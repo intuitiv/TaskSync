@@ -39,8 +39,8 @@ async function hasExternalMcpClientsAsync(): Promise<boolean> {
         try {
             const content = await fs.promises.readFile(configPath, 'utf8');
             const config = JSON.parse(content);
-            // Check if tasksync-chat is registered
-            if (config.mcpServers?.['tasksync-chat']) {
+            // Check if tasksync-plus is registered
+            if (config.mcpServers?.['tasksync-plus']) {
                 _hasExternalMcpClientsResult = true;
                 return true;
             }

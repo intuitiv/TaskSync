@@ -10,7 +10,7 @@ TaskSync Remote Access lets you:
 - **Queue prompts** for batch processing
 - **Switch between workspaces** seamlessly
 
-![TaskSync Remote Landing Page](./screenshots/remote-landing.png)
+<img src="./screenshots/remote-landing.png" width="300" />
 *Landing page with PIN authentication and active sessions*
 
 ## Quick Start
@@ -19,7 +19,7 @@ TaskSync Remote Access lets you:
 
 Click the **broadcast icon** (📡) in the TaskSync panel title bar.
 
-![Start Remote Server](./screenshots/remote-button.png)
+<img src="./screenshots/remote-button.png" width="200" />
 
 Or use the command palette:
 - `Cmd/Ctrl + Shift + P` → "TaskSync: Toggle Remote Server"
@@ -31,7 +31,7 @@ When the server starts, you'll see:
 - **Network URL**: `http://192.168.x.x:3000` (for mobile access)
 - **4-digit PIN**: Required for authentication
 
-![Connection Info](./screenshots/remote-connection-info.png)
+<img src="./screenshots/remote-connection-info.png" width="450" />
 
 ### 3. Connect from Your Phone
 
@@ -39,13 +39,13 @@ When the server starts, you'll see:
 2. Enter the **4-digit PIN** shown in VS Code
 3. Tap **Connect**
 
-![Mobile PIN Entry](./screenshots/mobile-pin-entry.png)
+<img src="./screenshots/mobile-pin-entry.png" width="300" />
 
 ### 4. Start Using TaskSync Remotely
 
 You'll see the same UI as VS Code, fully functional:
 
-![Mobile App View](./screenshots/mobile-app-view.png)
+<img src="./screenshots/mobile-app-view.png" width="300" />
 *TaskSync running on mobile with full functionality*
 
 ## Features

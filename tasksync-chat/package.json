@@ -1,10 +1,10 @@
 {
-  "name": "tasksync-chat",
-  "publisher": "4regab",
-  "displayName": "TaskSync",
-  "description": "Automate AI conversations. Queue your prompts or tasks. Work uninterrupted.",
+  "name": "tasksync-plus",
+  "publisher": "intuitiv",
+  "displayName": "TaskSync+",
+  "description": "Automate AI conversations. Queue your prompts. Work uninterrupted. Remote Control your AI Agents!",
   "icon": "media/Tasksync-logo.png",
-  "version": "2.0.12",
+  "version": "2.1.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -20,11 +20,13 @@
     "chat",
     "copilot",
     "agent",
-    "model-context-protocol"
+    "model-context-protocol",
+    "remote",
+    "mobile"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/4regab/TaskSync.git"
+    "url": "https://github.com/intuitiv/TaskSync.git"
   },
   "license": "MIT",
   "activationEvents": [
@@ -253,6 +255,7 @@
     "@types/express": "^4.17.21",
     "@types/node": "20.x",
     "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.7.1",
     "esbuild": "^0.27.2",
     "eslint": "^8.56.0",
     "typescript": "^5.3.3"

@@ -221,14 +221,14 @@ export class McpServerManager {
         // Register with Kiro
         await this.registerWithClient(
             path.join(os.homedir(), '.kiro', 'settings', 'mcp.json'),
-            'tasksync-chat',
+            'tasksync-plus',
             { url: serverUrl }
         );
 
         // Register with Antigravity/Gemini CLI
         await this.registerWithClient(
             path.join(os.homedir(), '.gemini', 'antigravity', 'mcp_config.json'),
-            'tasksync-chat',
+            'tasksync-plus',
             { serverUrl: serverUrl }
         );
 
@@ -282,8 +282,8 @@ export class McpServerManager {
             try {
                 const content = await fs.promises.readFile(configPath, 'utf8');
                 const config = JSON.parse(content);
-                if (config.mcpServers?.['tasksync-chat']) {
-                    delete config.mcpServers['tasksync-chat'];
+                if (config.mcpServers?.['tasksync-plus']) {
+                    delete config.mcpServers['tasksync-plus'];
                     await fs.promises.writeFile(configPath, JSON.stringify(config, null, 2));
                 }
             } catch {
