@@ -318,7 +318,7 @@
         reportBtn.title = 'Report Issue';
         reportBtn.setAttribute('aria-label', 'Report an issue on GitHub');
         reportBtn.addEventListener('click', function () {
-            vscode.postMessage({ type: 'openExternal', url: 'https://github.com/4regab/TaskSync/issues/new' });
+            vscode.postMessage({ type: 'openExternal', url: 'https://github.com/intuitiv/TaskSync/issues/new' });
         });
         headerButtons.appendChild(reportBtn);
 
