@@ -1,10 +1,32 @@
-# TaskSync
+# TaskSync+
 
-**Automate AI conversations. Queue your prompts. Work uninterrupted.**
+**Automate AI conversations. Queue your prompts. Remote Control your AI Agents.**
 
-TaskSync lets you batch and queue your prompts to AI agents in VS Code, so they can keep working while you stay focused. Perfect for long-running tasks, repetitive workflows, or hands-free automation—saving you time and reducing premium requests.
+TaskSync+ extends the original TaskSync with **Remote Mobile & Web Access**, created by [intuitiv](https://github.com/intuitiv). It keeps all the powerful queuing features you love, but now lets you control your AI workflows from your phone, tablet, or anywhere on your local network.
 
-## Features
+## 📱 NEW: Remote Mobile & Web Access
+
+<p align="center">
+  <strong>Control TaskSync from your phone, tablet, or any browser on your network!</strong>
+</p>
+
+**Why Remote Access?**
+- 🛋️ **Freedom**: Work from your couch while AI agents run on your computer
+- 📱 **Mobile**: Monitor and respond to AI prompts from your phone
+- 🔒 **Background**: Works even when your computer screen is locked
+- ⚡ **Real-time**: Instant sync between desktop and mobile
+
+**Quick Start:**
+1. Click the **broadcast icon** (📡) in the TaskSync panel
+2. Scan the QR code or visit the URL on your phone
+3. Enter the 4-digit PIN provided
+4. You're connected! Full control from your device.
+
+[See full Remote Documentation](docs/REMOTE_ACCESS.md)
+
+---
+
+## Core Features
 
 ### Smart Queue Mode
 Queue multiple prompts to be automatically sent when the AI agent requests feedback. Perfect for:
@@ -73,21 +95,6 @@ Paste or drag-and-drop images directly into the chat input. Images are automatic
 2. Search for files or folders
 3. Select to attach - the reference appears as a tag
 4. Multiple attachments supported per message
-
-### 📱 Mobile & Web Access (NEW)
-Control TaskSync from your phone, tablet, or any browser on your local network!
-
-1. Run command: `TaskSync: Start Remote Server`
-2. Open the URL on your phone (e.g., `http://192.168.1.5:3000`)
-3. Enter the 4-digit PIN shown in VS Code
-4. Use TaskSync from anywhere - same UI, real-time sync!
-
-**Features:**
-- PWA support - install as an app on your phone
-- Works when your computer screen is locked
-- Multiple VS Code windows = multiple sessions
-- See [REMOTE.md](REMOTE.md) for full documentation
-
 
 ### MCP Server Integration
 TaskSync runs an MCP (Model Context Protocol) server that integrates with:
