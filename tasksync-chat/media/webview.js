@@ -2280,6 +2280,11 @@
         return '<div class="chips-container" style="padding: 6px 0 0 0; border: none;">' + items + '</div>';
     }
 
+    // Expose message handler for remote server (Socket.io bridge)
+    window.dispatchVSCodeMessage = function(message) {
+        handleExtensionMessage({ data: message });
+    };
+
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {

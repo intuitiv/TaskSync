@@ -176,6 +176,12 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     // Context manager for #terminal, #problems references
     private readonly _contextManager: ContextManager;
 
+    // Remote broadcast callback (set by RemoteUiServer)
+    private _remoteBroadcastCallback: ((message: ToWebviewMessage) => void) | null = null;
+
+    // Current pending request info for remote server
+    private _currentPendingRequest: { id: string; prompt: string; isApprovalQuestion: boolean; choices?: ParsedChoice[] } | null = null;
+
     constructor(
         private readonly _extensionUri: vscode.Uri,
         private readonly _context: vscode.ExtensionContext,
@@ -208,6 +214,64 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             })
         );
     }
+
+    // ================== Remote Server Integration ==================
+
+    /**
+     * Set broadcast callback for remote UI server
+     * This enables the extension to push updates to connected web/mobile clients
+     */
+    public setRemoteBroadcastCallback(callback: ((message: ToWebviewMessage) => void) | null): void {
+        this._remoteBroadcastCallback = callback;
+    }
+
+    /**
+     * Get current state for remote clients (used when a new client connects)
+     */
+    public getStateForRemote(): {
+        queue: QueuedPrompt[];
+        queueEnabled: boolean;
+        currentSession: ToolCallEntry[];
+        persistedHistory: ToolCallEntry[];
+        pendingRequest: { id: string; prompt: string; isApprovalQuestion: boolean; choices?: ParsedChoice[] } | null;
+        settings: { soundEnabled: boolean; interactiveApprovalEnabled: boolean; reusablePrompts: ReusablePrompt[] };
+    } {
+        return {
+            queue: this._promptQueue,
+            queueEnabled: this._queueEnabled,
+            currentSession: this._currentSessionCalls,
+            persistedHistory: this._persistedHistory,
+            pendingRequest: this._currentPendingRequest,
+            settings: {
+                soundEnabled: this._soundEnabled,
+                interactiveApprovalEnabled: this._interactiveApprovalEnabled,
+                reusablePrompts: this._reusablePrompts
+            }
+        };
+    }
+
+    /**
+     * Handle message from remote client (web/mobile)
+     * Routes messages to the same handlers as the VS Code webview
+     */
+    public handleRemoteMessage(message: FromWebviewMessage): void {
+        this._handleWebviewMessage(message);
+    }
+
+    /**
+     * Broadcast message to both VS Code webview and remote clients
+     */
+    private _broadcast(message: ToWebviewMessage): void {
+        // Send to VS Code webview if available
+        this._view?.webview.postMessage(message);
+        
+        // Send to remote clients if callback is set
+        if (this._remoteBroadcastCallback) {
+            this._remoteBroadcastCallback(message);
+        }
+    }
+
+    // ================== End Remote Server Integration ==================
 
     /**
      * Save current tool call history to persisted history (called on deactivate)
@@ -357,12 +421,12 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
      * Update settings UI in webview
      */
     private _updateSettingsUI(): void {
-        this._view?.webview.postMessage({
+        this._broadcast({
             type: 'updateSettings',
             soundEnabled: this._soundEnabled,
             interactiveApprovalEnabled: this._interactiveApprovalEnabled,
             reusablePrompts: this._reusablePrompts
-        } as ToWebviewMessage);
+        });
     }
 
     /**
@@ -556,20 +620,34 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             }
         }
 
-        // Send pending tool call to webview
+        // Store pending request for remote clients
+        this._currentPendingRequest = {
+            id: toolCallId,
+            prompt: question,
+            isApprovalQuestion: isApproval,
+            choices: choices.length > 0 ? choices : undefined
+        };
+
+        // Broadcast pending tool call to VS Code webview and remote clients
+        const pendingMessage: ToWebviewMessage = {
+            type: 'toolCallPending',
+            id: toolCallId,
+            prompt: question,
+            isApprovalQuestion: isApproval,
+            choices: choices.length > 0 ? choices : undefined
+        };
+
         if (this._webviewReady && this._view) {
-            this._view.webview.postMessage({
-                type: 'toolCallPending',
-                id: toolCallId,
-                prompt: question,
-                isApprovalQuestion: isApproval,
-                choices: choices.length > 0 ? choices : undefined
-            });
+            this._broadcast(pendingMessage);
             // Play notification sound when AI triggers ask_user
             this.playNotificationSound();
         } else {
             // Fallback: queue the message (should rarely happen now)
             this._pendingToolCallMessage = { id: toolCallId, prompt: question };
+            // Still broadcast to remote clients even if VS Code webview isn't ready
+            if (this._remoteBroadcastCallback) {
+                this._remoteBroadcastCallback(pendingMessage);
+            }
         }
         this._updateCurrentSessionUI();
 
@@ -752,11 +830,14 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     this._currentSessionCallsMap.set(completedEntry.id, completedEntry);
                 }
 
-                // Send toolCallCompleted to trigger "Working...." state in webview
-                this._view?.webview.postMessage({
+                // Clear pending request for remote clients
+                this._currentPendingRequest = null;
+
+                // Broadcast toolCallCompleted to trigger "Working...." state
+                this._broadcast({
                     type: 'toolCallCompleted',
                     entry: completedEntry
-                } as ToWebviewMessage);
+                });
 
                 this._updateCurrentSessionUI();
                 resolve({ value, queue: this._queueEnabled, attachments });
@@ -888,7 +969,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             // Check cache first (TTL-based)
             const cached = this._fileSearchCache.get(cacheKey);
             if (cached && (Date.now() - cached.timestamp) < this._FILE_CACHE_TTL_MS) {
-                this._view?.webview.postMessage({
+                this._broadcast({
                     type: 'fileSearchResults',
                     files: cached.results
                 } as ToWebviewMessage);
@@ -995,7 +1076,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 if (firstKey) this._fileSearchCache.delete(firstKey);
             }
 
-            this._view?.webview.postMessage({
+            this._broadcast({
                 type: 'fileSearchResults',
                 files: allResults
             } as ToWebviewMessage);
@@ -1532,31 +1613,31 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
      * Update queue UI in webview
      */
     private _updateQueueUI(): void {
-        this._view?.webview.postMessage({
+        this._broadcast({
             type: 'updateQueue',
             queue: this._promptQueue,
             enabled: this._queueEnabled
-        } as ToWebviewMessage);
+        });
     }
 
     /**
      * Update current session UI in webview (cards in chat)
      */
     private _updateCurrentSessionUI(): void {
-        this._view?.webview.postMessage({
+        this._broadcast({
             type: 'updateCurrentSession',
             history: this._currentSessionCalls
-        } as ToWebviewMessage);
+        });
     }
 
     /**
      * Update persisted history UI in webview (for modal)
      */
     private _updatePersistedHistoryUI(): void {
-        this._view?.webview.postMessage({
+        this._broadcast({
             type: 'updatePersistedHistory',
             history: this._persistedHistory
-        } as ToWebviewMessage);
+        });
     }
 
     /**

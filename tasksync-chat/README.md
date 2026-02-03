@@ -74,6 +74,20 @@ Paste or drag-and-drop images directly into the chat input. Images are automatic
 3. Select to attach - the reference appears as a tag
 4. Multiple attachments supported per message
 
+### 📱 Mobile & Web Access (NEW)
+Control TaskSync from your phone, tablet, or any browser on your local network!
+
+1. Run command: `TaskSync: Start Remote Server`
+2. Open the URL on your phone (e.g., `http://192.168.1.5:3000`)
+3. Enter the 4-digit PIN shown in VS Code
+4. Use TaskSync from anywhere - same UI, real-time sync!
+
+**Features:**
+- PWA support - install as an app on your phone
+- Works when your computer screen is locked
+- Multiple VS Code windows = multiple sessions
+- See [REMOTE.md](REMOTE.md) for full documentation
+
 
 ### MCP Server Integration
 TaskSync runs an MCP (Model Context Protocol) server that integrates with:

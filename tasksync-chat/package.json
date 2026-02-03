@@ -112,6 +112,16 @@
           "default": true,
           "description": "Show interactive approval and choice buttons for Yes/No questions and multiple choice options."
         },
+        "tasksync.remoteEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start the Remote UI server on activation. Allows access to TaskSync from mobile/web browsers."
+        },
+        "tasksync.remotePort": {
+          "type": "number",
+          "default": 3000,
+          "description": "Preferred port for the Remote UI server. Will auto-increment if in use."
+        },
         "tasksync.reusablePrompts": {
           "type": "array",
           "default": [],
@@ -163,10 +173,50 @@
         "command": "tasksync.openSettings",
         "title": "TaskSync Settings",
         "icon": "$(gear)"
+      },
+      {
+        "command": "tasksync.startRemote",
+        "title": "TaskSync: Start Remote Server",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "tasksync.stopRemote",
+        "title": "TaskSync: Stop Remote Server",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "tasksync.toggleRemote",
+        "title": "TaskSync: Toggle Remote Server",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "tasksync.toggleRemoteStart",
+        "title": "TaskSync: Start Remote Server",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "tasksync.toggleRemoteStop",
+        "title": "TaskSync: Remote Server (Running)",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "tasksync.showRemoteUrl",
+        "title": "TaskSync: Show Remote URL",
+        "icon": "$(link-external)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "tasksync.toggleRemoteStart",
+          "when": "view == taskSyncView && !tasksync.remoteServerRunning",
+          "group": "navigation@0"
+        },
+        {
+          "command": "tasksync.toggleRemoteStop",
+          "when": "view == taskSyncView && tasksync.remoteServerRunning",
+          "group": "navigation@0"
+        },
         {
           "command": "tasksync.openHistory",
           "when": "view == taskSyncView",
@@ -195,9 +245,12 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.3",
     "@vscode/codicons": "^0.0.36",
+    "express": "^4.21.0",
+    "socket.io": "^4.7.5",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "20.x",
     "@types/vscode": "^1.90.0",
     "esbuild": "^0.27.2",

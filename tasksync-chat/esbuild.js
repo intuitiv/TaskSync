@@ -7,7 +7,16 @@ async function main() {
         entryPoints: ['src/extension.ts'],
         bundle: true,
         outfile: 'dist/extension.js',
-        external: ['vscode'],
+        external: [
+            'vscode',
+            // Socket.io and its dependencies must be external
+            // They don't bundle correctly with esbuild
+            'socket.io',
+            'engine.io',
+            'ws',
+            'bufferutil',
+            'utf-8-validate'
+        ],
         format: 'cjs',
         platform: 'node',
         target: 'node18',
