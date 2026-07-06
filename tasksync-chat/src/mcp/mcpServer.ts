@@ -11,6 +11,7 @@ import { AskAwayWebviewProvider } from '../webview/webviewProvider';
 import { askUser } from '../tools';
 import { getImageMimeType } from '../utils/imageUtils';
 import { CONFIG_NAMESPACE, MCP_SERVER_NAME } from '../constants/branding';
+import { dispatchGradle, GradleInput } from '../gradle/gradleEngine';
 
 
 async function tryReadImageAsMcpContent(uri: string): Promise<null | { type: 'image'; data: string; mimeType: string }> {
@@ -62,6 +63,13 @@ export class McpServerManager {
      */
     isRunning(): boolean {
         return this._isRunning;
+    }
+
+    /**
+     * The TCP port the MCP HTTP server is listening on (undefined until started).
+     */
+    getPort(): number | undefined {
+        return this._isRunning ? this.port : undefined;
     }
 
     async start(reusePort: boolean = false) {
@@ -131,8 +139,44 @@ export class McpServerManager {
                 }
             );
 
+            // Register gradle tool (async id-based Gradle build control).
+            // Backed by the standalone, VS Code-free engine so any MCP client
+            // (Claude Desktop, CLI, CI, etc.) can drive Gradle builds.
+            const gradleWorkspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+            (this.mcpServer as any).registerTool(
+                "gradle",
+                {
+                    description: "Async id-based Gradle build control. action=start spawns a build via ./gradlew and returns {buildId} immediately. The tool AUTO-OPTIMIZES every run for speed (Gradle daemon + --parallel + --build-cache + --configuration-cache, degraded to warnings if incompatible) so callers just name the task; the applied flags are echoed as 'optimizations' and any you pass explicitly (or their --no- opposite) win. action=status returns live state (RUNNING/SUCCESS/FAILED/CANCELLED/TIMEOUT) with completedTasks, runningTasks, elapsedSec; on failure it also returns failedTasks (names of tasks that failed — query logs with task:<name>), failedTaskLogsHint, whatWentWrong, exception (Caused by chain), errors (compiler errors), testFailures, testFailureDetails (for failed test tasks: parsed JUnit reports with {test, className, message, location, stack} — the real assertion message, source line, and trimmed stack trace, which Gradle's console omits), and exitCode. action=wait blocks until the build finishes (or timeoutMs); pass readyPattern (regex) to return early with ready:true when that text appears in the output even though the task keeps running (use for servers / --continuous). action=logs returns output with pagination metadata {fromLine,toLine,totalLines,nextFromLine,hasMore}: omit fromLine for a tail (last `tail` lines), or pass fromLine (0-based) to stream forward — feed nextFromLine back to page through a long-running task's output. Filter to a single task with task (e.g. ':app:compileKotlin'). action=stop kills a running build. Multiple builds run in parallel.",
+                    inputSchema: z.object({
+                        action: z.enum(["start", "status", "stop", "logs", "wait"])
+                            .describe("start: spawn build → {buildId}. status: live state. wait: block until done. stop: kill. logs: raw output (filter by task)."),
+                        tasks: z.array(z.string()).optional()
+                            .describe("Task names for action=start. E.g. [':app:test', ':core:assemble']. Defaults to ['build']."),
+                        arguments: z.array(z.string()).optional()
+                            .describe("Extra Gradle arguments for action=start. E.g. ['--tests', '*.FooTest', '--no-daemon']."),
+                        projectDir: z.string().optional()
+                            .describe("Absolute or workspace-relative dir containing gradlew. Defaults to workspace root."),
+                        offline: z.boolean().optional().describe("Pass --offline to Gradle. Defaults to false."),
+                        optimize: z.boolean().optional().describe("Auto-apply speed flags (daemon, --parallel, --build-cache, --configuration-cache). Default true. Set false to run a bare build."),
+                        env: z.record(z.string()).optional()
+                            .describe("Extra environment variables for the Gradle process (action=start). E.g. { \"JAVA_HOME\": \"/path/to/jdk17\" }."),
+                        timeoutMs: z.number().optional()
+                            .describe("action=start: hard-kill timeout ms (30000-1800000, default 1800000). action=wait: max wait ms (default 120000)."),
+                        buildId: z.string().optional().describe("ID from action=start. Required for status/stop/logs/wait."),
+                        task: z.string().optional().describe("action=logs: filter output to a specific task, e.g. ':app:compileKotlin'."),
+                        tail: z.number().optional().describe("action=logs: number of trailing lines to return (10-500, default 120). Ignored when fromLine is set."),
+                        fromLine: z.number().optional().describe("action=logs: 0-based start line for forward pagination. Use the response's nextFromLine as the cursor to stream a long-running task's output."),
+                        maxLines: z.number().optional().describe("action=logs: page size when paginating with fromLine (1-1000, default 200)."),
+                        readyPattern: z.string().optional().describe("action=wait: regex; return early with ready:true when it appears in output, even if the task never terminates (e.g. server 'Started .* in .*s' or 'Tomcat .* on port').")
+                    })
+                },
+                async (args: GradleInput) => {
+                    const result = await dispatchGradle(args, gradleWorkspaceRoot);
+                    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+                }
+            );
 
-            // Create transport
+
             this.transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: () => `sess_${crypto.randomUUID()}`
             });

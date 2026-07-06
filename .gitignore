@@ -29,3 +29,13 @@ debug_buttons.html
 js_test.html
 monitor.prd
 .tasksync
+
+# AskAway MCP secrets
+tasksync-opencode/.env
+tasksync-opencode/dist/
+tasksync-opencode/node_modules/
+
+# AskAway MCP secrets
+tasksync-plugin/.env
+tasksync-plugin/dist/
+tasksync-plugin/node_modules/

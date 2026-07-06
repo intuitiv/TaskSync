@@ -744,32 +744,22 @@ self.addEventListener('fetch', (event) => {
     }
 
     /**
-     * Cached file contents for webview assets (read once, serve from memory)
-     */
-    private _cachedWebviewJs: string | null = null;
-    private _cachedMainCss: string | null = null;
-
-    /**
      * Generate the main app HTML (identical to VS Code webview)
      */
     private _getAppHtml(): string {
-        // Read and cache the webview.js and main.css content
+        // Read latest webview.js and main.css content on each request so
+        // remote UI never serves stale assets across extension updates.
         const webviewJsPath = path.join(this._extensionUri.fsPath, 'media', 'webview.js');
         const mainCssPath = path.join(this._extensionUri.fsPath, 'media', 'main.css');
+        let webviewJs = '';
+        let mainCss = '';
         
         try {
-            if (!this._cachedWebviewJs) {
-                this._cachedWebviewJs = fs.readFileSync(webviewJsPath, 'utf8');
-            }
-            if (!this._cachedMainCss) {
-                this._cachedMainCss = fs.readFileSync(mainCssPath, 'utf8');
-            }
+            webviewJs = fs.readFileSync(webviewJsPath, 'utf8');
+            mainCss = fs.readFileSync(mainCssPath, 'utf8');
         } catch (err) {
             console.error('[AskAway Remote] Failed to read media files:', err);
         }
-
-        const webviewJs = this._cachedWebviewJs || '';
-        const mainCss = this._cachedMainCss || '';
 
         // CSS variable fallbacks for browser (VS Code provides these in webview)
         const cssVariableFallbacks = `

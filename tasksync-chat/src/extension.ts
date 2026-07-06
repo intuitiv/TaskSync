@@ -6,6 +6,7 @@ import { CONFIG_NAMESPACE, OUTPUT_CHANNEL_NAME, MCP_SERVER_NAME } from './consta
 import { AskAwayWebviewProvider } from './webview/webviewProvider';
 import { registerTools } from './tools';
 import { McpServerManager } from './mcp/mcpServer';
+import { killAllGradleRuns } from './gradle/gradleEngine';
 import { ContextManager } from './context';
 import { PlanEditorProvider } from './plan/planEditorProvider';
 
@@ -39,6 +40,466 @@ function logRuntime(message: string, details?: unknown): void {
         ? ` ${typeof details === 'string' ? details : JSON.stringify(details)}`
         : '';
     activationOutputChannel?.appendLine(`[${timestamp}] AskAway Runtime: ${message}${suffix}`);
+}
+
+const ASKWAY_BUILD_AGENT_FILE = 'askaway-build.agent.md';
+const ASKWAY_BUILD_AGENT_CONTENT = `---
+description: "Use when: acting as the main AskAway build agent, orchestrating implementation work, RTK command optimization, observability fixes, builds, tests, and production-readiness tasks."
+name: "AskAway Build"
+tools: [vscode/extensions, vscode/memory, vscode/newWorkspace, vscode/resolveMemoryFileUri, vscode/runCommand, vscode/toolSearch, execute, read, agent, edit, search, todo]
+user-invocable: true
+---
+
+You are the main AskAway Build Agent. Your job is to orchestrate implementation work with strong token discipline, accurate observability, and safe delegation.
+
+**At the end of conversation update AGENT_AUDIT.md with summary of work done, so that i can review in future. Template is timestamp  followed by summary.**
+
+## Core Role
+- Act as the primary build/orchestration agent for AskAway work.
+- Plan briefly, execute decisively, verify changes, and report concise proof.
+- Keep user-facing responses short, direct, and evidence-based.
+
+## RTK Policy
+- Resolve RTK mode once at session start: if \`~/.askaway-rtk-enabled\` exists, set RTK mode on for this chat session.
+- RTK must apply to regular agent command tools, not only delegated worker tools.
+- Use regular command-capable tools as needed. While VS Code-side interception is being validated, explicitly pass \`rtk \`-prefixed simple commands in command parameters.
+- RTK command parameters discovered so far: \`execute/runInTerminal.command\`, \`execute/sendToTerminal.command\`, and \`execute/createAndRunTask.task.command\`.
+- If a command parameter already starts with \`rtk \`, do not add another prefix.
+- Do not prepend \`rtk \` to an entire compound command such as \`cmd1 && cmd2\`, \`cmd1 | cmd2\`, or commands using redirects/subshells. Split compound commands into separate tool calls and wrap each eligible simple command independently.
+- While command-tool discovery is active, use the temporary LM tool catalog dump and PreToolUse parameter logger to identify command-capable tools and their command parameter names.
+- Do not perform a runtime file check before each command; treat RTK mode as a design-time/session-start decision.
+- If RTK is toggled during a chat, restart the agent session so RTK mode is re-evaluated.
+- Keep commands simple (avoid unnecessary pipes or chaining) so RTK can compress output effectively.
+- Never count RTK saved tokens as Copilot credits. RTK savings come from \`rtk gain\`; Copilot credits come from Copilot log \`copilotUsageNanoAiu\`.
+
+## Observability Rules
+- Observability must be per workspace. Never aggregate logs across unrelated VS Code workspaceStorage folders.
+- Credit totals must be recomputed from all readable current-workspace Copilot \`main.jsonl\` files, not a rolling window.
+- Skip malformed/corrupt JSONL lines; continue counting valid lines.
+- Credit display is local aggregation of Copilot log \`copilotUsageNanoAiu\`, divided by \`1_000_000_000\` for AIU.
+- RTK token savings are separate and should be shown from \`rtk gain --daily --format json\`.
+
+## Memory Discipline
+- Use the built-in \`memory\` tool (\`vscode/memory\`) to read and write durable notes across sessions.
+- At session start, \`view\` the \`/memories/\` directory and read \`/memories/_index.md\` (if present).
+- **WRITE AFTER substantial work**: persist key facts, verified commands, and architecture decisions. Keep notes concise.
+- If you skip a memory read or write, state why explicitly.
+
+## Implementation Discipline
+- Preserve user changes. Do not revert unrelated files.
+- Keep edits narrow and consistent with existing code style.
+- Compile/build after TypeScript changes.
+- Deploy AskAway locally by copying the built bundle to \`~/.vscode/extensions/intuitiv.askaway-1.0.35/dist/extension.js\` when requested or when validating installed behavior.
+- **Gradle builds/tests → use the \`gradle\` tool, never the terminal.**
+  - \`action:start\` with \`tasks\`, \`arguments\`, \`projectDir\`, \`env\` (e.g. \`{"JAVA_HOME":"/path/to/jdk"}\`) → returns \`{buildId}\` immediately.
+  - Poll \`action:status\` for live state (\`RUNNING/SUCCESS/FAILED\`). On FAILED the response includes \`failedTasks\`, \`whatWentWrong\`, \`exception[]\`, \`errors[]\`, \`testFailures[]\`, \`exitCode\`.
+  - \`action:wait\` to block until done (set \`timeoutMs\` if needed).
+  - \`action:logs\` with optional \`task\` filter (e.g. \`":service:test"\`) for per-task output.
+  - \`action:stop\` to kill a running build.
+  - Example: \`env JAVA_HOME=/path/jdk ./gradlew :service:test --tests '*.Foo' --no-daemon\` maps to:
+    \`{ action:"start", tasks:[":service:test"], arguments:["--tests","*.Foo","--no-daemon"], env:{"JAVA_HOME":"/path/jdk"} }\`
+- Record meaningful proof: compile result, bundle marker, RTK gain output, or relevant log source.
+
+## Search & Navigation Discipline
+- **Text/pattern search across files → use \`rg_search\`** (faster than grep in terminal, structured results with line numbers and context). Pass \`fileType\` to narrow to language (e.g. "ts", "py", "kt"). Only fall back to \`grep_search\` if rg_search is unavailable.
+- **Symbol lookups (go-to-definition, find references, hover, diagnostics) → use \`code_nav\`**. Requires the relevant VS Code language extension to be installed (e.g. Kotlin Language Support for .kt files, Pylance for .py). Works for any language — the bridge delegates to VS Code's language provider API automatically.
+- **Reading/understanding a file → start with \`code_nav\` (\`document_symbols\`)**, not a full-file dump. Get the symbol outline (functions, classes, methods with their line ranges) first, then do a *targeted ranged read* of only the region you need. Reserve whole-file reads for small files (<~150 lines) or when you genuinely need the entire content.
+- Note the boundary: \`code_nav\` returns structure and precise line ranges, not raw source text. Use it to locate *where* to look, then read that range — this avoids pulling thousands of irrelevant lines into context.
+- Do NOT run \`grep\` or \`rg\` in the terminal for code search when \`rg_search\` is available.
+- Do NOT read entire files to locate a symbol when \`code_nav\` (definition/references/document_symbols) or \`rg_search\` can locate it in one call.
+
+## Communication
+- BE CRISP. Default to the shortest correct answer (1–3 sentences). Lead with the result first; add detail only when asked or essential.
+- No preamble, no restating the question, no filler, no narrating what you are about to do. Never pad the final response.
+- Prefer a tight summary + concrete proof (numbers, file:line) over prose. Use short bullets, not paragraphs. Cut every sentence that does not add information.
+- Be honest about boundaries: you cannot rewrite GitHub Copilot's closed system prompt. You can guide behavior through this custom agent, tool descriptions, tool results, and worker prompts.
+- Explain credit math plainly when asked.
+- When user says today is RTK work, prioritize RTK setup, RTK command routing, RTK observability, and proof of savings.
+`;
+
+const RTK_GATE_COMMAND = '$HOME/.askaway/hooks/rtk-gate.sh';
+const RTK_GATE_SCRIPT = `#!/bin/sh
+# AskAway RTK conditional hook gate (PreToolUse).
+# Toggle OFF: no output -> tool runs unchanged.
+# Toggle ON: delegate command-only mutation to rtk's hook implementation.
+
+SENTINEL="$HOME/.askaway-rtk-enabled"
+payload=$(cat)
+
+[ -f "$SENTINEL" ] || exit 0
+
+RTK_BIN="$(command -v rtk 2>/dev/null)"
+if [ -z "$RTK_BIN" ]; then
+    for p in /opt/homebrew/bin/rtk /usr/local/bin/rtk "$HOME/.local/bin/rtk"; do
+        if [ -x "$p" ]; then
+            RTK_BIN="$p"
+            break
+        fi
+    done
+fi
+[ -n "$RTK_BIN" ] || exit 0
+
+# VS Code Copilot sends {toolName,input}; current rtk expects Claude's
+# {tool_name,tool_input}. Normalize keys, then delegate to rtk's hook engine.
+printf '%s' "$payload" | sed 's/"toolName"/"tool_name"/;s/"input"/"tool_input"/' | "$RTK_BIN" hook claude
+exit 0
+`;
+const RTK_HOOK_MATCHERS = [
+    // Claude Code's shell tool.
+    'Bash',
+    // VS Code Copilot terminal + task command tools. RTK wraps the shell command
+    // carried by these tools; non-shell command tools (e.g. run_vscode_command) are
+    // intentionally excluded because RTK cannot compress VS Code command output.
+    'run_in_terminal|runInTerminal|sendToTerminal|send_to_terminal|local_shell|bash|powershell|createAndRunTask|create_and_run_task|runTask|runTasks|runCommand|runCommands'
+];
+
+// ── Turn-budget UserPromptSubmit hook ─────────────────────────────────────────
+// Injects a live per-turn budget banner into every prompt when a soft budget is set
+// (askaway.turnBudgetAiu > 0). This is the "push" complement to the pull-based
+// turn_budget tool. The extension writes two sentinels the hook reads (it runs as an
+// external process and can't read VS Code config):
+//   ~/.askaway/turn-budget-aiu        the soft limit (0/absent => hook is a no-op)
+//   ~/.askaway/workspace-storage-root the VS Code workspaceStorage dir to scan for logs
+const BUDGET_GATE_COMMAND = '$HOME/.askaway/hooks/budget-gate.sh';
+const BUDGET_GATE_SCRIPT = `#!/bin/sh
+# AskAway turn-budget injector (UserPromptSubmit). No output unless a soft budget is set.
+CFG="$HOME/.askaway"
+[ -f "$CFG/turn-budget-aiu" ] || exit 0
+cat >/dev/null 2>&1
+NODE="$(command -v node 2>/dev/null)"
+if [ -z "$NODE" ]; then
+    for p in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.local/bin/node"; do
+        [ -x "$p" ] && NODE="$p" && break
+    done
+fi
+[ -n "$NODE" ] || exit 0
+"$NODE" "$CFG/hooks/budget-inject.js"
+exit 0
+`;
+const BUDGET_INJECT_SCRIPT = `// AskAway turn-budget injector. Emits a UserPromptSubmit additionalContext banner with
+// live per-turn spend vs the configured soft limit. No output if no budget is set.
+const fs = require('fs'), path = require('path'), os = require('os');
+function safeReaddir(d) { try { return fs.readdirSync(d); } catch (e) { return []; } }
+try {
+    const cfg = path.join(os.homedir(), '.askaway');
+    const limit = parseFloat((fs.readFileSync(path.join(cfg, 'turn-budget-aiu'), 'utf8') || '0').trim()) || 0;
+    if (!(limit > 0)) { process.exit(0); }
+    const wsRoot = (fs.readFileSync(path.join(cfg, 'workspace-storage-root'), 'utf8') || '').trim();
+    if (!wsRoot) { process.exit(0); }
+    let newest = null;
+    for (const h of safeReaddir(wsRoot)) {
+        const dl = path.join(wsRoot, h, 'GitHub.copilot-chat', 'debug-logs');
+        for (const s of safeReaddir(dl)) {
+            const m = path.join(dl, s, 'main.jsonl');
+            try { const st = fs.statSync(m); if (!newest || st.mtimeMs > newest.mt) { newest = { file: m, mt: st.mtimeMs }; } } catch (e) {}
+        }
+    }
+    if (!newest) { process.exit(0); }
+    const lines = fs.readFileSync(newest.file, 'utf8').split('\\n');
+    let lastSubmit = 0;
+    for (const l of lines) { if (l.indexOf('"type":"user_message"') === -1) { continue; } try { const p = JSON.parse(l); if (typeof p.ts === 'number' && p.ts > lastSubmit) { lastSubmit = p.ts; } } catch (e) {} }
+    let nano = 0;
+    for (const l of lines) { if (l.indexOf('llm_request') === -1) { continue; } let p; try { p = JSON.parse(l); } catch (e) { continue; } const ts = typeof p.ts === 'number' ? p.ts : 0; if (ts < lastSubmit) { continue; } nano += (p.attrs && typeof p.attrs.copilotUsageNanoAiu === 'number') ? p.attrs.copilotUsageNanoAiu : 0; }
+    // At UserPromptSubmit the NEW turn's user_message is not yet in the log, so the newest
+    // user_message ts is the PREVIOUS turn's — and \`nano\` below is the previous turn's total.
+    // The current turn is genuinely fresh (0 spent) at this instant, so present it that way
+    // and expose the previous turn as context. Live in-turn spend comes from the turn_budget tool.
+    const prevSpent = nano / 1e9;
+    const pctPrev = Math.round(prevSpent / limit * 100);
+    const tier = pctPrev >= 100 ? ', OVER' : (pctPrev >= 75 ? ', high' : '');
+    const ctx = lastSubmit === 0
+        ? 'Budget: ' + limit + ' AIU/turn (fresh).'
+        : 'Budget: ' + limit + ' AIU/turn (fresh). Last turn ' + prevSpent.toFixed(0) + '/' + limit + ' (' + pctPrev + '%' + tier + ').';
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: ctx } }));
+} catch (e) {}
+process.exit(0);
+`;
+
+/** Persist the sentinels the budget hook reads: the soft limit + the workspaceStorage root. */
+async function writeBudgetSentinels(context: vscode.ExtensionContext): Promise<void> {
+    try {
+        const cfgDir = path.join(os.homedir(), '.askaway');
+        await fs.promises.mkdir(cfgDir, { recursive: true });
+        const limit = Number(vscode.workspace.getConfiguration('askaway').get('turnBudgetAiu', 0)) || 0;
+        await fs.promises.writeFile(path.join(cfgDir, 'turn-budget-aiu'), `${limit}\n`, 'utf8');
+        const storage = context.storageUri?.fsPath;
+        if (storage) {
+            // storageUri = <...>/workspaceStorage/<hash>/<ext-id>; go up two to workspaceStorage.
+            const wsRoot = path.dirname(path.dirname(storage));
+            await fs.promises.writeFile(path.join(cfgDir, 'workspace-storage-root'), `${wsRoot}\n`, 'utf8');
+        }
+    } catch (err) {
+        logRuntime('Warning: Could not write budget sentinels', formatError(err));
+    }
+}
+
+/** Install the turn-budget UserPromptSubmit hook (Claude settings + Copilot hooks). */
+async function ensureBudgetHookInstalled(): Promise<void> {
+    const gatePath = path.join(os.homedir(), '.askaway', 'hooks', 'budget-gate.sh');
+    const injectPath = path.join(os.homedir(), '.askaway', 'hooks', 'budget-inject.js');
+    try {
+        await fs.promises.mkdir(path.dirname(gatePath), { recursive: true });
+        if (await fs.promises.readFile(gatePath, 'utf8').catch(() => undefined) !== BUDGET_GATE_SCRIPT) {
+            await fs.promises.writeFile(gatePath, BUDGET_GATE_SCRIPT, 'utf8');
+        }
+        await fs.promises.chmod(gatePath, 0o755);
+        if (await fs.promises.readFile(injectPath, 'utf8').catch(() => undefined) !== BUDGET_INJECT_SCRIPT) {
+            await fs.promises.writeFile(injectPath, BUDGET_INJECT_SCRIPT, 'utf8');
+        }
+
+        // Claude Code: ~/.claude/settings.json hooks.UserPromptSubmit
+        const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+        await fs.promises.mkdir(path.dirname(claudeSettingsPath), { recursive: true });
+        let settings: any = {};
+        try { settings = JSON.parse(await fs.promises.readFile(claudeSettingsPath, 'utf8')); } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') { throw err; }
+        }
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) { settings = {}; }
+        if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) { settings.hooks = {}; }
+        if (!Array.isArray(settings.hooks.UserPromptSubmit)) { settings.hooks.UserPromptSubmit = []; }
+        const hasBudget = settings.hooks.UserPromptSubmit.some((e: any) =>
+            Array.isArray(e?.hooks) && e.hooks.some((h: any) => h?.command === BUDGET_GATE_COMMAND));
+        if (!hasBudget) {
+            settings.hooks.UserPromptSubmit.push({ hooks: [{ type: 'command', command: BUDGET_GATE_COMMAND }] });
+            await fs.promises.writeFile(claudeSettingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+        }
+
+        // VS Code Copilot: ~/.copilot/hooks/budget-inject.json (best-effort — event support may vary).
+        const copilotHookPath = path.join(os.homedir(), '.copilot', 'hooks', 'budget-inject.json');
+        await fs.promises.mkdir(path.dirname(copilotHookPath), { recursive: true });
+        let cfg: any = {};
+        try { cfg = JSON.parse(await fs.promises.readFile(copilotHookPath, 'utf8')); } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') { throw err; }
+        }
+        if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) { cfg = {}; }
+        if (typeof cfg.version !== 'number') { cfg.version = 1; }
+        if (!cfg.hooks || typeof cfg.hooks !== 'object' || Array.isArray(cfg.hooks)) { cfg.hooks = {}; }
+        const gateAbs = path.join(os.homedir(), '.askaway', 'hooks', 'budget-gate.sh');
+        cfg.hooks.UserPromptSubmit = [{ type: 'command', command: gateAbs, cwd: '.', timeout: 10 }];
+        await fs.promises.writeFile(copilotHookPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+
+        logRuntime('Installed AskAway turn-budget hook', { gatePath, injectPath });
+    } catch (err) {
+        logRuntime('Warning: Could not install AskAway turn-budget hook', formatError(err));
+    }
+}
+
+
+async function ensureAskAwayBuildAgentInstalled(context: vscode.ExtensionContext): Promise<void> {
+    const userDir = path.dirname(path.dirname(context.globalStorageUri.fsPath));
+    const promptsDir = path.join(userDir, 'prompts');
+    const agentPath = path.join(promptsDir, ASKWAY_BUILD_AGENT_FILE);
+
+    try {
+        await fs.promises.mkdir(promptsDir, { recursive: true });
+        const existing = await fs.promises.readFile(agentPath, 'utf8').catch((err: NodeJS.ErrnoException) => {
+            if (err.code === 'ENOENT') {
+                return undefined;
+            }
+            throw err;
+        });
+
+        if (existing === undefined) {
+            await fs.promises.writeFile(agentPath, ASKWAY_BUILD_AGENT_CONTENT, 'utf8');
+            logRuntime('Installed AskAway Build user agent', { agentPath });
+        } else if (existing === ASKWAY_BUILD_AGENT_CONTENT) {
+            logRuntime('AskAway Build user agent already installed', { agentPath });
+        } else {
+            logRuntime('AskAway Build user agent exists; preserving user copy', { agentPath });
+        }
+    } catch (err) {
+        logRuntime('Warning: Could not install AskAway Build user agent', formatError(err));
+    }
+}
+
+function hookEntryUsesCommand(entry: any, command: string): boolean {
+    return Array.isArray(entry?.hooks) && entry.hooks.some((hook: any) => hook?.type === 'command' && hook?.command === command);
+}
+
+function migrateDirectRtkHookToGate(entry: any): boolean {
+    if (!Array.isArray(entry?.hooks)) {
+        return false;
+    }
+
+    let changed = false;
+    for (const hook of entry.hooks) {
+        if (hook?.type === 'command' && hook.command === 'rtk hook claude') {
+            hook.command = RTK_GATE_COMMAND;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+async function ensureRtkGlobalHooksInstalled(): Promise<void> {
+    const gatePath = path.join(os.homedir(), '.askaway', 'hooks', 'rtk-gate.sh');
+    const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+
+    try {
+        await fs.promises.mkdir(path.dirname(gatePath), { recursive: true });
+        const existingGate = await fs.promises.readFile(gatePath, 'utf8').catch((err: NodeJS.ErrnoException) => {
+            if (err.code === 'ENOENT') {
+                return undefined;
+            }
+            throw err;
+        });
+        if (existingGate !== RTK_GATE_SCRIPT) {
+            await fs.promises.writeFile(gatePath, RTK_GATE_SCRIPT, 'utf8');
+        }
+        await fs.promises.chmod(gatePath, 0o755);
+
+        await fs.promises.mkdir(path.dirname(claudeSettingsPath), { recursive: true });
+        let settings: any = {};
+        try {
+            const rawSettings = await fs.promises.readFile(claudeSettingsPath, 'utf8');
+            settings = JSON.parse(rawSettings);
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw err;
+            }
+        }
+
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+            settings = {};
+        }
+        if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+            settings.hooks = {};
+        }
+        if (!Array.isArray(settings.hooks.PreToolUse)) {
+            settings.hooks.PreToolUse = [];
+        }
+
+        let settingsChanged = false;
+        for (const entry of settings.hooks.PreToolUse) {
+            if (migrateDirectRtkHookToGate(entry)) {
+                settingsChanged = true;
+            }
+        }
+
+        // Prune stale AskAway gate entries whose matcher is no longer in RTK_HOOK_MATCHERS.
+        // This lets the matcher list evolve (e.g. adding task/command tools) without leaving
+        // orphaned entries behind from previous versions.
+        const beforePrune = settings.hooks.PreToolUse.length;
+        settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter((entry: any) => {
+            const isAskAwayGate = hookEntryUsesCommand(entry, RTK_GATE_COMMAND);
+            if (!isAskAwayGate) {
+                return true; // keep non-AskAway entries (e.g. the param logger) untouched
+            }
+            return RTK_HOOK_MATCHERS.includes(entry?.matcher);
+        });
+        if (settings.hooks.PreToolUse.length !== beforePrune) {
+            settingsChanged = true;
+        }
+
+        for (const matcher of RTK_HOOK_MATCHERS) {
+            const hasMatcherGate = settings.hooks.PreToolUse.some((entry: any) => entry?.matcher === matcher && hookEntryUsesCommand(entry, RTK_GATE_COMMAND));
+            if (!hasMatcherGate) {
+                settings.hooks.PreToolUse.push({
+                    matcher,
+                    hooks: [{ type: 'command', command: RTK_GATE_COMMAND }]
+                });
+                settingsChanged = true;
+            }
+        }
+
+        if (settingsChanged) {
+            await fs.promises.writeFile(claudeSettingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+            logRuntime('Installed AskAway RTK global hooks', { claudeSettingsPath, gatePath });
+        } else {
+            logRuntime('AskAway RTK global hooks already installed', { claudeSettingsPath, gatePath });
+        }
+    } catch (err) {
+        logRuntime('Warning: Could not install AskAway RTK global hooks', formatError(err));
+    }
+}
+
+/**
+ * Ensure the GitHub Copilot native PreToolUse hook routes through AskAway's RTK gate.
+ *
+ * VS Code Copilot reads its own hook config from ~/.copilot/hooks/*.json (NOT
+ * ~/.claude/settings.json). RTK ships a config that calls `rtk hook copilot`, but
+ * that subcommand is a no-op in current rtk builds (it never rewrites commands).
+ * `rtk hook claude` — which AskAway's gate invokes — DOES rewrite correctly and
+ * emits the `hookSpecificOutput.updatedInput` shape Copilot consumes. So we point
+ * every Copilot PreToolUse hook at the gate, giving consistent RTK rewriting plus
+ * the sentinel toggle. Copilot has no matcher here, so the gate runs for every tool
+ * and rewrites only the ones carrying a shell command.
+ */
+async function ensureCopilotHookInstalled(): Promise<void> {
+    const gateAbsPath = path.join(os.homedir(), '.askaway', 'hooks', 'rtk-gate.sh');
+    const copilotHookPath = path.join(os.homedir(), '.copilot', 'hooks', 'rtk-rewrite.json');
+    const BROKEN_CMD = 'rtk hook copilot';
+
+    try {
+        await fs.promises.mkdir(path.dirname(copilotHookPath), { recursive: true });
+
+        let config: any = {};
+        try {
+            config = JSON.parse(await fs.promises.readFile(copilotHookPath, 'utf8'));
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw err;
+            }
+        }
+        if (!config || typeof config !== 'object' || Array.isArray(config)) {
+            config = {};
+        }
+        if (typeof config.version !== 'number') {
+            config.version = 1;
+        }
+        if (!config.hooks || typeof config.hooks !== 'object' || Array.isArray(config.hooks)) {
+            config.hooks = {};
+        }
+
+        let changed = false;
+        const isBrokenValue = (v: unknown): boolean => v === BROKEN_CMD;
+
+        // `PreToolUse` array uses a single `command` string per entry.
+        const upper = Array.isArray(config.hooks.PreToolUse) ? config.hooks.PreToolUse : [];
+        if (upper.length === 0) {
+            config.hooks.PreToolUse = [{ type: 'command', command: gateAbsPath, cwd: '.', timeout: 5 }];
+            changed = true;
+        } else {
+            for (const entry of upper) {
+                if (entry && typeof entry === 'object' && (isBrokenValue(entry.command) || entry.command !== gateAbsPath)) {
+                    entry.command = gateAbsPath;
+                    changed = true;
+                }
+            }
+            config.hooks.PreToolUse = upper;
+        }
+
+        // `preToolUse` array uses `bash`/`powershell` string keys per entry.
+        const lower = Array.isArray(config.hooks.preToolUse) ? config.hooks.preToolUse : [];
+        if (lower.length === 0) {
+            config.hooks.preToolUse = [{ type: 'command', bash: gateAbsPath, powershell: gateAbsPath, cwd: '.', timeoutSec: 5 }];
+            changed = true;
+        } else {
+            for (const entry of lower) {
+                if (!entry || typeof entry !== 'object') {
+                    continue;
+                }
+                if (isBrokenValue(entry.bash) || entry.bash !== gateAbsPath) {
+                    entry.bash = gateAbsPath;
+                    changed = true;
+                }
+                if (isBrokenValue(entry.powershell) || entry.powershell !== gateAbsPath) {
+                    entry.powershell = gateAbsPath;
+                    changed = true;
+                }
+            }
+            config.hooks.preToolUse = lower;
+        }
+
+        if (changed) {
+            await fs.promises.writeFile(copilotHookPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+            logRuntime('Routed Copilot native hook through AskAway RTK gate', { copilotHookPath, gateAbsPath });
+        } else {
+            logRuntime('Copilot native hook already routed through RTK gate', { copilotHookPath });
+        }
+    } catch (err) {
+        logRuntime('Warning: Could not install Copilot RTK hook', formatError(err));
+    }
 }
 
 // Memoized result for external MCP client check (only checked once per activation)
@@ -112,6 +573,27 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(outputChannel);
     outputChannel.appendLine(`[${new Date().toISOString()}] AskAway: Extension activating...`);
 
+    void ensureAskAwayBuildAgentInstalled(context);
+    void ensureRtkGlobalHooksInstalled();
+    void ensureCopilotHookInstalled();
+    void writeBudgetSentinels(context);
+    void ensureBudgetHookInstalled();
+
+    // Enable debug logging globally on first activation (needed for token telemetry)
+    (async () => {
+        try {
+            const globalConfig = vscode.workspace.getConfiguration('', null);
+            await globalConfig.update(
+                'github.copilot.chat.agentDebugLog.fileLogging.enabled',
+                true,
+                vscode.ConfigurationTarget.Global
+            );
+            logRuntime('Debug logging enabled globally');
+        } catch (err) {
+            logRuntime('Warning: Could not enable debug logging', err);
+        }
+    })();
+
     const conflictingTaskSync = findConflictingTaskSyncExtension();
     if (conflictingTaskSync) {
         const conflictMessage = `AskAway detected a potential tool conflict with installed extension "${conflictingTaskSync.id}". Disable TaskSync (or AskAway) to avoid ask_user routing issues.`;
@@ -164,6 +646,22 @@ export function activate(context: vscode.ExtensionContext) {
         context.subscriptions.push(
             vscode.commands.registerCommand('askaway.sendMessage', () => {
                 provider.triggerSendFromShortcut();
+            })
+        );
+
+        context.subscriptions.push(
+            vscode.commands.registerCommand('askaway.dumpLmTools', async () => {
+                const outputPath = path.join(context.globalStorageUri.fsPath, 'lm-tools-catalog.json');
+                await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+                const tools = vscode.lm.tools.map(tool => ({
+                    name: tool.name,
+                    description: tool.description,
+                    tags: Array.from(tool.tags || []),
+                    inputSchema: tool.inputSchema ?? null
+                }));
+                await fs.promises.writeFile(outputPath, JSON.stringify({ generatedAt: new Date().toISOString(), tools }, null, 2));
+                await vscode.env.clipboard.writeText(outputPath);
+                vscode.window.showInformationMessage(`AskAway LM tools catalog written to ${outputPath}`);
             })
         );
 
@@ -624,4 +1122,6 @@ export async function deactivate() {
         await mcpServer.dispose();
         mcpServer = undefined;
     }
+
+    killAllGradleRuns();
 }

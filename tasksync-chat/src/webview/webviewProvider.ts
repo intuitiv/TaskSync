@@ -1,11 +1,34 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { createHash } from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { CONFIG_NAMESPACE, VIEW_TYPE, VIEW_FOCUS_COMMAND } from '../constants/branding';
 import { FILE_EXCLUSION_PATTERNS, FILE_SEARCH_EXCLUSION_PATTERNS, formatExcludePattern } from '../constants/fileExclusions';
 import { ContextManager, ContextReferenceType, ContextReference } from '../context';
 import { Plan, PlanTask, PlanTaskStatus, createPlan, createTask, findTaskById, getNextPendingTask, countByStatus } from '../plan/planTypes';
 import { PlanEditorProvider } from '../plan/planEditorProvider';
+import { getUserMemoryDir, summarizeAndStoreMemory, listMemories } from '../memory/memoryStore';
+
+// Exact token counting via the o200k_base BPE (GPT-4o / GPT-5 family, which Copilot uses).
+// Lazily loaded on first use to avoid paying the encoding-table init cost at activation.
+type TokenEncodeFn = (text: string) => number[];
+let _o200kEncode: TokenEncodeFn | undefined;
+function countTokens(text: string): number {
+    if (!text) { return 0; }
+    try {
+        if (!_o200kEncode) {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            _o200kEncode = (require('gpt-tokenizer/encoding/o200k_base') as { encode: TokenEncodeFn }).encode;
+        }
+        return _o200kEncode(text).length;
+    } catch {
+        return Math.ceil(text.length / 4); // fallback if the tokenizer is unavailable
+    }
+}
+
 
 // Queued prompt interface
 export interface QueuedPrompt {
@@ -68,9 +91,214 @@ export interface ReusablePrompt {
     prompt: string;     // Full prompt text
 }
 
+interface ScopeMetrics {
+    requestCount: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    nanoAiu: number;
+    /** Count of requests whose cached portion was < 50% of input (cache miss). Optional/back-compat. */
+    cacheMisses?: number;
+}
+
+interface ModelBreakdown extends ScopeMetrics {
+    model: string;
+}
+
+interface ObservabilityMetrics {
+    // Flat fields mirror the workspace cumulative scope (kept for backward compatibility).
+    requestCount: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    nanoAiu: number;
+    // Scoped breakdowns for the metrics table.
+    lastRequest: ScopeMetrics;   // current turn (reset on each user submit)
+    workspace: ScopeMetrics;     // cumulative for this workspace
+    overall: ScopeMetrics;       // current calendar month across all workspaces
+    perModel: ModelBreakdown[];  // current calendar month across all workspaces (debug)
+    turnRequests: TurnRequest[]; // individual requests of the current turn (newest last)
+    turnEvents: TurnEvent[];     // chronological current-turn LLM/tool timeline
+    rtkCommandCount: number;
+    rtkSavedTokens: number;
+    rtkSavingsPct: number;
+    gradle: { runs: number; optimizedRuns: number; tasksAvoided: number; configCacheReuses: number; savedTokens: number };
+    toolCalls: ToolCallMetrics;
+    source: string;
+    updatedAt: number;
+}
+
+/** Per-tool aggregate exposed to the UI. Durations in ms; tokens ≈ chars/4. */
+interface ToolStat {
+    tool: string;
+    calls: number;
+    outputTokens: number;
+    avgMs: number;
+    minMs: number;
+    maxMs: number;
+    errors: number;
+    /** True when this tool's max/avg duration risks blowing the ~5 min prompt-cache TTL. */
+    cacheRisk: boolean;
+    /** Top input categories (for grouping) → call count. */
+    groups: Array<{ group: string; calls: number }>;
+}
+
+interface ToolScope {
+    totalCalls: number;
+    totalOutputTokens: number;
+    byTool: ToolStat[];
+}
+
+/** Month (durable) + current-turn tool telemetry. */
+interface ToolCallMetrics extends ToolScope {
+    /** Tool calls since the last user submit (current request). */
+    turn: ToolScope;
+}
+
+/** Compact per-request summary used to attach before/after context to cache-miss records. */
+interface ReqSummary {
+    ts: number;
+    sid: string;
+    li: number;              // debug-log line index (locator into the master table)
+    responseId: string | null;
+    model: string;
+    role: string;            // debugName (panel/editAgent, summarizeConversationHistory, …)
+    inputTokens: number;
+    cachedTokens: number;
+    cacheHitPct: number;
+    nanoAiu: number;
+    miss: boolean;
+}
+
+/** One row in the current-turn requests table (individual model call). */
+interface TurnRequest {
+    id: string;              // stable 5-char locator (hash of sid:li) — user can ask to investigate it
+    ts: number;
+    model: string;
+    nanoAiu: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    cacheHitPct: number;
+}
+
+type TurnEvent = TurnRequestEvent | TurnToolEvent;
+
+/** Exact composition of a request's input. system/tools are tokenized precisely (o200k);
+ *  conversation is derived so the parts reconcile to the model-reported total exactly. */
+interface TurnInputSplit {
+    systemTokens: number;        // exact tokens of the system prompt content
+    toolsTokens: number;         // exact tokens of the tool-definitions content
+    conversationTokens: number;  // total - system - tools (cached prior history + new delta)
+    newMessageTokens: number;    // exact tokens of this request's fresh messages + user text
+    cachedPriorTokens: number;   // conversation - newMessage (cached prior context, not in sidecars)
+    userTokens: number;          // exact tokens of the latest user request text
+    totalInputTokens: number;    // model-reported inputTokens (authoritative)
+    skillsCount: number;         // # of <skill> entries in the system prompt
+    toolsCount: number;          // # of tool definitions
+    messageCount: number;        // # of messages in inputMessages
+    cachedTokens: number;        // model-reported cached tokens
+}
+
+interface TurnRequestEvent extends TurnRequest {
+    kind: 'request';
+    /** Per-request input breakdown powering the expandable detail row. */
+    split?: TurnInputSplit;
+    /** The turn's initiating request (user submission). Pinned to the top of the timeline. */
+    firstOfTurn?: boolean;
+}
+
+interface TurnToolEvent {
+    kind: 'tool';
+    id: string;
+    ts: number;
+    tool: string;
+    status: string;
+    durMs: number;
+    inputTokens: number;
+    outputTokens: number;
+    group: string;
+    inputPreview: string;
+    outputPreview: string;
+}
+
+/** Per-entry metadata stored in the seen map (version 2+). */
+interface SeenMeta {
+    ts: number;    // epoch ms — used for month bucketing
+    model: string;
+    nano: number;  // nanoAiu
+    in: number;    // inputTokens
+    out: number;   // outputTokens
+    cached?: number; // cachedTokens (added v3; absent on older entries)
+}
+
+interface ObservabilityLedger {
+    version: 1;
+    workspaceKey: string;
+    requestCount: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    nanoAiu: number;
+    /** Cumulative count of cache-miss requests (cached < 50% of input). Optional/back-compat. */
+    cacheMisses?: number;
+    /** Values are SeenMeta for entries written by v2+ code; `true` for legacy entries. */
+    seen: Record<string, SeenMeta | true>;
+    updatedAt: number;
+}
+
+interface MonthBucket extends ScopeMetrics {
+    perModel: Record<string, ScopeMetrics>;
+}
+
+interface MonthShard {
+    version: 1;
+    workspaceKey: string;
+    months: Record<string, MonthBucket>;
+    updatedAt: number;
+    /** Bytes consumed from the append-only usage-requests jsonl (persisted cursor). */
+    rawOffset?: number;
+    /** (Global shard only) responseId → monthKey, persisted for cross-restart dedup. Pruned to recent months. */
+    seenIds?: Record<string, string>;
+    /** (Global shard only) fold-logic version; a bump forces a one-time clean rebuild. */
+    foldVersion?: number;
+}
+
+/** Durable per-tool aggregate for one tool within one month. Durations in ms. */
+interface ToolAggregate {
+    calls: number;
+    errors: number;
+    totalDurMs: number;
+    minDurMs: number;
+    maxDurMs: number;
+    outputChars: number;
+    inputChars: number;
+    byGroup: Record<string, number>;
+}
+
+interface ToolMonthBucket {
+    tools: Record<string, ToolAggregate>;
+}
+
+/** Durable, additive per-workspace tool telemetry. Never rewritten downward. */
+interface ToolShard {
+    version: 1;
+    workspaceKey: string;
+    /** Bytes consumed from the append-only usage-tools jsonl (persisted cursor). */
+    rawOffset: number;
+    months: Record<string, ToolMonthBucket>;
+    updatedAt: number;
+}
+
+const execFileAsync = promisify(execFile);
+/** Bump to force a one-time clean rebuild of the global month shard when fold logic changes. */
+const GLOBAL_FOLD_VERSION = 2;
 // Message types
 type ToWebviewMessage =
     | { type: 'updateQueue'; queue: QueuedPrompt[]; enabled: boolean }
+    | { type: 'updateWorkerQueue'; tasks: Array<{ id: string; role: 'command' | 'subagent'; task: string; status: 'pending' | 'running' | 'done'; createdAt: number }> }
+    | { type: 'availableModels'; models: Array<{ id: string; name: string; vendor: string; family: string; maxInputTokens: number }> }
+    | { type: 'availableTools'; tools: Array<{ name: string; description: string; tags: string[] }> }
     | { type: 'toolCallPending'; id: string; prompt: string; isApprovalQuestion: boolean; choices?: ParsedChoice[] }
     | { type: 'toolCallCompleted'; entry: ToolCallEntry }
     | { type: 'updateCurrentSession'; history: ToolCallEntry[] }
@@ -79,7 +307,32 @@ type ToWebviewMessage =
     | { type: 'updateAttachments'; attachments: AttachmentInfo[] }
     | { type: 'imageSaved'; attachment: AttachmentInfo }
     | { type: 'openSettingsModal' }
-    | { type: 'updateSettings'; soundEnabled: boolean; interactiveApprovalEnabled: boolean; webexEnabled: boolean; telegramEnabled: boolean; autopilotEnabled: boolean; autopilotText: string; reusablePrompts: ReusablePrompt[] }
+    | {
+        type: 'updateSettings';
+        soundEnabled: boolean;
+        interactiveApprovalEnabled: boolean;
+        webexEnabled: boolean;
+        telegramEnabled: boolean;
+        autopilotEnabled: boolean;
+        autopilotText: string;
+        reusablePrompts: ReusablePrompt[];
+        autopilotPrompts?: string[];
+        responseTimeout?: number;
+        sessionWarningHours?: number;
+        maxConsecutiveAutoResponses?: number;
+        turnBudgetAiu?: number;
+        humanLikeDelayEnabled?: boolean;
+        humanLikeDelayMin?: number;
+        humanLikeDelayMax?: number;
+        sendWithCtrlEnter?: boolean;
+        webexStatus?: unknown;
+        telegramStatus?: unknown;
+        debugLoggingEnabled?: boolean;
+        rtkCompressionEnabled?: boolean;
+        rtkInstalled?: boolean;
+    }
+    | { type: 'updateObservabilityMetrics'; metrics: ObservabilityMetrics }
+    | { type: 'updateMemoriesList'; memories: Array<{ file: string; title: string; size: number; modified: number }> }
     | { type: 'slashCommandResults'; prompts: ReusablePrompt[] }
     | { type: 'playNotificationSound' }
     | { type: 'contextSearchResults'; suggestions: Array<{ type: string; label: string; description: string; detail: string }> }
@@ -106,12 +359,23 @@ type FromWebviewMessage =
     | { type: 'addAttachment' }
     | { type: 'removeAttachment'; attachmentId: string }
     | { type: 'removeHistoryItem'; callId: string }
+    | { type: 'workerResolveManual'; taskId: string; result: string }
+    | {
+        type: 'workerRunAutopilot';
+        taskId: string;
+        modelId?: string;
+        agentName?: string;
+        thinkingEffort?: 'low' | 'medium' | 'high';
+    }
+    | { type: 'configureWorkerTools' }
+    | { type: 'changeWorkerModel'; role: 'command' | 'subagent' }
+    | { type: 'requestModels' }
     | { type: 'clearPersistedHistory' }
     | { type: 'openHistoryModal' }
     | { type: 'searchFiles'; query: string }
     | { type: 'saveImage'; data: string; mimeType: string }
     | { type: 'addFileReference'; file: FileSearchResult }
-    | { type: 'webviewReady' }
+    | { type: 'webviewReady'; uiVersion?: string }
     | { type: 'openSettingsModal' }
     | { type: 'updateSoundSetting'; enabled: boolean }
     | { type: 'updateInteractiveApprovalSetting'; enabled: boolean }
@@ -145,9 +409,13 @@ type FromWebviewMessage =
     | { type: 'planPauseExecution' }
     | { type: 'openPlanBoard' }
     | { type: 'updateSendWithCtrlEnterSetting'; enabled: boolean }
+    | { type: 'updateDebugLoggingSetting'; enabled: boolean }
+    | { type: 'updateRtkCompressionSetting'; enabled: boolean }
+    | { type: 'updateCavemanSetting'; enabled: boolean }
     | { type: 'updateResponseTimeout'; value: number }
     | { type: 'updateSessionWarningHours'; value: number }
     | { type: 'updateMaxConsecutiveAutoResponses'; value: number }
+    | { type: 'updateTurnBudgetAiu'; value: number }
     | { type: 'updateHumanDelaySetting'; enabled: boolean }
     | { type: 'updateHumanDelayMin'; value: number }
     | { type: 'updateHumanDelayMax'; value: number }
@@ -187,6 +455,76 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     private _webviewReady: boolean = false;
     private _pendingToolCallMessage: { id: string; prompt: string } | null = null;
 
+    private _observabilityPollInterval: ReturnType<typeof setInterval> | null = null;
+    private readonly _OBSERVABILITY_POLL_MS = 2000;
+    /** Tracks byte + line offsets already consumed per log file so we only read new lines on each poll. */
+    private readonly _logFileReadOffsets = new Map<string, { byteOffset: number; lineCount: number }>();
+    /** Guards one-time load of persisted read offsets (survives extension restart → no re-scan / duplicate appends). */
+    private _logOffsetsLoaded = false;
+    /** Persisted per-file read cursors for the ALL-workspace global credit ingest (separate from the workspace scan). */
+    private readonly _globalLogOffsets = new Map<string, { byteOffset: number; lineCount: number }>();
+    private _globalOffsetsLoaded = false;
+
+    private readonly _WEBVIEW_UI_VERSION = 'workers-tools-hierarchy-v7-memories-list';
+
+    private _observabilityLastReadAt: number = 0;
+    /** Re-entrancy guard: prevents overlapping poll scans from double-counting the turn accumulator. */
+    private _observabilityScanning = false;
+    private _observabilityCache: ObservabilityMetrics = {
+        requestCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedTokens: 0,
+        nanoAiu: 0,
+        lastRequest: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
+        workspace: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
+        overall: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
+        perModel: [],
+        turnRequests: [],
+        turnEvents: [],
+        rtkCommandCount: 0,
+        rtkSavedTokens: 0,
+        rtkSavingsPct: 0,
+        gradle: { runs: 0, optimizedRuns: 0, tasksAvoided: 0, configCacheReuses: 0, savedTokens: 0 },
+        toolCalls: { totalCalls: 0, totalOutputTokens: 0, byTool: [], turn: { totalCalls: 0, totalOutputTokens: 0, byTool: [] } },
+        source: 'unavailable',
+        updatedAt: 0
+    };
+
+    // Accumulator for credits consumed since the last user submit.
+    // Grows as new log lines are processed; finalized and reset on each submit.
+    private _lastRequestMetrics: ScopeMetrics = { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 };
+    /** Per-tool aggregates for the CURRENT turn (reset on each user submit). tool → aggregate. */
+    private _turnToolAgg = new Map<string, ToolAggregate>();
+    /** Individual requests of the current turn (reset each submit), newest last. Capped to bound memory. */
+    private _turnRequests: TurnRequest[] = [];
+    /** Chronological current-turn request/tool events for optimization debugging. */
+    private _turnEvents: TurnEvent[] = [];
+    /** True once the turn's first (initiating) request has been seen — used to pin it on top. */
+    private _turnFirstReqSeen = false;
+    /** Cache of sidecar-file stats (system prompt / tools files) keyed by absolute path. */
+    private _splitFileCache = new Map<string, { tokens: number; count: number }>();
+    /** Rolling tail of recent request summaries (across polls) for cache-miss "before" context. */
+    private _recentReqs: ReqSummary[] = [];
+    /** Compact projection of a request summary for embedding as a neighbor in a cache-miss record. */
+    private _neighbor = (r: ReqSummary) => ({
+        ts: r.ts, role: r.role, model: r.model,
+        cacheHitPct: r.cacheHitPct, inputTokens: r.inputTokens,
+        cachedTokens: r.cachedTokens, nanoAiu: r.nanoAiu,
+        sid: r.sid, li: r.li, responseId: r.responseId,
+    });
+    /** Wall-clock of the last user submit; "This turn" aggregates llm_requests with ts >= this. */
+    private _lastSubmitTs = Date.now();
+    /** Highest user_message.ts seen in log files — prevents duplicate turn resets on re-scan. */
+    private _logTurnStartTs: number = 0;
+    // Throttle the cross-workspace overall(month) computation (reads all month shards).
+    private _overallLastComputedAt: number = 0;
+    private _overallCache: { totals: ScopeMetrics; perModel: ModelBreakdown[] } = {
+        totals: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
+        perModel: []
+    };
+    private readonly _OVERALL_RECOMPUTE_MS = 5000;
+
     // Debounce timer for queue persistence
     private _queueSaveTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly _QUEUE_SAVE_DEBOUNCE_MS = 300;
@@ -198,6 +536,24 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     private _historySaveTimer: ReturnType<typeof setTimeout> | null = null;
     private readonly _HISTORY_SAVE_DEBOUNCE_MS = 2000; // 2 seconds debounce
     private _historyDirty: boolean = false; // Track if history needs saving
+
+    // ── Worker task queues (Commands + Sub-Agents) ──
+    // Tasks are routed to the widget tabs where user can resolve manually or via model.
+    private _workerTasks: Map<string, {
+        id: string;
+        role: 'command' | 'subagent';
+        task: string;
+        modelId?: string;
+        status: 'pending' | 'running' | 'done';
+        resolve: (result: string) => void;
+        createdAt: number;
+    }> = new Map();
+
+    // Legacy worker queue support (keep for backward compat)
+    private _workerQueues: Map<string, {
+        pendingTask: { task: string; resolve: (result: string) => void } | null;
+        workerReady: ((task: string) => void) | null;
+    }> = new Map();
 
     // Performance limits
     private readonly _MAX_HISTORY_ENTRIES = 100;
@@ -353,8 +709,8 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         this._webexService = service;
         // Wire up response callback so Webex replies resolve pending requests
         if (service && typeof service.setResponseCallback === 'function') {
-            service.setResponseCallback((taskId: string, response: string, user: string) => {
-                this._handleMessagingResponse(taskId, response, user);
+            service.setResponseCallback((taskId: string, response: string, user: string, attachments?: AttachmentInfo[]) => {
+                this._handleMessagingResponse(taskId, response, user, attachments);
             });
         }
     }
@@ -367,8 +723,19 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         this._telegramService = service;
         // Wire up response callback so Telegram replies resolve pending requests
         if (service && typeof service.setResponseCallback === 'function') {
-            service.setResponseCallback((taskId: string, response: string, user: string) => {
-                this._handleMessagingResponse(taskId, response, user);
+            service.setResponseCallback((taskId: string, response: string, user: string, attachments?: AttachmentInfo[]) => {
+                this._handleMessagingResponse(taskId, response, user, attachments);
+            });
+        }
+        // Wire up history callback so Telegram /history command can fetch conversation data
+        if (service && typeof service.setHistoryCallback === 'function') {
+            service.setHistoryCallback(() => {
+                return this._currentSessionCalls.map(entry => ({
+                    prompt: entry.prompt,
+                    response: entry.response,
+                    timestamp: entry.timestamp,
+                    status: entry.status
+                }));
             });
         }
     }
@@ -432,6 +799,400 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         }
     }
 
+    // ── Worker task broker (Commands + Sub-Agents tabs) ──
+
+    /**
+     * Queue a task for the Commands or Sub-Agents tab.
+     * Blocks until the user (or selected model) resolves it.
+     */
+    public sendTaskToWorker(role: 'command' | 'subagent', task: string, modelId?: string): Promise<string> {
+        return new Promise<string>((resolve) => {
+            const id = `worker-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+            this._workerTasks.set(id, { id, role, task, modelId, status: 'pending', resolve, createdAt: Date.now() });
+            this._broadcastWorkerQueue();
+        });
+    }
+
+    /**
+     * Resolve a worker task (called from webview: manual submit or autopilot result).
+     */
+    public resolveWorkerTask(id: string, result: string): void {
+        const entry = this._workerTasks.get(id);
+        if (!entry) { return; }
+        entry.status = 'done';
+        entry.resolve(result);
+        // Generic memory capture: distill ANY completed sub-agent task into a
+        // durable memory note (covers research_on and any other tool that
+        // delegates to a sub-agent worker). Best-effort, fire-and-forget so it
+        // never blocks or fails the task resolution. Uses the local model only.
+        if (entry.role === 'subagent') {
+            void summarizeAndStoreMemory(getUserMemoryDir(this._context), entry.task, result)
+                .catch(err => console.warn('[AskAway] sub-agent memory capture failed:', err));
+        }
+        // Remove after brief delay so user sees "done"
+        setTimeout(() => {
+            this._workerTasks.delete(id);
+            this._broadcastWorkerQueue();
+        }, 1500);
+        this._broadcastWorkerQueue();
+    }
+
+    /** Broadcast current worker tasks to the webview */
+    private _broadcastWorkerQueue(): void {
+        const tasks = Array.from(this._workerTasks.values()).map(t => ({
+            id: t.id, role: t.role, task: t.task, status: t.status, createdAt: t.createdAt
+        }));
+        this._broadcast({ type: 'updateWorkerQueue', tasks });
+    }
+
+    /**
+     * Minimal built-in tool set for worker tabs.
+     * Keeps the UI and runtime focused on core Copilot built-ins only.
+     */
+    private _getMinimalWorkerTools(): readonly {
+        name: string;
+        description?: string;
+        inputSchema?: unknown;
+        tags?: readonly string[];
+    }[] {
+        // Explicit minimal set only. This avoids huge catalogs from other extensions
+        // and keeps worker tabs focused on core built-in capabilities.
+        const ALLOWED_TOOL_NAMES = new Set([
+            'execution_subagent',
+            'search_subagent',
+            'explore_subagent',
+            'skill',
+            'copilot_findFiles',
+            'copilot_findTextInFiles',
+            'copilot_readFile',
+            'copilot_listDirectory',
+            'copilot_getErrors',
+            'copilot_getChangedFiles',
+            'copilot_searchCodebase',
+            'copilot_searchWorkspaceSymbols',
+            'copilot_applyPatch',
+            'copilot_createFile',
+            'copilot_createDirectory',
+            'copilot_replaceString',
+            'copilot_multiReplaceString',
+            'copilot_viewImage',
+            'copilot_fetchWebPage',
+            'copilot_runVscodeCommand',
+            'copilot_getVSCodeAPI',
+        ]);
+
+        return vscode.lm.tools.filter(t => ALLOWED_TOOL_NAMES.has(t.name));
+    }
+
+    /** Send available LM models and tool catalog to the webview */
+    public async broadcastAvailableModels(): Promise<void> {
+        try {
+            const models = await vscode.lm.selectChatModels({});
+            // Deduplicate by name — keep one entry per display name (prefer the model
+            // whose id most closely matches its family, i.e. the canonical/shorter id).
+            const seen = new Map<string, typeof models[0]>();
+            for (const m of models) {
+                const existing = seen.get(m.name);
+                if (!existing || m.id.length < existing.id.length) {
+                    seen.set(m.name, m);
+                }
+            }
+            const modelList = Array.from(seen.values()).map(m => ({
+                id: m.id,
+                name: m.name,
+                vendor: m.vendor,
+                family: m.family,
+                maxInputTokens: m.maxInputTokens
+            }));
+            this._broadcast({ type: 'availableModels', models: modelList });
+            const tools = this._getMinimalWorkerTools().map(t => ({
+                name: t.name,
+                description: t.description || '',
+                tags: Array.from(t.tags || [])
+            }));
+            this._broadcast({ type: 'availableTools', tools });
+        } catch {
+            // ignore — model list is best-effort
+        }
+    }
+
+    /**
+     * Run a worker task via delegated model execution.
+     * Commands and sub-agents both run in the same agentic loop; user picks
+     * model/agent/context/thinking from the panel controls.
+     */
+    public async runWorkerTaskWithModel(
+        taskId: string,
+        modelId: string,
+        opts?: {
+            agentName?: string;
+            thinkingEffort?: 'low' | 'medium' | 'high';
+        }
+    ): Promise<void> {
+        const entry = this._workerTasks.get(taskId);
+        if (!entry) { return; }
+
+        entry.status = 'running';
+        this._broadcastWorkerQueue();
+
+        try {
+            const resolvedModelId = modelId || entry.modelId || '';
+            const models = await vscode.lm.selectChatModels({});
+            const model = models.find(m => m.id === resolvedModelId) ?? models[0];
+            if (!model) {
+                this.resolveWorkerTask(taskId, 'Error: no model available');
+                return;
+            }
+
+            const cts = new vscode.CancellationTokenSource();
+
+            const rtkEnabledForTools = this.isRtkCompressionEnabled();
+            // run_terminal is a worker-local tool we implement ourselves so that, when RTK is
+            // enabled, command output is actually routed through the `rtk` binary (real savings).
+            const RUN_TERMINAL_TOOL: vscode.LanguageModelChatTool = {
+                name: 'run_terminal',
+                description: rtkEnabledForTools
+                    ? 'Run a single shell command and get its output. RTK compression is ON: simple commands (ls, tree, git, grep, find, cat, diff, wc, env) are automatically routed through the rtk binary to minimize tokens. Use the fewest commands possible. Pass cwd separately instead of prefixing cd &&.'
+                    : 'Run a single shell command and get its output. Use the fewest commands possible.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        command: { type: 'string', description: 'The shell command to run.' },
+                        cwd: { type: 'string', description: 'Optional working directory. Prefer this over cd/chaining.' }
+                    },
+                    required: ['command']
+                } as vscode.LanguageModelChatTool['inputSchema']
+            };
+
+            const minimalTools: vscode.LanguageModelChatTool[] = this._getMinimalWorkerTools()
+                .map(t => ({
+                    name: t.name,
+                    description: t.description ?? '',
+                    inputSchema: (t.inputSchema ?? { type: 'object', properties: {} }) as vscode.LanguageModelChatTool['inputSchema']
+                }));
+
+            // Command role: force our rtk-wrapped run_terminal + read-only file tools (no black-box
+            // execution_subagent, so shell really goes through rtk). Subagent role: full minimal set.
+            const READONLY_FILE_TOOLS = new Set(['copilot_readFile', 'copilot_listDirectory', 'copilot_findFiles', 'copilot_findTextInFiles']);
+            const allTools: vscode.LanguageModelChatTool[] = entry.role === 'command'
+                ? [RUN_TERMINAL_TOOL, ...minimalTools.filter(t => READONLY_FILE_TOOLS.has(t.name))]
+                : minimalTools;
+
+            const thinkingEffort = opts?.thinkingEffort || 'medium';
+            const agentName = (opts?.agentName || 'default').trim();
+            const rolePrompt = entry.role === 'command'
+                ? 'You are a focused execution worker running on a cheaper model. You receive a SMALL TASK OBJECTIVE in plain language, NOT exact commands. Decide and run the minimal shell commands needed via the run_terminal tool, then return only the essential result. Keep commands simple and few. If the task specifies a working directory, pass it as run_terminal.cwd; do not use cd && command chaining.'
+                : 'You are a delegated research/implementation agent. Use tools as needed and return concise final results.';
+            const effortPrompt = thinkingEffort === 'high'
+                ? 'Think deeply and reason thoroughly before finalizing.'
+                : thinkingEffort === 'low'
+                    ? 'Be brief and fast — skip unnecessary reasoning.'
+                    : 'Use balanced reasoning.';
+            const agentPrompt = agentName !== 'default'
+                ? `Agent profile: ${agentName}. Follow this style profile while solving.`
+                : '';
+
+                        // RTK prompt: instruct model to use rtk CLI wrappers when RTK is enabled.
+                        // rtk is a proxy CLI that compresses tool output to save tokens.
+                        const rtkEnabled = this.isRtkCompressionEnabled();
+                        const rtkDocPrompt = rtkEnabled ? await this.getRtkInstructionPrompt() : '';
+            const rtkPrompt = rtkEnabled
+                ? (entry.role === 'command'
+                    ? 'Token optimization: RTK is ON. The run_terminal tool auto-compresses output for simple commands (ls, tree, git, grep, find, cat, diff, wc, env). Prefer those simple forms and avoid pipes/redirects so compression applies.'
+                    : 'Token optimization: when running shell commands, prefer rtk wrappers to minimize context usage: ' +
+                      '`rtk ls`, `rtk tree`, `rtk git <cmd>`, `rtk find`, `rtk grep`, `rtk diff`, `rtk read <file>`. ' +
+                      'Use raw commands only when rtk has no equivalent.')
+                : '';
+
+            const systemPrompt = [rolePrompt, agentPrompt, effortPrompt, rtkPrompt, rtkDocPrompt].filter(Boolean).join(' ');
+
+            // Agentic message history
+            const messages: vscode.LanguageModelChatMessage[] = [
+                vscode.LanguageModelChatMessage.User(systemPrompt),
+                vscode.LanguageModelChatMessage.User(entry.task)
+            ];
+
+            let finalText = '';
+            const MAX_ITERATIONS = 20;
+
+            for (let i = 0; i < MAX_ITERATIONS; i++) {
+                const response = await model.sendRequest(
+                    messages,
+                    { tools: allTools },
+                    cts.token
+                );
+
+                let turnText = '';
+                const toolCalls: vscode.LanguageModelToolCallPart[] = [];
+
+                for await (const part of response.stream) {
+                    if (part instanceof vscode.LanguageModelTextPart) {
+                        turnText += part.value;
+                    } else if (part instanceof vscode.LanguageModelToolCallPart) {
+                        toolCalls.push(part);
+                    }
+                }
+
+                if (turnText) { finalText += (finalText ? '\n' : '') + turnText; }
+                if (toolCalls.length === 0) { break; }
+
+                messages.push(vscode.LanguageModelChatMessage.Assistant(
+                    toolCalls.map(tc => new vscode.LanguageModelToolCallPart(tc.callId, tc.name, tc.input))
+                ));
+
+                const resultParts: vscode.LanguageModelToolResultPart[] = [];
+                for (const tc of toolCalls) {
+                    try {
+                        if (tc.name === 'run_terminal') {
+                            const input = tc.input as Record<string, unknown> | undefined;
+                            const cmd = String(input?.command ?? '').trim();
+                            const cwd = typeof input?.cwd === 'string' ? input.cwd.trim() : undefined;
+                            const out = cmd
+                                ? await this._runShellWithRtk(cmd, cwd)
+                                : 'Error: command is required';
+                            resultParts.push(new vscode.LanguageModelToolResultPart(tc.callId, [
+                                new vscode.LanguageModelTextPart(out)
+                            ]));
+                            continue;
+                        }
+                        const toolResult = await vscode.lm.invokeTool(
+                            tc.name,
+                            { input: tc.input as Record<string, unknown>, toolInvocationToken: undefined },
+                            cts.token
+                        );
+                        resultParts.push(new vscode.LanguageModelToolResultPart(tc.callId, toolResult.content));
+                    } catch (toolErr) {
+                        const msg = toolErr instanceof Error ? toolErr.message : String(toolErr);
+                        resultParts.push(new vscode.LanguageModelToolResultPart(tc.callId, [
+                            new vscode.LanguageModelTextPart(`Tool error: ${msg}`)
+                        ]));
+                    }
+                }
+
+                messages.push(vscode.LanguageModelChatMessage.User(resultParts));
+            }
+
+            this.resolveWorkerTask(taskId, finalText || '(no output)');
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.resolveWorkerTask(taskId, `Error: ${msg}`);
+        }
+    }
+
+    /**
+     * Extract and execute a shell command from a task description.
+     * Pulls command from backticks if present, otherwise runs the full text as bash.
+     */
+    private _executeWorkerShellCommand(taskText: string): Promise<string> {
+        // Try to extract command from backticks first
+        const backtickMatch = taskText.match(/`([^`\n]+)`/);
+        const command = backtickMatch ? backtickMatch[1].trim() : taskText.trim();
+
+        return new Promise((resolve) => {
+            const { exec } = require('child_process');
+            exec(command, { shell: '/bin/bash', timeout: 30000, maxBuffer: 1024 * 1024 }, (error: Error | null, stdout: string, stderr: string) => {
+                if (error && !stdout) {
+                    resolve(stderr.trim() || error.message);
+                } else {
+                    // Return stdout; append stderr if both present
+                    const out = stdout.trim();
+                    const err2 = stderr.trim();
+                    resolve(out + (err2 && out ? '\n--- stderr ---\n' + err2 : err2));
+                }
+            });
+        });
+    }
+
+    /**
+     * Rewrite a simple shell command to route through the `rtk` binary when RTK compression
+     * is enabled, so output is compressed and `rtk gain` records real savings. Only single,
+     * pipe-free commands with a known rtk equivalent are wrapped; everything else runs as-is.
+     */
+    private _wrapCommandWithRtk(command: string): string {
+        if (!this.isRtkCompressionEnabled()) { return command; }
+        const rtkBinary = this._findRtkBinary();
+        if (!rtkBinary) { return command; }
+        const rtk = this._shellQuote(rtkBinary);
+        const trimmed = command.trim();
+        if (/^rtk(\s|$)/.test(trimmed)) { return trimmed; }
+        // Stay safe: do not wrap compound commands (pipes, redirects, chaining, subshells).
+        if (/[|&;<>$`]/.test(trimmed) || /\$\(/.test(trimmed)) { return command; }
+        const parts = trimmed.split(/\s+/);
+        const first = parts[0];
+        const rest = parts.slice(1).join(' ');
+        if (first === 'git') { return `${rtk} git ${rest}`.trim(); }
+        if (first === 'cat') { return `${rtk} read ${rest}`.trim(); }
+        const directWrap = new Set(['ls', 'tree', 'grep', 'find', 'diff', 'wc', 'env']);
+        if (directWrap.has(first)) { return `${rtk} ${trimmed}`; }
+        return command;
+    }
+
+    private _findRtkBinary(): string | null {
+        const pathCandidates = (process.env.PATH ?? '')
+            .split(path.delimiter)
+            .filter(Boolean)
+            .map(dir => path.join(dir, 'rtk'));
+        const candidates = [
+            '/opt/homebrew/bin/rtk',
+            '/usr/local/bin/rtk',
+            ...pathCandidates
+        ];
+
+        for (const candidate of candidates) {
+            try {
+                fs.accessSync(candidate, fs.constants.X_OK);
+                return candidate;
+            } catch {
+                // Continue searching.
+            }
+        }
+
+        return null;
+    }
+
+    private _shellQuote(value: string): string {
+        return `'${value.replace(/'/g, `'\\''`)}'`;
+    }
+
+    /**
+     * Execute a shell command for a worker, routing through rtk when enabled.
+     * This is the path that makes RTK savings real (vs. the model calling a black-box subagent).
+     */
+    private _runShellWithRtk(command: string, requestedCwd?: string): Promise<string> {
+        const finalCmd = this._wrapCommandWithRtk(command);
+        const cwd = requestedCwd || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        return new Promise((resolve) => {
+            const { exec } = require('child_process');
+            exec(finalCmd, { shell: '/bin/bash', cwd, timeout: 30000, maxBuffer: 1024 * 1024 }, (error: Error | null, stdout: string, stderr: string) => {
+                const out = (stdout || '').trim();
+                const err = (stderr || '').trim();
+                if (error && !out) {
+                    resolve(err || error.message);
+                } else {
+                    resolve(out + (err && out ? '\n--- stderr ---\n' + err : err));
+                }
+            });
+        });
+    }
+
+    // Legacy: keep waitForTask/submitTaskResult for backward compat
+    public waitForTask(role: string): Promise<string> {
+        return new Promise<string>((resolve) => {
+            let queue = this._workerQueues.get(role);
+            if (!queue) { queue = { pendingTask: null, workerReady: null }; this._workerQueues.set(role, queue); }
+            if (queue.pendingTask) { resolve(queue.pendingTask.task); }
+            else { queue.workerReady = resolve; }
+        });
+    }
+    public submitTaskResult(role: string, result: string): void {
+        const queue = this._workerQueues.get(role);
+        if (queue?.pendingTask) { queue.pendingTask.resolve(result); queue.pendingTask = null; }
+    }
+    public isWorkerRegistered(role: string): boolean {
+        const queue = this._workerQueues.get(role);
+        return !!queue && (queue.workerReady !== null || queue.pendingTask !== null);
+    }
+
     /** Get the active plan task ID (if plan is executing) */
     public getActivePlanTaskId(): string | null {
         return this._planEditor?.getActiveTaskId() ?? null;
@@ -445,7 +1206,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     /**
      * Handle a response coming from an external messaging service (Webex/Telegram)
      */
-    private _handleMessagingResponse(taskId: string, response: string, user: string): void {
+    private _handleMessagingResponse(taskId: string, response: string, user: string, attachments?: AttachmentInfo[]): void {
         // The taskId from messaging services is the toolCallId
         if (!this._currentToolCallId) { return; }
 
@@ -472,8 +1233,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         }
 
         this._updateCurrentSessionUI();
+        this._resetTurnMetrics();
         const resolvedMsgId = this._currentToolCallId;
-        resolve({ value: response, queue: this._queueEnabled, attachments: [] });
+        resolve({ value: response, queue: this._queueEnabled, attachments: attachments || [] });
         this._pendingRequests.delete(this._currentToolCallId);
         this._currentToolCallId = null;
         this._signalNextWaiter();
@@ -900,6 +1662,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 this._view?.webview.postMessage({ type: 'toolCallCompleted', entry: pendingEntry } as ToWebviewMessage);
             }
             this._updateCurrentSessionUI();
+            this._resetTurnMetrics();
             resolve({ value: responseText, queue: this._queueEnabled && this._promptQueue.length > 0, attachments: [] });
             this._pendingRequests.delete(toolCallId);
             this._currentToolCallId = null;
@@ -965,6 +1728,11 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
         const responseTimeout = this._readResponseTimeoutMinutes(config);
         const maxConsecutiveAutoResponses = config.get<number>('maxConsecutiveAutoResponses', 5);
+        const turnBudgetAiu = config.get<number>('turnBudgetAiu', 0);
+        const debugLoggingEnabled = vscode.workspace.getConfiguration('github.copilot.chat')
+            .get<boolean>('agentDebugLog.fileLogging.enabled', false);
+        const rtkCompressionEnabled = fs.existsSync(path.join(os.homedir(), '.askaway-rtk-enabled')) && this.isRtkInstalled();
+        const rtkInstalled = this.isRtkInstalled();
 
         this._broadcast({
             type: 'updateSettings',
@@ -979,13 +1747,1317 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             responseTimeout,
             sessionWarningHours: this._sessionWarningHours,
             maxConsecutiveAutoResponses,
+            turnBudgetAiu,
             humanLikeDelayEnabled: this._humanLikeDelayEnabled,
             humanLikeDelayMin: this._humanLikeDelayMin,
             humanLikeDelayMax: this._humanLikeDelayMax,
             sendWithCtrlEnter: this._sendWithCtrlEnter,
+            debugLoggingEnabled,
+            rtkCompressionEnabled,
+            rtkInstalled,
             webexStatus,
             telegramStatus
         } as any);
+
+        void this._broadcastObservabilityMetrics();
+    }
+
+    private async _broadcastObservabilityMetrics(): Promise<void> {
+        // Re-entrancy guard: the async scan (reads debug logs, advances offsets, accumulates
+        // the turn totals) can take >1 poll interval. Without this guard, overlapping runs
+        // read the same bytes twice and DOUBLE-COUNT the "This turn" credits (2K vs true 1K).
+        if (this._observabilityScanning) {
+            return;
+        }
+        this._observabilityScanning = true;
+        try {
+            const nextMetrics = await this._collectObservabilityMetrics();
+            nextMetrics.lastRequest = this._deriveLastRequest();
+            this._observabilityCache = this._stabilizeObservabilityMetrics(nextMetrics);
+            this._observabilityLastReadAt = Date.now();
+
+            this._broadcast({
+                type: 'updateObservabilityMetrics',
+                metrics: this._observabilityCache
+            });
+        } finally {
+            this._observabilityScanning = false;
+        }
+
+        void this._broadcastMemoriesList();
+    }
+
+    private async _broadcastMemoriesList(): Promise<void> {
+        try {
+            const memories = await listMemories(getUserMemoryDir(this._context));
+            this._broadcast({ type: 'updateMemoriesList', memories });
+        } catch {
+            // Best-effort; memories list is non-critical.
+        }
+    }
+
+    private _stabilizeObservabilityMetrics(next: ObservabilityMetrics): ObservabilityMetrics {
+        const previous = this._observabilityCache;
+        if (previous.updatedAt <= 0) {
+            return next;
+        }
+
+        if (next.source === 'unavailable') {
+            return {
+                ...previous,
+                source: previous.source === 'unavailable' ? 'unavailable' : `${previous.source} (last good)`,
+                updatedAt: next.updatedAt
+            };
+        }
+
+        // Workspace cumulative is monotonic; guard against transient under-reads.
+        const workspace: ScopeMetrics = {
+            requestCount: Math.max(previous.workspace.requestCount, next.workspace.requestCount),
+            inputTokens: Math.max(previous.workspace.inputTokens, next.workspace.inputTokens),
+            outputTokens: Math.max(previous.workspace.outputTokens, next.workspace.outputTokens),
+            cachedTokens: Math.max(previous.workspace.cachedTokens, next.workspace.cachedTokens),
+            nanoAiu: Math.max(previous.workspace.nanoAiu, next.workspace.nanoAiu)
+        };
+
+        // Month overall is also monotonically non-decreasing within a month; protect against
+        // transient 0-reads (e.g. ledger file lock or throttled recompute returning stale 0).
+        const overall: ScopeMetrics = {
+            requestCount: Math.max(previous.overall.requestCount, next.overall.requestCount),
+            inputTokens: Math.max(previous.overall.inputTokens, next.overall.inputTokens),
+            outputTokens: Math.max(previous.overall.outputTokens, next.overall.outputTokens),
+            cachedTokens: Math.max(previous.overall.cachedTokens, next.overall.cachedTokens),
+            nanoAiu: Math.max(previous.overall.nanoAiu, next.overall.nanoAiu)
+        };
+
+        return {
+            ...next,
+            workspace,
+            overall,
+            // Mirror workspace cumulative into the flat fields for backward compatibility.
+            requestCount: workspace.requestCount,
+            inputTokens: workspace.inputTokens,
+            outputTokens: workspace.outputTokens,
+            cachedTokens: workspace.cachedTokens,
+            nanoAiu: workspace.nanoAiu,
+            rtkCommandCount: Math.max(previous.rtkCommandCount, next.rtkCommandCount),
+            rtkSavedTokens: Math.max(previous.rtkSavedTokens, next.rtkSavedTokens)
+        };
+    }
+
+    private _emptyScope(): ScopeMetrics {
+        return { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 };
+    }
+
+    private _getMonthKey(ts: number): string {
+        const d = Number.isFinite(ts) && ts > 0 ? new Date(ts) : new Date();
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        return `${y}-${m}`;
+    }
+
+    private async _collectObservabilityMetrics(): Promise<ObservabilityMetrics> {
+        const emptyMetrics = (): ObservabilityMetrics => ({
+            requestCount: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedTokens: 0,
+            nanoAiu: 0,
+            lastRequest: this._emptyScope(),
+            workspace: this._emptyScope(),
+            overall: this._emptyScope(),
+            perModel: [],
+            turnRequests: [],
+            turnEvents: [],
+            rtkCommandCount: 0,
+            rtkSavedTokens: 0,
+            rtkSavingsPct: 0,
+            gradle: { runs: 0, optimizedRuns: 0, tasksAvoided: 0, configCacheReuses: 0, savedTokens: 0 },
+            toolCalls: { totalCalls: 0, totalOutputTokens: 0, byTool: [], turn: { totalCalls: 0, totalOutputTokens: 0, byTool: [] } },
+            source: 'unavailable',
+            updatedAt: Date.now()
+        });
+
+        try {
+            const workspaceKey = this._getObservabilityWorkspaceKey();
+            const ledger = await this._loadObservabilityLedger(workspaceKey);
+            await this._loadLogOffsets();
+            const logFiles = await this._findWorkspaceCopilotDebugLogFiles();
+            const currentMonth = this._getMonthKey(Date.now());
+
+            if (logFiles.length === 0) {
+                const rtk = await this._collectRtkObservability();
+                const gradleObs = await this._collectGradleObservability();
+                const toolObs = await this._collectToolCallObservability();
+                const overall = await this._computeOverallMonth(currentMonth);
+                const workspaceScope: ScopeMetrics = {
+                    requestCount: ledger.requestCount,
+                    inputTokens: ledger.inputTokens,
+                    outputTokens: ledger.outputTokens,
+                    cachedTokens: ledger.cachedTokens,
+                    nanoAiu: ledger.nanoAiu,
+                    cacheMisses: ledger.cacheMisses || 0
+                };
+                const base = emptyMetrics();
+                return {
+                    ...base,
+                    requestCount: workspaceScope.requestCount,
+                    inputTokens: workspaceScope.inputTokens,
+                    outputTokens: workspaceScope.outputTokens,
+                    cachedTokens: workspaceScope.cachedTokens,
+                    nanoAiu: workspaceScope.nanoAiu,
+                    workspace: workspaceScope,
+                    lastRequest: this._deriveLastRequest(),
+                    overall: overall.totals,
+                    perModel: overall.perModel,
+                    turnRequests: [...this._turnRequests],
+                    turnEvents: [...this._turnEvents],
+                    rtkCommandCount: rtk.commandCount,
+                    rtkSavedTokens: rtk.savedTokens,
+                    rtkSavingsPct: rtk.savingsPct,
+                    gradle: this._gradleWithSavings(gradleObs, toolObs),
+                    toolCalls: toolObs,
+                    source: ledger.requestCount > 0 ? 'ledger:last good' : 'unavailable'
+                };
+            }
+
+            const rawRows: string[] = [];
+            const toolRows: string[] = [];
+            // Ordered summaries of NEW requests this pass — used to attach before/after
+            // neighbor context to cache-miss records (so a spike points at its surroundings).
+            const scanSummaries: ReqSummary[] = [];
+            // "This turn" is accumulated into this._lastRequestMetrics across polls. Because we now
+            // read only NEW bytes each poll (incremental), we must ADD to the running total rather
+            // than recompute from a full-file scan. The total is reset to empty at each turn
+            // boundary (user submit / user_message log line) via _resetTurnMetrics().
+            for (const logFile of logFiles) {
+                let raw = '';
+                let lineIndexBase = 0;
+                try {
+                    // Incremental read: only consume bytes added since the last poll.
+                    // This avoids re-scanning the entire (potentially 10k+ line) JSONL on every tick.
+                    const entry = this._logFileReadOffsets.get(logFile);
+                    const knownOffset = entry?.byteOffset ?? 0;
+                    const knownLineCount = entry?.lineCount ?? 0;
+                    const fd = await fs.promises.open(logFile, 'r');
+                    try {
+                        const fileSize = (await fd.stat()).size;
+                        if (fileSize > knownOffset) {
+                            const buf = Buffer.allocUnsafe(fileSize - knownOffset);
+                            await fd.read(buf, 0, buf.length, knownOffset);
+                            // Only consume up to the last complete line (newline boundary) so a
+                            // partially-flushed trailing line isn't split across polls, which would
+                            // corrupt line indexing and JSON parsing.
+                            const lastNl = buf.lastIndexOf(0x0a);
+                            if (lastNl < 0) {
+                                // No complete line yet; wait for more data.
+                                continue;
+                            }
+                            raw = buf.toString('utf8', 0, lastNl + 1);
+                            lineIndexBase = knownLineCount;
+                            // Advance offset to the newline boundary; count only complete lines.
+                            const consumedLines = raw.split('\n').length - 1; // trailing '' after final \n
+                            this._logFileReadOffsets.set(logFile, {
+                                byteOffset: knownOffset + lastNl + 1,
+                                lineCount: knownLineCount + consumedLines
+                            });
+                        }
+                    } finally {
+                        await fd.close();
+                    }
+                } catch {
+                    continue;
+                }
+                if (!raw) {
+                    continue;
+                }
+
+                const sessionId = path.basename(path.dirname(logFile));
+                const lines = raw.split(/\r?\n/);
+                for (let i = 0; i < lines.length; i++) {
+                    const lineIndex = lineIndexBase + i;
+                    const line = lines[i];
+                    if (!line) {
+                        continue;
+                    }
+
+                    // ── User-submit boundary: `user_message` fires once per real user
+                    // submission (unlike `turn_start`, which fires for every agent iteration).
+                    // Use the log timestamp as the precise "This turn" window start.
+                    if (line.indexOf('"type":"user_message"') !== -1) {
+                        try {
+                            const ts = (JSON.parse(line) as { ts?: number }).ts;
+                            if (typeof ts === 'number' && ts > this._logTurnStartTs) {
+                                this._logTurnStartTs = ts;
+                                this._resetTurnMetrics(ts);
+                            }
+                        } catch { /* malformed — skip */ }
+                        continue;
+                    }
+
+                    // ── Tool-call telemetry: Copilot logs EVERY tool invocation (built-in
+                    // + custom) as a `tool_call` entry with name/dur(ms)/status plus
+                    // attrs.args (input) and attrs.result (output). Ingest all of them so the
+                    // table isn't limited to AskAway's own tools. Append to the durable
+                    // append-only usage-tools log and accumulate the current turn.
+                    if (line.indexOf('"type":"tool_call"') !== -1) {
+                        try {
+                            const t = JSON.parse(line) as Record<string, unknown>;
+                            const tAttrs = (t.attrs as Record<string, unknown> | undefined) ?? {};
+                            const toolName = typeof t.name === 'string' ? t.name : 'unknown';
+                            const durMs = typeof t.dur === 'number' ? t.dur : 0;
+                            const tStatus = typeof t.status === 'string' ? t.status : 'ok';
+                            const tTs = typeof t.ts === 'number' ? t.ts : Date.now();
+                            const argsStr = typeof tAttrs.args === 'string'
+                                ? tAttrs.args
+                                : (tAttrs.args != null ? JSON.stringify(tAttrs.args) : '');
+                            const resultStr = typeof tAttrs.result === 'string'
+                                ? tAttrs.result
+                                : (tAttrs.result != null ? JSON.stringify(tAttrs.result) : '');
+                            const group = this._toolInputGroup(toolName, argsStr);
+                            toolRows.push(JSON.stringify({
+                                ts: tTs, sid: sessionId, li: lineIndex, tool: toolName,
+                                dur: durMs, status: tStatus,
+                                inChars: argsStr.length, outChars: resultStr.length,
+                                group, workspaceKey
+                            }));
+                            if (tTs >= this._lastSubmitTs) {
+                                this._foldToolAgg(this._turnToolAgg, toolName, durMs, tStatus, argsStr.length, resultStr.length, group);
+                                this._pushTurnEvent({
+                                    kind: 'tool',
+                                    id: this._shortReqId(sessionId, lineIndex),
+                                    ts: tTs,
+                                    tool: toolName,
+                                    status: tStatus,
+                                    durMs,
+                                    inputTokens: countTokens(argsStr),
+                                    outputTokens: countTokens(resultStr),
+                                    group,
+                                    inputPreview: this._previewToolPayload(argsStr),
+                                    outputPreview: this._previewToolPayload(resultStr)
+                                });
+                            }
+                        } catch { /* malformed tool_call — skip */ }
+                        continue;
+                    }
+
+                    if (line.indexOf('llm_request') === -1) {
+                        continue;
+                    }
+
+                    let parsed: Record<string, unknown>;
+                    try {
+                        parsed = JSON.parse(line) as Record<string, unknown>;
+                    } catch {
+                        // Ignore malformed lines and continue collecting from others.
+                        continue;
+                    }
+                    const attrs = parsed.attrs as Record<string, unknown> | undefined;
+                    if (!attrs || typeof attrs !== 'object') {
+                        continue;
+                    }
+
+                    const inputTokens = typeof attrs.inputTokens === 'number' ? attrs.inputTokens : 0;
+                    const outputTokens = typeof attrs.outputTokens === 'number' ? attrs.outputTokens : 0;
+                    const cachedTokens = typeof attrs.cachedTokens === 'number' ? attrs.cachedTokens : 0;
+                    const nanoAiu = typeof attrs.copilotUsageNanoAiu === 'number' ? attrs.copilotUsageNanoAiu : 0;
+                    const model = typeof attrs.model === 'string' ? attrs.model : 'unknown';
+                    const ts = typeof parsed.ts === 'number' ? parsed.ts : Date.now();
+                    const debugName = typeof attrs.debugName === 'string' ? attrs.debugName : '';
+                    const billableOrIdentified = model !== 'unknown' || inputTokens > 0 || outputTokens > 0 || cachedTokens > 0 || nanoAiu > 0;
+                    if (!billableOrIdentified) {
+                        continue;
+                    }
+
+                    // NOTE: we deliberately do NOT skip `summarize*` (compaction) or retry calls —
+                    // they consume real credits (copilotUsageNanoAiu), so counting them keeps
+                    // turn/workspace totals consistent with Copilot's own billed figure.
+
+                    // Current user turn: aggregate EVERY llm_request since the last submit.
+                    // Accumulated into the persistent field so incremental reads don't reset it;
+                    // _resetTurnMetrics() clears it at each turn boundary.
+                    const isMiss = this._isCacheMiss(inputTokens, cachedTokens);
+                    if (ts >= this._lastSubmitTs) {
+                        this._lastRequestMetrics.requestCount += 1;
+                        this._lastRequestMetrics.inputTokens += inputTokens;
+                        this._lastRequestMetrics.outputTokens += outputTokens;
+                        this._lastRequestMetrics.cachedTokens += cachedTokens;
+                        this._lastRequestMetrics.nanoAiu += nanoAiu;
+                        if (isMiss) { this._lastRequestMetrics.cacheMisses = (this._lastRequestMetrics.cacheMisses || 0) + 1; }
+                        // Individual row for the "This turn" requests table (capped to bound memory).
+                        const turnRequest: TurnRequest = {
+                            id: this._shortReqId(sessionId, lineIndex),
+                            ts, model, nanoAiu,
+                            inputTokens, outputTokens, cachedTokens,
+                            cacheHitPct: inputTokens > 0 ? Math.round(cachedTokens / inputTokens * 100) : 100,
+                        };
+                        this._turnRequests.push(turnRequest);
+                        if (this._turnRequests.length > 500) { this._turnRequests.shift(); }
+                        const reqEvent: TurnRequestEvent = { kind: 'request', ...turnRequest };
+                        // Per-request input breakdown (system prompt + tool defs + history),
+                        // powering the expandable detail row. Sidecar reads are cached.
+                        const split = this._computeInputSplit(path.dirname(logFile), attrs, inputTokens, cachedTokens);
+                        if (split) { reqEvent.split = split; }
+                        // The first request of the turn is the user submission — Copilot may log
+                        // its ts AFTER an early tool call it emitted, so pin it to the top.
+                        if (!this._turnFirstReqSeen) { this._turnFirstReqSeen = true; reqEvent.firstOfTurn = true; }
+                        this._pushTurnEvent(reqEvent);
+                    }
+
+                    // Stable dedup key: session + line index + content hash. Must be identical
+                    // whether the line was read in a full scan or an incremental scan, otherwise
+                    // the same request would be counted twice across restarts. Incremental reads
+                    // only reach this hash for the handful of NEW lines per poll, so it's cheap.
+                    const recordKey = `${sessionId}:${lineIndex}:${this._hashText(line)}`;
+                    if (ledger.seen[recordKey] === true) {
+                        // Upgrade legacy boolean entry to full SeenMeta.
+                        ledger.seen[recordKey] = { ts, model, nano: nanoAiu, in: inputTokens, out: outputTokens, cached: cachedTokens };
+                        ledger.requestCount += 1;
+                        ledger.inputTokens += inputTokens;
+                        ledger.outputTokens += outputTokens;
+                        ledger.cachedTokens += cachedTokens;
+                        ledger.nanoAiu += nanoAiu;
+                        if (isMiss) { ledger.cacheMisses = (ledger.cacheMisses || 0) + 1; }
+                        continue;
+                    }
+                    if (ledger.seen[recordKey]) {
+                        continue;
+                    }
+                    ledger.seen[recordKey] = { ts, model, nano: nanoAiu, in: inputTokens, out: outputTokens, cached: cachedTokens };
+
+                    // Workspace cumulative ledger.
+                    ledger.requestCount += 1;
+                    ledger.inputTokens += inputTokens;
+                    ledger.outputTokens += outputTokens;
+                    ledger.cachedTokens += cachedTokens;
+                    ledger.nanoAiu += nanoAiu;
+                    if (isMiss) { ledger.cacheMisses = (ledger.cacheMisses || 0) + 1; }
+
+                    const cacheHitPct = inputTokens > 0 ? Math.round(cachedTokens / inputTokens * 100) : 100;
+
+                    // Full per-request row for the master table (usage-requests jsonl).
+                    rawRows.push(JSON.stringify({
+                        ts,
+                        id: this._shortReqId(sessionId, lineIndex),
+                        dur: typeof parsed.dur === 'number' ? parsed.dur : null,
+                        ttft: typeof attrs.ttft === 'number' ? attrs.ttft : null,
+                        status: typeof parsed.status === 'string' ? parsed.status : null,
+                        sid: sessionId,
+                        li: lineIndex,
+                        responseId: typeof attrs.responseId === 'string' ? attrs.responseId : null,
+                        model,
+                        role: debugName,
+                        inputTokens,
+                        outputTokens,
+                        cachedTokens,
+                        cacheHitPct,
+                        nanoAiu,
+                        workspaceKey
+                    }));
+
+                    // Parallel summary for neighbor (before/after) context on cache-miss records.
+                    scanSummaries.push({
+                        ts, sid: sessionId, li: lineIndex,
+                        responseId: typeof attrs.responseId === 'string' ? attrs.responseId : null,
+                        model, role: debugName,
+                        inputTokens, cachedTokens, cacheHitPct, nanoAiu, miss: isMiss
+                    });
+                }
+                // Read offset was already advanced (newline-aligned) when the bytes were read.
+            }
+
+            // Emit cache-miss records with before/after neighbor context. `window` prepends the
+            // previous poll's tail so an early-in-batch spike still gets "before" context, and we
+            // save the new tail for the next poll. Each record points back to the master table.
+            if (scanSummaries.length > 0) {
+                const window = [...this._recentReqs, ...scanSummaries];
+                const base = this._recentReqs.length;
+                for (let k = 0; k < scanSummaries.length; k++) {
+                    if (!scanSummaries[k].miss) { continue; }
+                    const idx = base + k;
+                    const before = window.slice(Math.max(0, idx - 3), idx).map(this._neighbor);
+                    const after = window.slice(idx + 1, idx + 4).map(this._neighbor);
+                    const cur = scanSummaries[k];
+                    void this._recordCacheMissSpike({
+                        ts: cur.ts, model: cur.model, role: cur.role,
+                        inputTokens: cur.inputTokens, cachedTokens: cur.cachedTokens,
+                        cacheHitPct: cur.cacheHitPct, nanoAiu: cur.nanoAiu,
+                        sid: cur.sid, responseId: cur.responseId,
+                        workspaceKey,
+                        // Pointer into the master table (append-only per-request log) for full context.
+                        master: { file: `usage-requests/${workspaceKey}.jsonl`, sid: cur.sid, li: cur.li, responseId: cur.responseId },
+                        before, after,
+                    });
+                }
+                this._recentReqs = window.slice(-3);
+            }
+
+            ledger.updatedAt = Date.now();
+            // _lastRequestMetrics is accumulated in-place during the scan above; no reassignment.
+            await this._saveObservabilityLedger(ledger);
+            await this._saveLogOffsets();
+            if (rawRows.length > 0) {
+                await this._appendRawRequestRows(workspaceKey, rawRows);
+            }
+            if (toolRows.length > 0) {
+                await this._appendRawToolRows(workspaceKey, toolRows);
+            }
+
+            const workspaceScope: ScopeMetrics = {
+                requestCount: ledger.requestCount,
+                inputTokens: ledger.inputTokens,
+                outputTokens: ledger.outputTokens,
+                cachedTokens: ledger.cachedTokens,
+                nanoAiu: ledger.nanoAiu,
+                cacheMisses: ledger.cacheMisses || 0
+            };
+            const overall = await this._computeOverallMonth(currentMonth);
+            const rtk = await this._collectRtkObservability();
+            const gradleObs = await this._collectGradleObservability();
+            const toolObs = await this._collectToolCallObservability();
+
+            return {
+                requestCount: workspaceScope.requestCount,
+                inputTokens: workspaceScope.inputTokens,
+                outputTokens: workspaceScope.outputTokens,
+                cachedTokens: workspaceScope.cachedTokens,
+                nanoAiu: workspaceScope.nanoAiu,
+                lastRequest: this._deriveLastRequest(),
+                workspace: workspaceScope,
+                overall: overall.totals,
+                perModel: overall.perModel,
+                turnRequests: [...this._turnRequests],
+                turnEvents: [...this._turnEvents],
+                rtkCommandCount: rtk.commandCount,
+                rtkSavedTokens: rtk.savedTokens,
+                rtkSavingsPct: rtk.savingsPct,
+                gradle: this._gradleWithSavings(gradleObs, toolObs),
+                toolCalls: toolObs,
+                source: `ledger:${logFiles.length} logs`,
+                updatedAt: Date.now()
+            };
+        } catch {
+            return emptyMetrics();
+        }
+    }
+
+    /** Returns the aggregate of all llm_requests since the user's last submit (current turn). */
+    private _deriveLastRequest(): ScopeMetrics {
+        return { ...this._lastRequestMetrics };
+    }
+
+    /**
+     * Current-month totals across all workspaces, read from ONE durable, additive "global"
+     * month shard. The shard is fed by streaming EVERY workspace's Copilot debug log
+     * (`main.jsonl`) through persisted per-file byte cursors — the debug logs are the
+     * comprehensive, append-only source Copilot maintains, so this captures every request
+     * (not just the ones AskAway happened to mirror). The shard only ever grows and is
+     * persisted, so the credit figure can never drop even if debug logs later rotate away.
+     */
+    private async _computeOverallMonth(currentMonth: string): Promise<{ totals: ScopeMetrics; perModel: ModelBreakdown[] }> {
+        const now = Date.now();
+        if (now - this._overallLastComputedAt < this._OVERALL_RECOMPUTE_MS) {
+            return this._overallCache;
+        }
+        this._overallLastComputedAt = now;
+
+        const totals = this._emptyScope();
+        const perModelMap = new Map<string, ScopeMetrics>();
+        let shard: MonthShard;
+        try {
+            shard = await this._ingestGlobalDebugLogs();
+        } catch {
+            this._overallCache = { totals, perModel: [] };
+            return this._overallCache;
+        }
+
+        const bucket = shard.months[currentMonth];
+        if (bucket) {
+            totals.requestCount += bucket.requestCount || 0;
+            totals.inputTokens += bucket.inputTokens || 0;
+            totals.outputTokens += bucket.outputTokens || 0;
+            totals.cachedTokens += bucket.cachedTokens || 0;
+            totals.nanoAiu += bucket.nanoAiu || 0;
+            totals.cacheMisses = (totals.cacheMisses || 0) + (bucket.cacheMisses || 0);
+            for (const [model, s] of Object.entries(bucket.perModel || {})) {
+                const acc = perModelMap.get(model) ?? this._emptyScope();
+                acc.requestCount += s.requestCount || 0;
+                acc.inputTokens += s.inputTokens || 0;
+                acc.outputTokens += s.outputTokens || 0;
+                acc.cachedTokens += s.cachedTokens || 0;
+                acc.nanoAiu += s.nanoAiu || 0;
+                acc.cacheMisses = (acc.cacheMisses || 0) + (s.cacheMisses || 0);
+                perModelMap.set(model, acc);
+            }
+        }
+
+        const perModel: ModelBreakdown[] = Array.from(perModelMap.entries())
+            .map(([model, s]) => ({ model, ...s }))
+            .sort((a, b) => b.nanoAiu - a.nanoAiu);
+
+        this._overallCache = { totals, perModel };
+        return this._overallCache;
+    }
+
+    /** Path of the persisted cursor file for the all-workspace global ingest. */
+    private _getGlobalOffsetsPath(): string {
+        return path.join(this._context.globalStorageUri.fsPath, 'observability-global-offsets.json');
+    }
+
+    private async _loadGlobalOffsets(): Promise<void> {
+        if (this._globalOffsetsLoaded) { return; }
+        this._globalOffsetsLoaded = true;
+        try {
+            const raw = await fs.promises.readFile(this._getGlobalOffsetsPath(), 'utf8');
+            const parsed = JSON.parse(raw) as Record<string, { byteOffset: number; lineCount: number }>;
+            for (const [file, off] of Object.entries(parsed)) {
+                if (off && typeof off.byteOffset === 'number') {
+                    this._globalLogOffsets.set(file, { byteOffset: off.byteOffset, lineCount: Number(off.lineCount) || 0 });
+                }
+            }
+        } catch { /* none yet */ }
+    }
+
+    private async _saveGlobalOffsets(): Promise<void> {
+        try {
+            const obj: Record<string, { byteOffset: number; lineCount: number }> = {};
+            for (const [file, off] of this._globalLogOffsets.entries()) { obj[file] = off; }
+            const p = this._getGlobalOffsetsPath();
+            await fs.promises.mkdir(path.dirname(p), { recursive: true });
+            await fs.promises.writeFile(p, JSON.stringify(obj));
+        } catch { /* best-effort */ }
+    }
+
+    /** Find EVERY workspace's Copilot debug-log main.jsonl under the shared workspaceStorage dir. */
+    private async _findAllCopilotDebugLogFiles(): Promise<string[]> {
+        // globalStorage/<ext> → ../.. → User/ ; sibling User/workspaceStorage holds all workspaces.
+        const userDir = path.dirname(path.dirname(this._context.globalStorageUri.fsPath));
+        const wsStorage = path.join(userDir, 'workspaceStorage');
+        const out: string[] = [];
+        let wsDirs: fs.Dirent[] = [];
+        try { wsDirs = await fs.promises.readdir(wsStorage, { withFileTypes: true }); } catch { return out; }
+        for (const ws of wsDirs) {
+            if (!ws.isDirectory()) { continue; }
+            const debugRoot = path.join(wsStorage, ws.name, 'GitHub.copilot-chat', 'debug-logs');
+            let sessions: fs.Dirent[] = [];
+            try { sessions = await fs.promises.readdir(debugRoot, { withFileTypes: true }); } catch { continue; }
+            for (const s of sessions) {
+                if (!s.isDirectory()) { continue; }
+                out.push(path.join(debugRoot, s.name, 'main.jsonl'));
+            }
+        }
+        return out;
+    }
+
+    /** A request is a "cache miss" when its cached portion is < 50% of its input tokens. */
+    private _isCacheMiss(inputTokens: number, cachedTokens: number): boolean {
+        return inputTokens > 0 && cachedTokens < inputTokens * 0.5;
+    }
+
+    /** Fold one request's usage into the global month shard (dedup handled by caller). */
+    private _foldReqIntoShard(shard: MonthShard, ts: number, model: string, inTok: number, outTok: number, cachedTok: number, nano: number): void {
+        const monthKey = this._getMonthKey(ts);
+        const miss = this._isCacheMiss(inTok, cachedTok) ? 1 : 0;
+        let bucket = shard.months[monthKey];
+        if (!bucket) { bucket = { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0, cacheMisses: 0, perModel: {} }; shard.months[monthKey] = bucket; }
+        bucket.requestCount += 1; bucket.inputTokens += inTok; bucket.outputTokens += outTok; bucket.cachedTokens += cachedTok; bucket.nanoAiu += nano;
+        bucket.cacheMisses = (bucket.cacheMisses || 0) + miss;
+        let pm = bucket.perModel[model];
+        if (!pm) { pm = { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0, cacheMisses: 0 }; bucket.perModel[model] = pm; }
+        pm.requestCount += 1; pm.inputTokens += inTok; pm.outputTokens += outTok; pm.cachedTokens += cachedTok; pm.nanoAiu += nano;
+        pm.cacheMisses = (pm.cacheMisses || 0) + miss;
+    }
+
+    /**
+     * Incrementally fold new requests into the durable global month shard from every
+     * workspace's Copilot debug log. IMPORTANT: each `llm_request` line is a DISTINCT billed
+     * model call — an agent turn's iterations share one `responseId` but are separate charges
+     * (verified: a 7-line responseId had nano 50, 6.6, 5.8, 4.4, 5.1, 4.5, 4.4). So we SUM every
+     * line's `copilotUsageNanoAiu` with NO dedup; deduping by responseId undercounted ~5×.
+     * Per-file persisted byte cursors count each line exactly once (even across restarts); the
+     * shard is additive + persisted, so counts survive after debug logs rotate away.
+     */
+    private async _ingestGlobalDebugLogs(): Promise<MonthShard> {
+        await this._loadGlobalOffsets();
+        let shard = await this._loadMonthShard('_global');
+        // One-time clean rebuild when the fold logic changes (here: removed the wrong
+        // responseId dedup). Reset buckets + cursors and re-fold every line from offset 0.
+        if (shard.foldVersion !== GLOBAL_FOLD_VERSION) {
+            shard = { version: 1, workspaceKey: '_global', months: {}, rawOffset: 0, foldVersion: GLOBAL_FOLD_VERSION, updatedAt: 0 };
+            this._globalLogOffsets.clear();
+        }
+        const MAX_PASS = 24 * 1024 * 1024;
+        let dirty = false;
+
+        for (const file of await this._findAllCopilotDebugLogFiles()) {
+            const known = this._globalLogOffsets.get(file);
+            const from = known?.byteOffset ?? 0;
+            let size = 0;
+            try { size = (await fs.promises.stat(file)).size; } catch { continue; }
+            if (size <= from) { continue; }
+            const fd = await fs.promises.open(file, 'r');
+            try {
+                const readLen = Math.min(size - from, MAX_PASS);
+                const buf = Buffer.allocUnsafe(readLen);
+                await fd.read(buf, 0, buf.length, from);
+                const lastNl = buf.lastIndexOf(0x0a);
+                if (lastNl < 0) { continue; }
+                const text = buf.toString('utf8', 0, lastNl + 1);
+                for (const line of text.split('\n')) {
+                    if (!line || line.indexOf('llm_request') === -1) { continue; }
+                    let parsed: Record<string, unknown>;
+                    try { parsed = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+                    const attrs = parsed.attrs as Record<string, unknown> | undefined;
+                    if (!attrs) { continue; }
+                    // No summarize filter: compaction/retry calls ARE billed, so include every
+                    // request with a copilotUsageNanoAiu to match Copilot's own credit figure.
+                    this._foldReqIntoShard(
+                        shard,
+                        typeof parsed.ts === 'number' ? parsed.ts : 0,
+                        typeof attrs.model === 'string' ? attrs.model : 'unknown',
+                        typeof attrs.inputTokens === 'number' ? attrs.inputTokens : 0,
+                        typeof attrs.outputTokens === 'number' ? attrs.outputTokens : 0,
+                        typeof attrs.cachedTokens === 'number' ? attrs.cachedTokens : 0,
+                        typeof attrs.copilotUsageNanoAiu === 'number' ? attrs.copilotUsageNanoAiu : 0,
+                    );
+                }
+                const consumedLines = text.split('\n').length - 1;
+                this._globalLogOffsets.set(file, { byteOffset: from + lastNl + 1, lineCount: (known?.lineCount ?? 0) + consumedLines });
+                dirty = true;
+            } finally {
+                await fd.close();
+            }
+        }
+
+        if (dirty) {
+            shard.updatedAt = Date.now();
+            await this._saveMonthShard(shard);
+            await this._saveGlobalOffsets();
+        }
+        return shard;
+    }
+
+    private _getMonthShardPath(workspaceKey: string): string {
+        return path.join(this._context.globalStorageUri.fsPath, 'observability-months', `${workspaceKey}.json`);
+    }
+
+    private async _loadMonthShard(workspaceKey: string): Promise<MonthShard> {
+        try {
+            const raw = await fs.promises.readFile(this._getMonthShardPath(workspaceKey), 'utf8');
+            const parsed = JSON.parse(raw) as Partial<MonthShard>;
+            // Migration: shards written before the durable-cursor rewrite have no `rawOffset`.
+            // Their month buckets came from the old (buggy) path, so discard them and rebuild
+            // cleanly from the append-only usage-requests log (rawOffset:0 → full re-fold).
+            if (parsed.version === 1 && parsed.months && typeof parsed.months === 'object' && typeof parsed.rawOffset === 'number') {
+                return {
+                    version: 1, workspaceKey,
+                    months: parsed.months as Record<string, MonthBucket>,
+                    rawOffset: parsed.rawOffset,
+                    seenIds: (parsed.seenIds && typeof parsed.seenIds === 'object') ? parsed.seenIds as Record<string, string> : undefined,
+                    foldVersion: typeof parsed.foldVersion === 'number' ? parsed.foldVersion : undefined,
+                    updatedAt: Number(parsed.updatedAt) || 0
+                };
+            }
+        } catch {
+            // Fresh shard.
+        }
+        return { version: 1, workspaceKey, months: {}, rawOffset: 0, updatedAt: 0 };
+    }
+
+    private async _saveMonthShard(shard: MonthShard): Promise<void> {
+        const shardPath = this._getMonthShardPath(shard.workspaceKey);
+        await fs.promises.mkdir(path.dirname(shardPath), { recursive: true });
+        await fs.promises.writeFile(shardPath, JSON.stringify(shard));
+    }
+
+    private async _appendRawRequestRows(workspaceKey: string, rows: string[]): Promise<void> {
+        const rawPath = path.join(this._context.globalStorageUri.fsPath, 'usage-requests', `${workspaceKey}.jsonl`);
+        await fs.promises.mkdir(path.dirname(rawPath), { recursive: true });
+        await fs.promises.appendFile(rawPath, rows.join('\n') + '\n');
+    }
+
+    /** Append-only durable log of every tool_call (built-in + custom). Never rewritten. */
+    private async _appendRawToolRows(workspaceKey: string, rows: string[]): Promise<void> {
+        const rawPath = path.join(this._context.globalStorageUri.fsPath, 'usage-tools', `${workspaceKey}.jsonl`);
+        await fs.promises.mkdir(path.dirname(rawPath), { recursive: true });
+        await fs.promises.appendFile(rawPath, rows.join('\n') + '\n');
+    }
+
+    private _getLogOffsetsPath(): string {
+        return path.join(this._context.globalStorageUri.fsPath, 'observability-logoffsets.json');
+    }
+
+    /**
+     * Load persisted per-debug-log read cursors ONCE. Persisting these across restarts is
+     * what prevents the append-only usage logs from getting duplicate rows on restart
+     * (an in-memory-only cursor would reset to 0 and re-append every historical line).
+     */
+    private async _loadLogOffsets(): Promise<void> {
+        if (this._logOffsetsLoaded) { return; }
+        this._logOffsetsLoaded = true;
+        try {
+            const raw = await fs.promises.readFile(this._getLogOffsetsPath(), 'utf8');
+            const parsed = JSON.parse(raw) as Record<string, { byteOffset: number; lineCount: number }>;
+            for (const [file, off] of Object.entries(parsed)) {
+                if (off && typeof off.byteOffset === 'number' && typeof off.lineCount === 'number') {
+                    this._logFileReadOffsets.set(file, { byteOffset: off.byteOffset, lineCount: off.lineCount });
+                }
+            }
+        } catch { /* no persisted offsets yet */ }
+    }
+
+    private async _saveLogOffsets(): Promise<void> {
+        try {
+            const obj: Record<string, { byteOffset: number; lineCount: number }> = {};
+            for (const [file, off] of this._logFileReadOffsets.entries()) { obj[file] = off; }
+            const p = this._getLogOffsetsPath();
+            await fs.promises.mkdir(path.dirname(p), { recursive: true });
+            await fs.promises.writeFile(p, JSON.stringify(obj));
+        } catch { /* best-effort */ }
+    }
+
+    /**
+     * Derive a coarse input category for grouping tool calls, so a tool with thousands
+     * of calls can be broken down by what it was doing (e.g. `run_in_terminal` by the
+     * leading command word, `read_file` by extension). Never includes secrets/paths in full.
+     */
+    private _toolInputGroup(tool: string, argsStr: string): string {
+        if (!argsStr) { return 'default'; }
+        let args: Record<string, unknown> = {};
+        try { args = JSON.parse(argsStr) as Record<string, unknown>; } catch { return 'default'; }
+        const cmd = typeof args.command === 'string' ? args.command : '';
+        if (cmd) {
+            const toks = cmd.trim().split(/\s+/);
+            let head = toks[0] || 'cmd';
+            if (head === 'rtk' && toks[1]) { head = `rtk ${toks[1]}`; }
+            return head.slice(0, 24);
+        }
+        const fp = typeof args.filePath === 'string' ? args.filePath
+            : typeof args.path === 'string' ? args.path : '';
+        if (fp) {
+            const ext = path.extname(fp);
+            return ext ? `*${ext}` : 'file';
+        }
+        if (typeof args.query === 'string' || typeof args.pattern === 'string') { return 'query'; }
+        if (typeof args.prompt === 'string' || typeof args.description === 'string') { return 'prompt'; }
+        return 'default';
+    }
+
+    private _previewToolPayload(payload: string, maxLen = 180): string {
+        if (!payload) { return ''; }
+        let text = payload;
+        try {
+            const parsed = JSON.parse(payload) as unknown;
+            text = typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
+        } catch { /* keep raw text */ }
+        text = text.replace(/\s+/g, ' ').trim();
+        return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+    }
+
+    /** Exact composition of a request's input. System prompt + tool definitions are tokenized
+     *  precisely (o200k); the remaining "conversation" (cached prior history + fresh delta) is
+     *  derived as total - system - tools so the parts reconcile to the model total exactly.
+     *  Sidecar tokenization is cached by path (content is stable once written). */
+    private _computeInputSplit(
+        sessionDir: string, attrs: Record<string, unknown>, totalInputTokens: number, cachedTokens: number
+    ): TurnInputSplit | undefined {
+        try {
+            const sys = this._readSidecarStats(sessionDir, attrs.systemPromptFile, /<skill>/g);
+            const tools = this._readSidecarStats(sessionDir, attrs.toolsFile);
+            const inputMessages = typeof attrs.inputMessages === 'string' ? attrs.inputMessages : '';
+            const userRequest = typeof attrs.userRequest === 'string' ? attrs.userRequest : '';
+            const userTokens = countTokens(userRequest);
+            const newMessageTokens = countTokens(inputMessages) + userTokens;
+            let messageCount = 0;
+            if (inputMessages) {
+                try { const a = JSON.parse(inputMessages); if (Array.isArray(a)) { messageCount = a.length; } } catch { /* keep 0 */ }
+            }
+            if (!sys.tokens && !tools.tokens && !totalInputTokens) { return undefined; }
+            // Conversation = everything that isn't the (exactly tokenized) system prompt or tools.
+            // Derived from the authoritative reported total, so system+tools+conversation === total.
+            const conversationTokens = Math.max(0, totalInputTokens - sys.tokens - tools.tokens);
+            const cachedPriorTokens = Math.max(0, conversationTokens - newMessageTokens);
+            return {
+                systemTokens: sys.tokens, toolsTokens: tools.tokens,
+                conversationTokens, newMessageTokens, cachedPriorTokens,
+                userTokens, totalInputTokens,
+                skillsCount: sys.count, toolsCount: tools.count,
+                messageCount, cachedTokens: cachedTokens || 0,
+            };
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** Read a debug-log sidecar file once (cached): exactly tokenize its `.content` text and a
+     *  count (regex matches if `countPattern` given, else JSON array length of the content). */
+    private _readSidecarStats(sessionDir: string, name: unknown, countPattern?: RegExp): { tokens: number; count: number } {
+        if (typeof name !== 'string' || !name) { return { tokens: 0, count: 0 }; }
+        const p = path.join(sessionDir, name);
+        const cached = this._splitFileCache.get(p);
+        if (cached) { return cached; }
+        const stats = { tokens: 0, count: 0 };
+        try {
+            const raw = fs.readFileSync(p, 'utf8');
+            // Sidecars are { content: "<the actual text/JSON sent>" }.
+            let content = raw;
+            try { const outer = JSON.parse(raw); if (outer && typeof outer.content === 'string') { content = outer.content; } } catch { /* use raw */ }
+            stats.tokens = countTokens(content);
+            if (countPattern) {
+                stats.count = (content.match(countPattern) || []).length;
+            } else {
+                try { const arr = JSON.parse(content); if (Array.isArray(arr)) { stats.count = arr.length; } } catch { /* not a JSON array */ }
+            }
+        } catch { /* unreadable — zeros */ }
+        if (this._splitFileCache.size > 200) { this._splitFileCache.clear(); }
+        this._splitFileCache.set(p, stats);
+        return stats;
+    }
+
+    private _pushTurnEvent(event: TurnEvent): void {
+        this._turnEvents.push(event);
+        // Pin the turn's initiating request to the top (sort key = just before the turn start),
+        // since Copilot may timestamp it after an early tool call it spawned.
+        const key = (e: TurnEvent): number =>
+            (e.kind === 'request' && (e as TurnRequestEvent).firstOfTurn) ? this._lastSubmitTs - 1 : e.ts;
+        this._turnEvents.sort((a, b) => key(a) === key(b) ? a.id.localeCompare(b.id) : key(a) - key(b));
+        if (this._turnEvents.length > 1000) { this._turnEvents.splice(0, this._turnEvents.length - 1000); }
+    }
+
+    /** Fold one tool call into an aggregate map (used for both turn + durable shard). */
+    private _foldToolAgg(
+        map: Map<string, ToolAggregate>, tool: string, durMs: number,
+        status: string, inChars: number, outChars: number, group: string
+    ): void {
+        let a = map.get(tool);
+        if (!a) {
+            a = { calls: 0, errors: 0, totalDurMs: 0, minDurMs: Number.POSITIVE_INFINITY, maxDurMs: 0, outputChars: 0, inputChars: 0, byGroup: {} };
+            map.set(tool, a);
+        }
+        a.calls += 1;
+        if (status && status !== 'ok' && status !== 'success') { a.errors += 1; }
+        a.totalDurMs += durMs;
+        if (durMs < a.minDurMs) { a.minDurMs = durMs; }
+        if (durMs > a.maxDurMs) { a.maxDurMs = durMs; }
+        a.outputChars += outChars;
+        a.inputChars += inChars;
+        a.byGroup[group] = (a.byGroup[group] || 0) + 1;
+    }
+
+    private _getToolShardPath(workspaceKey: string): string {
+        return path.join(this._context.globalStorageUri.fsPath, 'observability-tools', `${workspaceKey}.json`);
+    }
+
+    private async _loadToolShard(workspaceKey: string): Promise<ToolShard> {
+        try {
+            const raw = await fs.promises.readFile(this._getToolShardPath(workspaceKey), 'utf8');
+            const parsed = JSON.parse(raw) as Partial<ToolShard>;
+            if (parsed.version === 1 && parsed.months && typeof parsed.rawOffset === 'number') {
+                return { version: 1, workspaceKey, rawOffset: parsed.rawOffset, months: parsed.months as Record<string, ToolMonthBucket>, updatedAt: Number(parsed.updatedAt) || 0 };
+            }
+        } catch { /* fresh */ }
+        return { version: 1, workspaceKey, rawOffset: 0, months: {}, updatedAt: 0 };
+    }
+
+    private async _saveToolShard(shard: ToolShard): Promise<void> {
+        const p = this._getToolShardPath(shard.workspaceKey);
+        await fs.promises.mkdir(path.dirname(p), { recursive: true });
+        await fs.promises.writeFile(p, JSON.stringify(shard));
+    }
+
+    /**
+     * Incrementally fold new rows of a workspace's append-only usage-tools jsonl into its
+     * durable tool shard via a persisted byte cursor. Additive only; never drops data.
+     */
+    private async _ingestToolsIntoShard(workspaceKey: string): Promise<ToolShard> {
+        const shard = await this._loadToolShard(workspaceKey);
+        const rawPath = path.join(this._context.globalStorageUri.fsPath, 'usage-tools', `${workspaceKey}.jsonl`);
+        let size = 0;
+        try { size = (await fs.promises.stat(rawPath)).size; } catch { return shard; }
+        if (size <= shard.rawOffset) { return shard; }
+        const fd = await fs.promises.open(rawPath, 'r');
+        let consumed = shard.rawOffset;
+        try {
+            const buf = Buffer.allocUnsafe(size - shard.rawOffset);
+            await fd.read(buf, 0, buf.length, shard.rawOffset);
+            const lastNl = buf.lastIndexOf(0x0a);
+            if (lastNl < 0) { return shard; }
+            const text = buf.toString('utf8', 0, lastNl + 1);
+            consumed = shard.rawOffset + lastNl + 1;
+            for (const line of text.split('\n')) {
+                if (!line) { continue; }
+                let row: Record<string, unknown>;
+                try { row = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+                const ts = typeof row.ts === 'number' ? row.ts : 0;
+                const monthKey = this._getMonthKey(ts);
+                const tool = typeof row.tool === 'string' ? row.tool : 'unknown';
+                const durMs = Number(row.dur) || 0;
+                const status = typeof row.status === 'string' ? row.status : 'ok';
+                const inChars = Number(row.inChars) || 0;
+                const outChars = Number(row.outChars) || 0;
+                const group = typeof row.group === 'string' ? row.group : 'default';
+                let bucket = shard.months[monthKey];
+                if (!bucket) { bucket = { tools: {} }; shard.months[monthKey] = bucket; }
+                const map = new Map<string, ToolAggregate>();
+                if (bucket.tools[tool]) { map.set(tool, bucket.tools[tool]); }
+                this._foldToolAgg(map, tool, durMs, status, inChars, outChars, group);
+                bucket.tools[tool] = map.get(tool)!;
+            }
+        } finally {
+            await fd.close();
+        }
+        shard.rawOffset = consumed;
+        shard.updatedAt = Date.now();
+        await this._saveToolShard(shard);
+        return shard;
+    }
+
+    private _getObservabilityWorkspaceKey(): string {
+        const folders = (vscode.workspace.workspaceFolders ?? [])
+            .map(folder => folder.uri.fsPath)
+            .sort()
+            .join('|');
+        const storage = this._context.storageUri?.fsPath ?? '';
+        return this._hashText(folders || storage || 'no-workspace');
+    }
+
+    private _getObservabilityLedgerPath(workspaceKey: string): string {
+        return path.join(this._context.globalStorageUri.fsPath, 'observability-ledgers', `${workspaceKey}.json`);
+    }
+
+    private async _loadObservabilityLedger(workspaceKey: string): Promise<ObservabilityLedger> {
+        const ledgerPath = this._getObservabilityLedgerPath(workspaceKey);
+        try {
+            const raw = await fs.promises.readFile(ledgerPath, 'utf8');
+            const parsed = JSON.parse(raw) as Partial<ObservabilityLedger>;
+            if (parsed.version === 1 && parsed.workspaceKey === workspaceKey && parsed.seen && typeof parsed.seen === 'object') {
+                const seen = parsed.seen as Record<string, SeenMeta | true>;
+
+                // Migration: drop transient ":new" keys written by a prior build. Those used a
+                // different key shape than the stable content-hash keys, so the same request could
+                // be stored under both — inflating totals ~2x. Removing them lets the next full
+                // scan (offset resets on restart) re-add each request once under its hash key.
+                for (const key of Object.keys(seen)) {
+                    if (key.endsWith(':new')) {
+                        delete seen[key];
+                    }
+                }
+
+                // Recompute cumulative totals from seen metadata so they stay consistent
+                // even after a past duplication bug inflated the on-disk counts.
+                let requestCount = 0, inputTokens = 0, outputTokens = 0, cachedTokens = 0, nanoAiu = 0, cacheMisses = 0;
+                for (const meta of Object.values(seen)) {
+                    if (meta === true || typeof meta !== 'object') {
+                        continue; // legacy entry — counted once, no metadata
+                    }
+                    requestCount += 1;
+                    inputTokens += meta.in || 0;
+                    outputTokens += meta.out || 0;
+                    cachedTokens += meta.cached || 0;
+                    nanoAiu += meta.nano || 0;
+                    if (this._isCacheMiss(meta.in || 0, meta.cached || 0)) { cacheMisses += 1; }
+                }
+
+                return {
+                    version: 1,
+                    workspaceKey,
+                    requestCount,
+                    inputTokens,
+                    outputTokens,
+                    cachedTokens,
+                    nanoAiu,
+                    cacheMisses,
+                    seen,
+                    updatedAt: Number(parsed.updatedAt) || 0
+                };
+            }
+        } catch {
+            // Start a fresh ledger when no prior ledger exists or the file is unreadable.
+        }
+
+        return {
+            version: 1,
+            workspaceKey,
+            requestCount: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedTokens: 0,
+            nanoAiu: 0,
+            cacheMisses: 0,
+            seen: {},
+            updatedAt: 0
+        };
+    }
+
+    private async _saveObservabilityLedger(ledger: ObservabilityLedger): Promise<void> {
+        const ledgerPath = this._getObservabilityLedgerPath(ledger.workspaceKey);
+        await fs.promises.mkdir(path.dirname(ledgerPath), { recursive: true });
+        await fs.promises.writeFile(ledgerPath, JSON.stringify(ledger));
+    }
+
+    private _hashText(value: string): string {
+        return createHash('sha256').update(value).digest('hex');
+    }
+
+    /** Append a cache-miss spike record to ~/.askaway/cache-miss-spikes.jsonl for offline analysis. */
+    private async _recordCacheMissSpike(record: Record<string, unknown>): Promise<void> {
+        try {
+            const dir = path.join(os.homedir(), '.askaway');
+            await fs.promises.mkdir(dir, { recursive: true });
+            const file = path.join(dir, 'cache-miss-spikes.jsonl');
+            await fs.promises.appendFile(file, JSON.stringify(record) + '\n', 'utf8');
+        } catch {
+            // Best-effort — never let spike logging affect observability.
+        }
+    }
+
+    private async _collectRtkObservability(): Promise<{ commandCount: number; savedTokens: number; savingsPct: number }> {
+        const sentinelPath = path.join(os.homedir(), '.askaway-rtk-enabled');
+        if (!fs.existsSync(sentinelPath)) {
+            return { commandCount: 0, savedTokens: 0, savingsPct: 0 };
+        }
+
+        const rtkBinary = this._findRtkBinary();
+        if (!rtkBinary) {
+            return { commandCount: 0, savedTokens: 0, savingsPct: 0 };
+        }
+
+        try {
+            const result = await execFileAsync(rtkBinary, ['gain', '--daily', '--format', 'json'], {
+                timeout: 2000,
+                maxBuffer: 1024 * 1024
+            });
+            const parsed = JSON.parse(result.stdout || '{}') as {
+                summary?: { total_commands?: number; total_saved?: number; avg_savings_pct?: number };
+            };
+            const summary = parsed.summary ?? {};
+            return {
+                commandCount: typeof summary.total_commands === 'number' ? summary.total_commands : 0,
+                savedTokens: typeof summary.total_saved === 'number' ? summary.total_saved : 0,
+                savingsPct: typeof summary.avg_savings_pct === 'number' ? summary.avg_savings_pct : 0
+            };
+        } catch {
+            return { commandCount: 0, savedTokens: 0, savingsPct: 0 };
+        }
+    }
+
+    /** Read the last N lines of a JSONL file (best-effort, bounded memory). */
+    private async _tailJsonl(file: string, maxLines: number): Promise<Record<string, unknown>[]> {
+        try {
+            const content = await fs.promises.readFile(file, 'utf8');
+            const lines = content.split('\n').filter(Boolean);
+            const slice = lines.length > maxLines ? lines.slice(-maxLines) : lines;
+            const out: Record<string, unknown>[] = [];
+            for (const l of slice) {
+                try { out.push(JSON.parse(l)); } catch { /* skip malformed */ }
+            }
+            return out;
+        } catch {
+            return [];
+        }
+    }
+
+    /**
+     * Aggregate the gradle "success story" log (~/.askaway/gradle-runs.jsonl):
+     * how many runs were auto-optimized and how much work the cache/daemon avoided.
+     */
+    private async _collectGradleObservability(): Promise<{ runs: number; optimizedRuns: number; tasksAvoided: number; configCacheReuses: number; rawOutputTokens: number }> {
+        const rows = await this._tailJsonl(path.join(os.homedir(), '.askaway', 'gradle-runs.jsonl'), 5000);
+        let runs = 0, optimizedRuns = 0, tasksAvoided = 0, configCacheReuses = 0, rawOutputTokens = 0;
+        for (const r of rows) {
+            runs += 1;
+            if (Array.isArray(r.optimizations) && r.optimizations.length > 0) { optimizedRuns += 1; }
+            tasksAvoided += (Number(r.tasksUpToDate) || 0) + (Number(r.tasksFromCache) || 0);
+            if (r.configCacheReused === true) { configCacheReuses += 1; }
+            rawOutputTokens += Number(r.rawOutputTokens) || 0;
+        }
+        return { runs, optimizedRuns, tasksAvoided, configCacheReuses, rawOutputTokens };
+    }
+
+    /**
+     * Combine the gradle-run aggregate with the tool-call log to estimate tokens
+     * saved by the async gradle design. Baseline: if the agent had run gradle in a
+     * plain terminal and read the WHOLE output, it would cost `rawOutputTokens`.
+     * Actual: the agent only received compact status + bounded/paginated logs,
+     * which is exactly what the gradle tool-call log records. Saved = baseline - actual.
+     */
+    private _gradleWithSavings(
+        gradleObs: { runs: number; optimizedRuns: number; tasksAvoided: number; configCacheReuses: number; rawOutputTokens: number },
+        toolObs: { byTool: Array<{ tool: string; outputTokens: number }> }
+    ): ObservabilityMetrics['gradle'] {
+        const gradleSent = toolObs.byTool.find(t => t.tool === 'gradle')?.outputTokens ?? 0;
+        const savedTokens = Math.max(0, gradleObs.rawOutputTokens - gradleSent);
+        return {
+            runs: gradleObs.runs,
+            optimizedRuns: gradleObs.optimizedRuns,
+            tasksAvoided: gradleObs.tasksAvoided,
+            configCacheReuses: gradleObs.configCacheReuses,
+            savedTokens,
+        };
+    }
+
+    /**
+     * Aggregate the tool-call log (~/.askaway/tool-calls.jsonl): per-tool call
+     * counts and approximate output token totals, to spot where output tokens go.
+     */
+    /**
+     * Build the tool-call telemetry payload. The MONTH scope is summed from the durable,
+     * additive per-workspace tool shards (fed by the append-only usage-tools logs); the
+     * TURN scope is the in-memory accumulator since the last user submit. Reports per-tool
+     * count, avg/min/max duration (to spot tools that may blow the ~5 min cache TTL),
+     * output tokens (≈chars/4), error count, and top input groups.
+     */
+    private async _collectToolCallObservability(): Promise<ToolCallMetrics> {
+        const currentMonth = this._getMonthKey(Date.now());
+        const monthAgg = new Map<string, ToolAggregate>();
+
+        // Ingest every workspace's append-only usage-tools log into its durable shard, then
+        // sum the current month across all shards.
+        const toolsDir = path.join(this._context.globalStorageUri.fsPath, 'usage-tools');
+        let files: fs.Dirent[] = [];
+        try { files = await fs.promises.readdir(toolsDir, { withFileTypes: true }); } catch { files = []; }
+        for (const f of files) {
+            if (!f.isFile() || !f.name.endsWith('.jsonl')) { continue; }
+            const workspaceKey = f.name.replace(/\.jsonl$/, '');
+            let shard: ToolShard;
+            try { shard = await this._ingestToolsIntoShard(workspaceKey); } catch { continue; }
+            const bucket = shard.months[currentMonth];
+            if (!bucket) { continue; }
+            for (const [tool, a] of Object.entries(bucket.tools)) {
+                const acc = monthAgg.get(tool);
+                if (!acc) {
+                    monthAgg.set(tool, { ...a, byGroup: { ...a.byGroup } });
+                } else {
+                    acc.calls += a.calls; acc.errors += a.errors;
+                    acc.totalDurMs += a.totalDurMs;
+                    acc.minDurMs = Math.min(acc.minDurMs, a.minDurMs);
+                    acc.maxDurMs = Math.max(acc.maxDurMs, a.maxDurMs);
+                    acc.outputChars += a.outputChars; acc.inputChars += a.inputChars;
+                    for (const [g, n] of Object.entries(a.byGroup)) { acc.byGroup[g] = (acc.byGroup[g] || 0) + n; }
+                }
+            }
+        }
+
+        return { ...this._aggToScope(monthAgg), turn: this._aggToScope(this._turnToolAgg) };
+    }
+
+    /** Convert an aggregate map to the UI ToolScope shape (sorted, with cache-risk flags). */
+    private _aggToScope(map: Map<string, ToolAggregate>): ToolScope {
+        // A tool call that takes longer than this risks the ~5 min prompt-cache TTL expiring
+        // before the next request, causing a cache miss on the following turn.
+        const CACHE_RISK_MS = 240000; // 4 min
+        let totalCalls = 0, totalOutputTokens = 0;
+        const byTool: ToolStat[] = [];
+        for (const [tool, a] of map.entries()) {
+            const outputTokens = Math.ceil(a.outputChars / 4);
+            const avgMs = a.calls > 0 ? Math.round(a.totalDurMs / a.calls) : 0;
+            const minMs = a.minDurMs === Number.POSITIVE_INFINITY ? 0 : Math.round(a.minDurMs);
+            const maxMs = Math.round(a.maxDurMs);
+            totalCalls += a.calls;
+            totalOutputTokens += outputTokens;
+            const groups = Object.entries(a.byGroup)
+                .map(([group, calls]) => ({ group, calls }))
+                .sort((x, y) => y.calls - x.calls)
+                .slice(0, 5);
+            byTool.push({
+                tool, calls: a.calls, outputTokens, avgMs, minMs, maxMs,
+                errors: a.errors, cacheRisk: maxMs >= CACHE_RISK_MS, groups
+            });
+        }
+        byTool.sort((a, b) => b.calls - a.calls);
+        return { totalCalls, totalOutputTokens, byTool };
+    }
+
+    /** RTK compression is enabled when the sentinel file exists AND the rtk binary is installed.
+     *  Guards against prefixing commands with `rtk` on machines that don't have it. */
+    public isRtkCompressionEnabled(): boolean {
+        const sentinelPath = path.join(os.homedir(), '.askaway-rtk-enabled');
+        return fs.existsSync(sentinelPath) && this.isRtkInstalled();
+    }
+
+    /** Whether the `rtk` CLI is installed (checked across common locations + PATH). Cached. */
+    public isRtkInstalled(): boolean {
+        if (this._rtkInstalledCache !== undefined) { return this._rtkInstalledCache; }
+        const candidates = [
+            '/opt/homebrew/bin/rtk', '/usr/local/bin/rtk', path.join(os.homedir(), '.local', 'bin', 'rtk')
+        ];
+        for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+            if (dir) { candidates.push(path.join(dir, 'rtk')); }
+        }
+        this._rtkInstalledCache = candidates.some(c => { try { return fs.existsSync(c); } catch { return false; } });
+        return this._rtkInstalledCache;
+    }
+    private _rtkInstalledCache: boolean | undefined;
+
+    /**
+     * Return a short RTK guidance snippet from RTK.md/skill docs when present.
+     * This keeps behavior aligned with `rtk init -g` style instructions without
+     * hard-coding a full vendor doc into prompts.
+     */
+    public async getRtkInstructionPrompt(): Promise<string> {
+        const candidates = [
+            path.join(os.homedir(), '.codex', 'RTK.md'),
+            path.join(os.homedir(), '.claude', 'RTK.md'),
+            path.join(os.homedir(), '.askaway', 'skills', 'rtk-integration.md'),
+            path.join(os.homedir(), '.askaway', 'RTK.md'),
+        ];
+
+        for (const candidate of candidates) {
+            try {
+                if (!fs.existsSync(candidate)) {
+                    continue;
+                }
+                const raw = await fs.promises.readFile(candidate, 'utf8');
+                const cleaned = raw
+                    .split(/\r?\n/)
+                    .filter(line => line.trim() && !line.trim().startsWith('#'))
+                    .slice(0, 8)
+                    .join(' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                if (cleaned) {
+                    return `RTK.md guidance: ${cleaned.slice(0, 480)}`;
+                }
+            } catch {
+                // Continue fallback chain.
+            }
+        }
+
+        return '';
+    }
+
+    private async _findWorkspaceCopilotDebugLogFiles(): Promise<string[]> {
+        const candidates: string[] = [];
+
+        // Workspace-scoped observability:
+        // context.storageUri points to .../workspaceStorage/<workspace-id>/<extension-id>
+        // so we can resolve sibling GitHub.copilot-chat logs for THIS workspace only.
+        const storageUriPath = this._context.storageUri?.fsPath;
+        if (storageUriPath) {
+            const workspaceStorageDir = path.dirname(storageUriPath);
+            const debugRoot = path.join(workspaceStorageDir, 'GitHub.copilot-chat', 'debug-logs');
+            let sessionDirs: fs.Dirent[] = [];
+            try {
+                sessionDirs = await fs.promises.readdir(debugRoot, { withFileTypes: true });
+            } catch {
+                return [];
+            }
+
+            for (const sessionDir of sessionDirs) {
+                if (!sessionDir.isDirectory()) {
+                    continue;
+                }
+
+                const mainLog = path.join(debugRoot, sessionDir.name, 'main.jsonl');
+                try {
+                    await fs.promises.access(mainLog, fs.constants.R_OK);
+                    candidates.push(mainLog);
+                } catch {
+                    // Skip unreadable candidate.
+                }
+            }
+        }
+
+        return candidates.sort();
     }
 
     /**
@@ -1026,6 +3098,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
 
         // Clear session timer interval
         this._stopSessionTimerInterval();
+        this._stopObservabilityPolling();
 
         // Clear file search cache
         this._fileSearchCache.clear();
@@ -1074,6 +3147,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
 
         // Clean up when webview is disposed
         webviewView.onDidDispose(() => {
+            this._stopObservabilityPolling();
             this._webviewReady = false;
             this._view = undefined;
             // Clear file search cache when view is hidden
@@ -1085,8 +3159,14 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         // Save history when webview visibility changes (backup for reload)
         webviewView.onDidChangeVisibility(() => {
             if (!webviewView.visible) {
+                this._stopObservabilityPolling();
                 // Save current session when switching away
                 this.saveCurrentSessionToHistory();
+            } else {
+                // Rebuild HTML on every show so stale retained DOM can't keep old worker layouts alive.
+                this._webviewReady = false;
+                webviewView.webview.html = this._getHtmlContent(webviewView.webview);
+                this._startObservabilityPolling();
             }
         }, null, this._disposables);
 
@@ -1201,7 +3281,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     this._updateCurrentSessionUI();
                     this._currentToolCallId = null;
                     this._signalNextWaiter();
-
+                    this._resetTurnMetrics();
                     return {
                         value: effectiveText,
                         queue: this._queueEnabled && this._promptQueue.length > 0,
@@ -1239,6 +3319,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
 
         const toolCallId = `tc_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
         this._currentToolCallId = toolCallId;
+        const displayQuestion = question;
 
         // Check if queue is enabled and has prompts - auto-respond
         if (this._queueEnabled && this._promptQueue.length > 0) {
@@ -1259,7 +3340,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 } else {
                     const entry: ToolCallEntry = {
                         id: toolCallId,
-                        prompt: question,
+                        prompt: displayQuestion,
                         response: queuedPrompt.prompt,
                         timestamp: Date.now(),
                         isFromQueue: true,
@@ -1270,7 +3351,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     this._updateCurrentSessionUI();
                     this._currentToolCallId = null;
                     this._signalNextWaiter();
-
+                    this._resetTurnMetrics();
                     return {
                         value: queuedPrompt.prompt,
                         queue: this._queueEnabled && this._promptQueue.length > 0,
@@ -1285,7 +3366,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         // Add pending entry to current session (so we have the prompt when completing)
         const pendingEntry: ToolCallEntry = {
             id: toolCallId,
-            prompt: question,
+            prompt: displayQuestion,
             response: '',
             timestamp: Date.now(),
             askedAt: Date.now(),
@@ -1314,7 +3395,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         // Store pending request for remote clients
         this._currentPendingRequest = {
             id: toolCallId,
-            prompt: question,
+            prompt: displayQuestion,
             isApprovalQuestion: isApproval,
             choices: choices.length > 0 ? choices : undefined
         };
@@ -1323,7 +3404,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         const pendingMessage: ToWebviewMessage = {
             type: 'toolCallPending',
             id: toolCallId,
-            prompt: question,
+            prompt: displayQuestion,
             isApprovalQuestion: isApproval,
             choices: choices.length > 0 ? choices : undefined
         };
@@ -1334,7 +3415,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             this.playNotificationSound();
         } else {
             // Fallback: queue the message (should rarely happen now)
-            this._pendingToolCallMessage = { id: toolCallId, prompt: question };
+            this._pendingToolCallMessage = { id: toolCallId, prompt: displayQuestion };
             // Still broadcast to remote clients even if VS Code webview isn't ready
             if (this._remoteBroadcastCallback) {
                 this._remoteBroadcastCallback(pendingMessage);
@@ -1666,6 +3747,33 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             case 'removeHistoryItem':
                 this._handleRemoveHistoryItem(message.callId);
                 break;
+            case 'workerResolveManual':
+                // User submitted a manual response for a worker task
+                if (message.taskId && typeof message.result === 'string') {
+                    this.resolveWorkerTask(message.taskId, message.result);
+                }
+                break;
+            case 'workerRunAutopilot':
+                // Delegated model execution with effort/agent options
+                if (message.taskId) {
+                    this.runWorkerTaskWithModel(message.taskId, message.modelId || '', {
+                        agentName: message.agentName,
+                        thinkingEffort: message.thinkingEffort
+                    });
+                }
+                break;
+            case 'configureWorkerTools':
+                // Open VS Code native Configure Tools dialog (same as Copilot chat widget toolbar button)
+                void vscode.commands.executeCommand('workbench.action.chat.configureTools');
+                break;
+            case 'changeWorkerModel':
+                // Open VS Code native model picker (same as Copilot chat widget model button)
+                void vscode.commands.executeCommand('workbench.action.chat.changeModel');
+                break;
+            case 'requestModels':
+                // Webview requesting fresh model list
+                this.broadcastAvailableModels();
+                break;
             case 'clearPersistedHistory':
                 this._handleClearPersistedHistory();
                 break;
@@ -1682,7 +3790,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 this._handleAddFileReference(message.file);
                 break;
             case 'webviewReady':
-                this._handleWebviewReady();
+                this._handleWebviewReady(message.uiVersion);
                 break;
             case 'openSettingsModal':
                 this._handleOpenSettingsModal();
@@ -1708,6 +3816,12 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             case 'updateSendWithCtrlEnterSetting':
                 this._handleUpdateSendWithCtrlEnterSetting(message.enabled);
                 break;
+            case 'updateDebugLoggingSetting':
+                this._handleUpdateDebugLoggingSetting(message.enabled);
+                break;
+            case 'updateRtkCompressionSetting':
+                this._handleUpdateRtkCompressionSetting(message.enabled);
+                break;
             case 'updateResponseTimeout':
                 this._handleUpdateResponseTimeout(message.value);
                 break;
@@ -1716,6 +3830,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 break;
             case 'updateMaxConsecutiveAutoResponses':
                 this._handleUpdateMaxConsecutiveAutoResponses(message.value);
+                break;
+            case 'updateTurnBudgetAiu':
+                this._handleUpdateTurnBudgetAiu(message.value);
                 break;
             case 'updateHumanDelaySetting':
                 this._handleUpdateHumanDelaySetting(message.enabled);
@@ -1828,14 +3945,26 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     /**
      * Handle webview ready signal - send initial state and any pending messages
      */
-    private _handleWebviewReady(): void {
+    private _handleWebviewReady(uiVersion?: string): void {
+        // If we receive a ready signal from an older retained webview bundle,
+        // immediately replace HTML so users cannot stay on stale UI.
+        if (uiVersion !== this._WEBVIEW_UI_VERSION && this._view) {
+            this._webviewReady = false;
+            this._view.webview.html = this._getHtmlContent(this._view.webview);
+            return;
+        }
+
         this._webviewReady = true;
 
         // Send settings
         this._updateSettingsUI();
+        this._startObservabilityPolling();
         // Send initial queue state and current session history
         this._updateQueueUI();
         this._updateCurrentSessionUI();
+        // Send available models and worker queue
+        this.broadcastAvailableModels();
+        this._broadcastWorkerQueue();
 
         // Send plan state if plan mode is active
         if (this._currentPlan) {
@@ -1876,10 +4005,53 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         }
     }
 
+    private _startObservabilityPolling(): void {
+        if (this._observabilityPollInterval) {
+            return;
+        }
+
+        // Push immediately so users see fresh numbers as soon as Settings is opened.
+        void this._broadcastObservabilityMetrics();
+
+        this._observabilityPollInterval = setInterval(() => {
+            if (!this._webviewReady || !this._view || !this._view.visible) {
+                return;
+            }
+            void this._broadcastObservabilityMetrics();
+        }, this._OBSERVABILITY_POLL_MS);
+    }
+
+    private _stopObservabilityPolling(): void {
+        if (this._observabilityPollInterval) {
+            clearInterval(this._observabilityPollInterval);
+            this._observabilityPollInterval = null;
+        }
+    }
+
+    /** Reset the "This turn" metrics window. Call at every turn boundary regardless of response source.
+     *  Pass ts to use the log-entry timestamp (more accurate); omit to use wall-clock. */
+    private _resetTurnMetrics(ts?: number): void {
+        this._lastSubmitTs = ts ?? Date.now();
+        this._lastRequestMetrics = this._emptyScope();
+        this._turnToolAgg.clear();
+        this._turnRequests = [];
+        this._turnEvents = [];
+        this._turnFirstReqSeen = false;
+    }
+
+    /** Stable 5-char locator for a request (hash of sid:lineIndex); shown in the turn table so
+     *  the user can ask to investigate a specific request, and written into the master table. */
+    private _shortReqId(sid: string, lineIndex: number): string {
+        return this._hashText(`${sid}:${lineIndex}`).slice(0, 5).toUpperCase();
+    }
+
     /**
      * Handle submit from webview
      */
     private _handleSubmit(value: string, attachments: AttachmentInfo[]): void {
+        // A new user message starts a new "This turn" aggregation window. The next
+        // observability scan sums only llm_requests at/after this timestamp.
+        this._resetTurnMetrics();
         if (this._pendingRequests.size > 0 && this._currentToolCallId) {
             const resolve = this._pendingRequests.get(this._currentToolCallId);
             if (resolve) {
@@ -2600,6 +4772,49 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             this._sendWithCtrlEnter = enabled;
             const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
             await config.update('sendWithCtrlEnter', enabled, vscode.ConfigurationTarget.Global);
+            this._updateSettingsUI();
+        } finally {
+            this._isUpdatingConfig = false;
+        }
+    }
+
+    private async _handleUpdateDebugLoggingSetting(enabled: boolean): Promise<void> {
+        this._isUpdatingConfig = true;
+        try {
+            const copilotConfig = vscode.workspace.getConfiguration('github.copilot.chat');
+            const target = vscode.workspace.workspaceFolders?.length
+                ? vscode.ConfigurationTarget.Workspace
+                : vscode.ConfigurationTarget.Global;
+            await copilotConfig.update('agentDebugLog.fileLogging.enabled', enabled, target);
+            this._updateSettingsUI();
+        } finally {
+            this._isUpdatingConfig = false;
+        }
+    }
+
+    private async _handleUpdateRtkCompressionSetting(enabled: boolean): Promise<void> {
+        this._isUpdatingConfig = true;
+        const sentinelPath = path.join(os.homedir(), '.askaway-rtk-enabled');
+        try {
+            if (enabled && !this.isRtkInstalled()) {
+                // rtk isn't installed — refuse to enable so we never prefix `rtk` on a machine without it.
+                vscode.window.showWarningMessage('RTK is not installed on this machine. Install the `rtk` CLI to enable command compression.');
+                this._updateSettingsUI();
+                return;
+            }
+            if (enabled) {
+                await fs.promises.writeFile(sentinelPath, 'enabled\n', 'utf8');
+            } else {
+                try {
+                    await fs.promises.unlink(sentinelPath);
+                } catch (err) {
+                    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                        throw err;
+                    }
+                }
+            }
+            this._updateSettingsUI();
+            void this._broadcastObservabilityMetrics();
         } finally {
             this._isUpdatingConfig = false;
         }
@@ -2633,6 +4848,24 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
             await config.update('maxConsecutiveAutoResponses', value, vscode.ConfigurationTarget.Global);
             this._loadSettings();
+        } finally {
+            this._isUpdatingConfig = false;
+        }
+    }
+
+    private async _handleUpdateTurnBudgetAiu(value: number): Promise<void> {
+        this._isUpdatingConfig = true;
+        try {
+            const clamped = Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+            const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
+            await config.update('turnBudgetAiu', clamped, vscode.ConfigurationTarget.Global);
+            // Keep the budget-hook sentinel in sync so the UserPromptSubmit hook sees the new limit.
+            try {
+                const cfgDir = path.join(os.homedir(), '.askaway');
+                await fs.promises.mkdir(cfgDir, { recursive: true });
+                await fs.promises.writeFile(path.join(cfgDir, 'turn-budget-aiu'), `${clamped}\n`, 'utf8');
+            } catch { /* non-fatal */ }
+            this._updateSettingsUI();
         } finally {
             this._isUpdatingConfig = false;
         }
@@ -3117,6 +5350,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     private _getHtmlContent(webview: vscode.Webview): string {
         const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'main.css'));
         const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'webview.js'));
+        const cacheBust = String(Date.now());
+        const styleUriWithVersion = `${styleUri}?v=${cacheBust}`;
+        const scriptUriWithVersion = `${scriptUri}?v=${cacheBust}`;
         const codiconsUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'node_modules', '@vscode', 'codicons', 'dist', 'codicon.css'));
         const logoUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'askaway-icon.svg'));
         const notificationSoundUri = webview.asWebviewUri(vscode.Uri.joinPath(this._extensionUri, 'media', 'notification.wav'));
@@ -3129,12 +5365,21 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; font-src ${webview.cspSource}; img-src ${webview.cspSource}; script-src 'nonce-${nonce}' https://cdn.jsdelivr.net; connect-src https://cdn.jsdelivr.net; media-src ${webview.cspSource} data: mediastream:;">
     <link href="${codiconsUri}" rel="stylesheet">
-    <link href="${styleUri}" rel="stylesheet">
+    <link href="${styleUriWithVersion}" rel="stylesheet">
     <title>AskAway</title>
     <audio id="notification-sound" preload="auto" src="${notificationSoundUri}"></audio>
 </head>
 <body>
     <div class="main-container">
+        <!-- Tab Bar -->
+        <div class="widget-tabs" id="widget-tabs">
+            <button class="widget-tab active" data-tab="chat" title="Main chat">Chat</button>
+            <button class="widget-tab" data-tab="observability" title="Observability metrics, RTK/Gradle savings, requests and memories">Metrics</button>
+            <button class="widget-tab" data-tab="settings" title="Settings">Settings</button>
+        </div>
+
+        <!-- Chat Panel -->
+        <div class="tab-panel active" id="panel-chat">
         <!-- Chat Container -->
         <div class="chat-container" id="chat-container">
             <!-- Welcome Section - Let's build -->
@@ -3273,6 +5518,139 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 </button>
             </div>
         </div>
+        </div><!-- End panel-chat -->
+
+        <!-- Commands Panel -->
+        <div class="tab-panel" id="panel-commands">
+            <div class="worker-panel-header">
+                <span class="worker-panel-title">Command Queue</span>
+                <span class="worker-panel-hint">Delegated agentic processing</span>
+            </div>
+            <div class="worker-task-list" id="command-task-list">
+                <div class="worker-empty">No pending commands</div>
+            </div>
+            <div class="worker-input-area">
+                <div class="worker-task-display hidden" id="command-task-display">
+                    <div class="worker-task-label">Command to run:</div>
+                    <div class="worker-task-text" id="command-task-text"></div>
+                </div>
+                <!-- Model + Effort row -->
+                <div class="worker-model-config-row">
+                    <select class="worker-model-select" id="command-model-select" title="Model — deduplicated from VS Code LM API">
+                        <option value="">Loading models…</option>
+                    </select>
+                    <select class="worker-effort-select" id="command-effort-select" title="Effort hint sent in system prompt">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                    </select>
+                </div>
+                <!-- Formed label + Agent + Autopilot toggle -->
+                <div class="worker-run-controls">
+                    <span class="worker-formed-model" id="command-formed-model">—</span>
+                    <select class="worker-agent-select" id="command-agent-select" title="Agent profile">
+                        <option value="default">Default</option>
+                        <option value="Explore">Explore</option>
+                        <option value="ts">ts</option>
+                        <option value="talk_to_user">talk_to_user</option>
+                    </select>
+                    <label class="worker-autopilot-label" title="Auto-run queued tasks without manual trigger">
+                        <span class="worker-auto-text">Auto</span>
+                        <div class="toggle-switch worker-autopilot-toggle" id="command-autopilot-toggle" role="switch" aria-checked="false" tabindex="0"></div>
+                    </label>
+                </div>
+                <!-- Per-panel tool picker (independent of global Copilot tool config) -->
+                <div class="worker-tools-panel" id="command-tools-panel">
+                    <button class="worker-tools-header-btn" id="command-tools-header-btn" aria-expanded="false">
+                        <span class="codicon codicon-tools"></span>
+                        <span class="worker-tools-label" id="command-tools-label">Tools: loading…</span>
+                        <span class="worker-tools-scope-badge">per-panel</span>
+                        <span class="codicon codicon-chevron-right worker-tools-chevron" id="command-tools-chevron"></span>
+                    </button>
+                    <div class="worker-tools-body hidden" id="command-tools-body"></div>
+                </div>
+                <textarea class="worker-response-input" id="command-response-input" placeholder="Optional: override with manual result…" rows="2"></textarea>
+                <div class="worker-actions">
+                    <button class="worker-btn worker-run-btn" id="command-autopilot-btn" title="Run with selected model">
+                        <span class="codicon codicon-zap"></span> Run
+                    </button>
+                    <button class="worker-btn worker-submit-btn" id="command-submit-btn" title="Submit manual response">
+                        <span class="codicon codicon-arrow-up"></span> Submit
+                    </button>
+                </div>
+            </div>
+        </div><!-- End panel-commands -->
+
+        <!-- Sub-Agents Panel -->
+        <div class="tab-panel" id="panel-subagents">
+            <div class="worker-panel-header">
+                <span class="worker-panel-title">Agent Queue</span>
+                <span class="worker-panel-hint">Agentic tasks with model and tool selection</span>
+            </div>
+            <div class="worker-task-list" id="subagent-task-list">
+                <div class="worker-empty">No pending agent tasks</div>
+            </div>
+            <div class="worker-input-area">
+                <div class="worker-task-display hidden" id="subagent-task-display">
+                    <div class="worker-task-label">Task:</div>
+                    <div class="worker-task-text" id="subagent-task-text"></div>
+                </div>
+                <!-- Model + Effort row -->
+                <div class="worker-model-config-row">
+                    <select class="worker-model-select" id="subagent-model-select" title="Model — deduplicated from VS Code LM API">
+                        <option value="">Loading models…</option>
+                    </select>
+                    <select class="worker-effort-select" id="subagent-effort-select" title="Effort hint sent in system prompt">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                    </select>
+                </div>
+                <!-- Formed label + Agent + Autopilot toggle -->
+                <div class="worker-run-controls">
+                    <span class="worker-formed-model" id="subagent-formed-model">—</span>
+                    <select class="worker-agent-select" id="subagent-agent-select" title="Agent profile">
+                        <option value="default">Default</option>
+                        <option value="Explore">Explore</option>
+                        <option value="ts">ts</option>
+                        <option value="talk_to_user">talk_to_user</option>
+                    </select>
+                    <label class="worker-autopilot-label" title="Auto-run queued tasks without manual trigger">
+                        <span class="worker-auto-text">Auto</span>
+                        <div class="toggle-switch worker-autopilot-toggle" id="subagent-autopilot-toggle" role="switch" aria-checked="false" tabindex="0"></div>
+                    </label>
+                </div>
+                <!-- Per-panel tool picker (independent of global Copilot tool config) -->
+                <div class="worker-tools-panel" id="subagent-tools-panel">
+                    <button class="worker-tools-header-btn" id="subagent-tools-header-btn" aria-expanded="false">
+                        <span class="codicon codicon-tools"></span>
+                        <span class="worker-tools-label" id="subagent-tools-label">Tools: loading…</span>
+                        <span class="worker-tools-scope-badge">per-panel</span>
+                        <span class="codicon codicon-chevron-right worker-tools-chevron" id="subagent-tools-chevron"></span>
+                    </button>
+                    <div class="worker-tools-body hidden" id="subagent-tools-body"></div>
+                </div>
+                <textarea class="worker-response-input" id="subagent-response-input" placeholder="Or type manual response…" rows="2"></textarea>
+                <div class="worker-actions">
+                    <button class="worker-btn worker-run-btn" id="subagent-autopilot-btn" title="Run with selected model">
+                        <span class="codicon codicon-zap"></span> Run
+                    </button>
+                    <button class="worker-btn worker-submit-btn" id="subagent-submit-btn" title="Submit manual response">
+                        <span class="codicon codicon-arrow-up"></span> Submit
+                    </button>
+                </div>
+            </div>
+        </div><!-- End panel-subagents -->
+
+        <!-- Observability Panel -->
+        <div class="tab-panel" id="panel-observability">
+            <div class="settings-tab-shell" id="observability-tab-shell"></div>
+        </div><!-- End panel-observability -->
+
+        <!-- Settings Panel -->
+        <div class="tab-panel" id="panel-settings">
+            <div class="settings-tab-shell" id="settings-tab-shell"></div>
+        </div><!-- End panel-settings -->
 
         <!-- Voice Mode Overlay -->
         <div id="voice-overlay" class="voice-overlay hidden">
@@ -3303,7 +5681,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             </div>
         </div>
     </div>
-    <script nonce="${nonce}" src="${scriptUri}"></script>
+    <script nonce="${nonce}" src="${scriptUriWithVersion}"></script>
 </body>
 </html>`;
     }

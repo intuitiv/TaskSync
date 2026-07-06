@@ -1,5 +1,9 @@
 import * as vscode from 'vscode';
+import * as os from 'os';
+import * as path from 'path';
+import * as fs from 'fs';
 import { CONFIG_NAMESPACE } from '../constants/branding';
+import type { AttachmentInfo } from '../webview/webviewProvider';
 
 // ── Interfaces ─────────────────────────────────────────────────
 
@@ -36,8 +40,16 @@ export class TelegramService {
     private _chatId: string | undefined;
     private _pollingTimer: NodeJS.Timeout | undefined;
     private _activeTasks: Map<string, TrackedTask> = new Map();
-    private _lastUpdateId: number = 0;  // Telegram getUpdates offset
-    private _onResponseReceived: ((taskId: string, response: string, user: string) => void) | undefined;
+    private _lastUpdateId: number = 0;  // Telegram getUpdates offset (only advanced past our own processed messages)
+    /**
+     * Shared-queue offset algorithm: in-memory set of update_ids this window has
+     * processed. Used to (a) dedupe re-received messages on subsequent polls and
+     * (b) decide how far we can safely advance `_lastUpdateId` without ACKing past
+     * a foreign-topic message (which Telegram would delete globally for all bots).
+     */
+    private _myProcessedSet: Set<number> = new Set();
+    private _onResponseReceived: ((taskId: string, response: string, user: string, attachments?: AttachmentInfo[]) => void) | undefined;
+    private _onHistoryRequested: (() => { prompt: string; response: string; timestamp: number; status: string }[]) | undefined;
 
     // ── Backoff polling state ──
     private _pollTickIndex: number = 0;
@@ -147,8 +159,12 @@ export class TelegramService {
         return this._enabled;
     }
 
-    public setResponseCallback(callback: (taskId: string, response: string, user: string) => void) {
+    public setResponseCallback(callback: (taskId: string, response: string, user: string, attachments?: AttachmentInfo[]) => void) {
         this._onResponseReceived = callback;
+    }
+
+    public setHistoryCallback(callback: () => { prompt: string; response: string; timestamp: number; status: string }[]) {
+        this._onHistoryRequested = callback;
     }
 
     /** Get detailed status for settings UI */
@@ -214,6 +230,151 @@ export class TelegramService {
 
     private _apiUrl(method: string): string {
         return `${TELEGRAM_API}${this._botToken}/${method}`;
+    }
+
+    /**
+     * Download a file from Telegram by file_id.
+     * Calls getFile to get the file path, downloads it, and saves to OS temp dir.
+     * Returns the local file path or undefined on failure.
+     */
+    private async _downloadTelegramFile(fileId: string, suggestedName?: string): Promise<string | undefined> {
+        try {
+            // Step 1: Get file path from Telegram
+            const fileInfoResp = await fetch(this._apiUrl('getFile'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ file_id: fileId })
+            });
+            if (!fileInfoResp.ok) {
+                this._warn(`AskAway/Telegram: getFile failed ${fileInfoResp.status}`);
+                return undefined;
+            }
+            const fileInfo = await fileInfoResp.json() as any;
+            const filePath = fileInfo.result?.file_path;
+            if (!filePath) {
+                this._warn('AskAway/Telegram: getFile returned no file_path');
+                return undefined;
+            }
+
+            // Step 2: Download the file
+            const downloadUrl = `https://api.telegram.org/file/bot${this._botToken}/${filePath}`;
+            const downloadResp = await fetch(downloadUrl);
+            if (!downloadResp.ok) {
+                this._warn(`AskAway/Telegram: file download failed ${downloadResp.status}`);
+                return undefined;
+            }
+
+            // Step 3: Save to temp directory
+            const ext = path.extname(filePath) || path.extname(suggestedName || '') || '';
+            const baseName = suggestedName || `telegram_${fileId.substring(0, 8)}${ext}`;
+            const tmpDir = path.join(os.tmpdir(), 'tasksync-attachments');
+            await fs.promises.mkdir(tmpDir, { recursive: true });
+            const localPath = path.join(tmpDir, `${Date.now()}_${baseName}`);
+
+            const buffer = Buffer.from(await downloadResp.arrayBuffer());
+            await fs.promises.writeFile(localPath, buffer);
+
+            this._log(`AskAway/Telegram: Downloaded file ${filePath} → ${localPath} (${buffer.length} bytes)`);
+            return localPath;
+        } catch (e) {
+            this._err('AskAway/Telegram: _downloadTelegramFile error', e);
+            return undefined;
+        }
+    }
+
+    /**
+     * Extract media file info from a Telegram message.
+     * Returns an array of {fileId, fileName} for all supported attachment types.
+     */
+    private _extractMediaFromMessage(msg: any): { fileId: string; fileName: string }[] {
+        const media: { fileId: string; fileName: string }[] = [];
+
+        // Photo: array of PhotoSize, pick the largest (last)
+        if (msg.photo && msg.photo.length > 0) {
+            const largest = msg.photo[msg.photo.length - 1];
+            media.push({ fileId: largest.file_id, fileName: `photo_${largest.file_unique_id}.jpg` });
+        }
+
+        // Document (any file type)
+        if (msg.document) {
+            media.push({
+                fileId: msg.document.file_id,
+                fileName: msg.document.file_name || `document_${msg.document.file_unique_id}`
+            });
+        }
+
+        // Video
+        if (msg.video) {
+            media.push({
+                fileId: msg.video.file_id,
+                fileName: msg.video.file_name || `video_${msg.video.file_unique_id}.mp4`
+            });
+        }
+
+        // Audio
+        if (msg.audio) {
+            media.push({
+                fileId: msg.audio.file_id,
+                fileName: msg.audio.file_name || `audio_${msg.audio.file_unique_id}.mp3`
+            });
+        }
+
+        // Voice message (ogg/opus)
+        if (msg.voice) {
+            media.push({
+                fileId: msg.voice.file_id,
+                fileName: `voice_${msg.voice.file_unique_id}.ogg`
+            });
+        }
+
+        // Video note (round video)
+        if (msg.video_note) {
+            media.push({
+                fileId: msg.video_note.file_id,
+                fileName: `videonote_${msg.video_note.file_unique_id}.mp4`
+            });
+        }
+
+        // Sticker
+        if (msg.sticker) {
+            const ext = msg.sticker.is_animated ? '.tgs' : (msg.sticker.is_video ? '.webm' : '.webp');
+            media.push({
+                fileId: msg.sticker.file_id,
+                fileName: `sticker_${msg.sticker.file_unique_id}${ext}`
+            });
+        }
+
+        // Animation (GIF)
+        if (msg.animation) {
+            media.push({
+                fileId: msg.animation.file_id,
+                fileName: msg.animation.file_name || `animation_${msg.animation.file_unique_id}.mp4`
+            });
+        }
+
+        return media;
+    }
+
+    /**
+     * Download all media from a Telegram message and return AttachmentInfo array.
+     */
+    private async _downloadMessageMedia(msg: any): Promise<AttachmentInfo[]> {
+        const mediaItems = this._extractMediaFromMessage(msg);
+        if (mediaItems.length === 0) { return []; }
+
+        const attachments: AttachmentInfo[] = [];
+        for (const item of mediaItems) {
+            const localPath = await this._downloadTelegramFile(item.fileId, item.fileName);
+            if (localPath) {
+                attachments.push({
+                    id: `tg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                    name: item.fileName,
+                    uri: localPath,
+                    isTemporary: true
+                });
+            }
+        }
+        return attachments;
     }
 
     /** Cache the bot's own user ID to ignore its own messages */
@@ -328,6 +489,33 @@ export class TelegramService {
             this._warn(`AskAway/Telegram: createForumTopic error: ${e}`);
         }
         return undefined;
+    }
+
+    /**
+     * Edit a forum topic indicator to reflect pending/resolved state.
+     * Telegram only supports custom emoji IDs for real topic icons; this helper
+     * uses a name prefix fallback that is reliable across chats.
+     */
+    private async _editTopicIcon(topicId: number | undefined, workspaceName: string, pending: boolean): Promise<void> {
+        if (!topicId || !this.isConfigured()) { return; }
+        const name = pending ? `🔴 ${workspaceName}` : workspaceName;
+        try {
+            const resp = await fetch(this._apiUrl('editForumTopic'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: this._chatId,
+                    message_thread_id: topicId,
+                    name: name
+                })
+            });
+            if (!resp.ok) {
+                const err = await resp.text();
+                this._warn(`AskAway/Telegram: _editTopicIcon editForumTopic failed (${resp.status}): ${err}`);
+            }
+        } catch (e) {
+            this._warn(`AskAway/Telegram: _editTopicIcon error: ${e}`);
+        }
     }
 
     // ── Post Question ──────────────────────────────────────────
@@ -460,6 +648,8 @@ export class TelegramService {
                     timestamp: Date.now(),
                     formattedText: plainBody.text
                 });
+                // Mark topic as pending.
+                void this._editTopicIcon(topicId, workspaceName, true);
                 this.stopPolling();
                 this._resetBackoff();
                 this.startPolling();
@@ -479,6 +669,9 @@ export class TelegramService {
                 timestamp: Date.now(),
                 formattedText: text   // store rendered HTML body for footer edits
             });
+
+            // Mark topic as pending.
+            void this._editTopicIcon(topicId, workspaceName, true);
 
             // Race-condition guard: if resolveTask was already called for this
             // taskId while we were awaiting the API, clean up immediately.
@@ -770,6 +963,9 @@ export class TelegramService {
         } catch (e) {
             this._warn(`AskAway/Telegram: Failed to mark message as resolved: ${e}`);
         }
+
+        // Clear pending indicator from topic name.
+        void this._editTopicIcon(task.topicId, this._workspaceName(), false);
     }
 
     public startPolling() {
@@ -807,6 +1003,51 @@ export class TelegramService {
         this._pollingStartedAtMs = Date.now();
     }
 
+    /**
+     * Determine whether a Telegram update is intended for a different VS Code
+     * window (different forum topic / different active task). Foreign updates
+     * are intentionally NOT acknowledged — leaving them in Telegram's queue so
+     * the rightful owner workspace can consume them on its next poll.
+     *
+     * See `_pollOnce` for the full shared-queue offset algorithm.
+     */
+    private _isForeignUpdate(update: any): boolean {
+        // Callback queries (inline button clicks): ours only if the callback
+        // task ID is one of OUR active tasks.
+        if (update.callback_query) {
+            const cbData: string = update.callback_query.data || '';
+            const parts = cbData.split(':');
+            if (parts[0] === 'askaway' && parts.length >= 3) {
+                const cbTaskId = parts[1];
+                return !this._activeTasks.has(cbTaskId);
+            }
+            // Unknown callback format — keep status quo, treat as ours.
+            return false;
+        }
+
+        const msg = update.message;
+        if (!msg) {
+            // Unknown update type — keep status quo, treat as ours.
+            return false;
+        }
+
+        // Bot commands (/file, /status, /help, /ls): every window participates.
+        if (typeof msg.text === 'string' && msg.text.startsWith('/')) {
+            return false;
+        }
+
+        const msgThreadId: number | undefined = msg.message_thread_id;
+        if (msgThreadId === undefined) {
+            // Non-forum chat or General topic message — no per-window routing
+            // information, so accept (status quo).
+            return false;
+        }
+
+        // Forum topic message — ours only if one of our active tasks owns the topic.
+        const matchesOurTopic = [...this._activeTasks.values()].some(t => t.topicId === msgThreadId);
+        return !matchesOurTopic;
+    }
+
     public stopPolling() {
         if (this._pollingTimer) {
             clearTimeout(this._pollingTimer);
@@ -819,11 +1060,16 @@ export class TelegramService {
     private async _poll(): Promise<void> {
         this._pollingTimer = undefined;
 
-        if (!this.isConfigured() || this._activeTasks.size === 0) {
-            this._log(`AskAway/Telegram: Poll skipped — configured=${this.isConfigured()}, activeTasks=${this._activeTasks.size}`);
+        if (!this.isConfigured()) {
+            this._log(`AskAway/Telegram: Poll skipped — not configured`);
             this.stopPolling();
             return;
         }
+
+        // Allow polling even without active tasks when conversation is active
+        // (enables bot commands like /file, /ls, /status during Copilot work)
+        const hasActiveTasks = this._activeTasks.size > 0;
+        const hasActiveConversation = this._conversationActive && this._lastCopilotActivity > 0;
 
         // Keep polling while tasks are active, even if Copilot is idle.
         // Stopping here causes delayed user replies to be missed.
@@ -852,7 +1098,7 @@ export class TelegramService {
             }
         }
 
-        if (this._activeTasks.size === 0) {
+        if (this._activeTasks.size === 0 && !hasActiveConversation) {
             this.stopPolling();
             return;
         }
@@ -895,8 +1141,26 @@ export class TelegramService {
                 const updates = data.result || [];
 
                 for (const update of updates) {
-                    this._lastUpdateId = Math.max(this._lastUpdateId, update.update_id);
+                    // ── Shared-queue offset algorithm ──
+                    // Determine if this update is intended for another VS Code window
+                    // (different forum topic / different active task). If so, leave it
+                    // in the Telegram queue — do NOT mark processed and do NOT let our
+                    // offset advance past it, since Telegram's getUpdates offset is a
+                    // GLOBAL per-bot ACK: any window advancing past update X deletes X
+                    // for every other window. The rightful owner will consume + ACK it
+                    // on its own poll.
+                    if (this._isForeignUpdate(update)) {
+                        continue;
+                    }
+                    // Dedupe: we already handled this update in a previous poll but
+                    // couldn't yet ACK it (a foreign message ahead of it kept our offset
+                    // pinned). Telegram re-delivers it until our offset moves past — we
+                    // just skip work here.
+                    if (this._myProcessedSet.has(update.update_id)) {
+                        continue;
+                    }
 
+                    try {
                     // Handle callback query (inline button click)
                     if (update.callback_query) {
                         const cbData = update.callback_query.data || '';
@@ -933,12 +1197,24 @@ export class TelegramService {
                         continue;
                     }
 
-                    // Handle text message reply
+                    // Handle text/media message reply
                     const msg = update.message;
-                    if (!msg || !msg.text) { continue; }
+                    if (!msg) { continue; }
+
+                    // A message needs either text or some media to be useful
+                    const hasText = !!msg.text;
+                    const hasCaption = !!msg.caption;
+                    const hasMedia = !!(msg.photo || msg.document || msg.video || msg.audio || msg.voice || msg.video_note || msg.sticker || msg.animation);
+                    if (!hasText && !hasCaption && !hasMedia) { continue; }
 
                     // Skip messages from the bot itself
                     if (this._botId && msg.from?.id === this._botId) { continue; }
+
+                    // ── Handle bot commands (/file, /status, /help, /ls) ──
+                    if (hasText && msg.text.startsWith('/')) {
+                        const handled = await this._handleBotCommand(msg);
+                        if (handled) { continue; }
+                    }
 
                     // Forum topic routing: if this window's active task is bound to a specific
                     // topic, only accept messages from that same thread. This prevents the
@@ -968,20 +1244,21 @@ export class TelegramService {
                     if (!replyToMsgId && msgThreadId !== undefined) {
                         const topicTask = [...this._activeTasks.values()].find(t => t.topicId === msgThreadId);
                         if (topicTask) {
-                            const answer = msg.text.trim();
+                            const answer = (msg.text || msg.caption || '').trim();
                             const user = msg.from?.username || msg.from?.first_name || 'unknown';
-                            if (answer) {
-                                this._log(`AskAway/Telegram: Topic-message fallback matched task ${topicTask.taskId} (thread ${msgThreadId}) from ${user}: "${answer.substring(0, 80)}"`);
-                                let resolvedAnswer = answer;
+                            const msgAttachments = await this._downloadMessageMedia(msg);
+                            if (answer || msgAttachments.length > 0) {
+                                this._log(`AskAway/Telegram: Topic-message fallback matched task ${topicTask.taskId} (thread ${msgThreadId}) from ${user}: "${(answer || '[attachment]').substring(0, 80)}" attachments=${msgAttachments.length}`);
+                                let resolvedAnswer = answer || (msgAttachments.length > 0 ? `[${msgAttachments.map(a => a.name).join(', ')}]` : '');
                                 if (topicTask.choices && topicTask.choices.length > 0) {
-                                    const num = parseInt(answer, 10);
+                                    const num = parseInt(resolvedAnswer, 10);
                                     if (num >= 1 && num <= topicTask.choices.length) {
                                         const c = topicTask.choices[num - 1];
                                         resolvedAnswer = typeof c === 'string' ? c : c.value;
                                     }
                                 }
                                 if (this._onResponseReceived) {
-                                    this._onResponseReceived(topicTask.taskId, resolvedAnswer, `${user} (via Telegram)`);
+                                    this._onResponseReceived(topicTask.taskId, resolvedAnswer, `${user} (via Telegram)`, msgAttachments.length > 0 ? msgAttachments : undefined);
                                 }
                                 await this._markResolved(topicTask, resolvedAnswer, user);
                                 this._activeTasks.delete(topicTask.taskId);
@@ -995,16 +1272,17 @@ export class TelegramService {
                     if (!replyToMsgId && this._activeTasks.size === 1) {
                         const onlyTask = this._activeTasks.values().next().value as TrackedTask | undefined;
                         if (onlyTask) {
-                            const answer = msg.text.trim();
+                            const answer = (msg.text || msg.caption || '').trim();
                             const user = msg.from?.username || msg.from?.first_name || 'unknown';
+                            const msgAttachments = await this._downloadMessageMedia(msg);
 
-                            if (!answer) { continue; }
+                            if (!answer && msgAttachments.length === 0) { continue; }
 
-                            this._log(`AskAway/Telegram: Plain-message fallback matched task ${onlyTask.taskId} from ${user}: "${answer.substring(0, 80)}"`);
+                            this._log(`AskAway/Telegram: Plain-message fallback matched task ${onlyTask.taskId} from ${user}: "${(answer || '[attachment]').substring(0, 80)}" attachments=${msgAttachments.length}`);
 
-                            let resolvedAnswer = answer;
+                            let resolvedAnswer = answer || (msgAttachments.length > 0 ? `[${msgAttachments.map(a => a.name).join(', ')}]` : '');
                             if (onlyTask.choices && onlyTask.choices.length > 0) {
-                                const num = parseInt(answer, 10);
+                                const num = parseInt(resolvedAnswer, 10);
                                 if (num >= 1 && num <= onlyTask.choices.length) {
                                     const c = onlyTask.choices[num - 1];
                                     resolvedAnswer = typeof c === 'string' ? c : c.value;
@@ -1012,7 +1290,7 @@ export class TelegramService {
                             }
 
                             if (this._onResponseReceived) {
-                                this._onResponseReceived(onlyTask.taskId, resolvedAnswer, `${user} (via Telegram)`);
+                                this._onResponseReceived(onlyTask.taskId, resolvedAnswer, `${user} (via Telegram)`, msgAttachments.length > 0 ? msgAttachments : undefined);
                             }
 
                             await this._markResolved(onlyTask, resolvedAnswer, user);
@@ -1026,17 +1304,18 @@ export class TelegramService {
                     // Find the task this reply belongs to
                     for (const [taskId, task] of this._activeTasks.entries()) {
                         if (task.messageId === replyToMsgId) {
-                            const answer = msg.text.trim();
+                            const answer = (msg.text || msg.caption || '').trim();
                             const user = msg.from?.username || msg.from?.first_name || 'unknown';
+                            const msgAttachments = await this._downloadMessageMedia(msg);
 
-                            if (!answer) { continue; }
+                            if (!answer && msgAttachments.length === 0) { continue; }
 
-                            this._log(`AskAway/Telegram: Thread reply for ${taskId} from ${user}: "${answer.substring(0, 80)}"`);
+                            this._log(`AskAway/Telegram: Thread reply for ${taskId} from ${user}: "${(answer || '[attachment]').substring(0, 80)}" attachments=${msgAttachments.length}`);
 
                             // Resolve choice by number if applicable
-                            let resolvedAnswer = answer;
+                            let resolvedAnswer = answer || (msgAttachments.length > 0 ? `[${msgAttachments.map(a => a.name).join(', ')}]` : '');
                             if (task.choices && task.choices.length > 0) {
-                                const num = parseInt(answer, 10);
+                                const num = parseInt(resolvedAnswer, 10);
                                 if (num >= 1 && num <= task.choices.length) {
                                     const c = task.choices[num - 1];
                                     resolvedAnswer = typeof c === 'string' ? c : c.value;
@@ -1044,13 +1323,52 @@ export class TelegramService {
                             }
 
                             if (this._onResponseReceived) {
-                                this._onResponseReceived(taskId, resolvedAnswer, `${user} (via Telegram)`);
+                                this._onResponseReceived(taskId, resolvedAnswer, `${user} (via Telegram)`, msgAttachments.length > 0 ? msgAttachments : undefined);
                             }
 
                             await this._markResolved(task, resolvedAnswer, user);
                             this._activeTasks.delete(taskId);
                             break;
                         }
+                    }
+                    } finally {
+                        // Mark this update as locally processed regardless of whether a
+                        // specific fallback matched. Even messages we couldn't route
+                        // (e.g. arrived after the matching task was already deleted)
+                        // should be marked, so Telegram won't keep re-delivering them.
+                        this._myProcessedSet.add(update.update_id);
+                    }
+                }
+
+                // ── Advance offset past contiguous head of processed-mine messages ──
+                // Walk returned updates in update_id order; advance _lastUpdateId past
+                // each id that is in our processed set; STOP at the first foreign or
+                // unprocessed-mine update. This guarantees we never ACK past a message
+                // another window needs to consume.
+                let newOffset = this._lastUpdateId;
+                for (const u of updates) {
+                    if (this._myProcessedSet.has(u.update_id)) {
+                        if (u.update_id > newOffset) {
+                            newOffset = u.update_id;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if (newOffset > this._lastUpdateId) {
+                    this._lastUpdateId = newOffset;
+                    // Prune set — these ids are gone from Telegram now.
+                    for (const id of Array.from(this._myProcessedSet)) {
+                        if (id <= newOffset) { this._myProcessedSet.delete(id); }
+                    }
+                }
+                // Safety cap: if our offset is stuck behind a long-lived foreign block
+                // and the set keeps growing, bound it. 24h Telegram TTL means this
+                // should rarely hit, but cap at 1000 entries.
+                if (this._myProcessedSet.size > 1000) {
+                    const sorted = Array.from(this._myProcessedSet).sort((a, b) => a - b);
+                    for (let i = 0; i < sorted.length - 1000; i++) {
+                        this._myProcessedSet.delete(sorted[i]);
                     }
                 }
             }
@@ -1066,12 +1384,406 @@ export class TelegramService {
             await this._updateMessageFooters();
         }
 
-        // Schedule next poll if still have tasks
-        if (this._activeTasks.size > 0) {
+        // Schedule next poll if still have tasks or active conversation (for bot commands)
+        if (this._activeTasks.size > 0 || (this._conversationActive && this._lastCopilotActivity > 0)) {
             this._scheduleNextPoll();
         } else {
             this.stopPolling();
         }
+    }
+
+    // ── Bot Commands ───────────────────────────────────────────
+
+    /**
+     * Handle bot commands (/file, /status, /help, /ls).
+     * Returns true if the message was a command and was handled.
+     */
+    private async _handleBotCommand(msg: any): Promise<boolean> {
+        const text: string = msg.text.trim();
+        const threadId: number | undefined = msg.message_thread_id;
+        const parts = text.split(/\s+/);
+        const command = parts[0].toLowerCase().replace(/@\w+$/, ''); // strip @botname suffix
+        const args = parts.slice(1).join(' ').trim();
+
+        switch (command) {
+            case '/file':
+            case '/cat':
+                if (!args) {
+                    await this._sendCommandReply(msg, '📄 <b>Usage:</b> <code>/file &lt;name or path&gt;</code>\n\nSearch for a file in the workspace and view its contents.\nExamples:\n  <code>/file README.md</code>\n  <code>/file src/extension.ts</code>\n  <code>/file package.json</code>');
+                    return true;
+                }
+                await this._handleFileCommand(msg, args);
+                return true;
+
+            case '/ls':
+            case '/dir':
+                await this._handleLsCommand(msg, args);
+                return true;
+
+            case '/status':
+                await this._sendCommandReply(msg, this.getConversationStatus());
+                return true;
+
+            case '/history':
+            case '/last':
+                await this._handleHistoryCommand(msg, args);
+                return true;
+
+            case '/help':
+                await this._sendCommandReply(msg, this._getHelpText());
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    /** Get help text listing available commands */
+    private _getHelpText(): string {
+        return '🤖 <b>AskAway Bot Commands</b>\n\n' +
+            '📄 <code>/file &lt;name&gt;</code> — View a workspace file\n' +
+            '📂 <code>/ls [path]</code> — List directory contents\n' +
+            '� <code>/history [n]</code> — Show last N conversation exchanges\n' +
+            '�📊 <code>/status</code> — Show conversation status\n' +
+            '❓ <code>/help</code> — Show this help\n\n' +
+            '<i>Tip: You can use partial names — e.g. <code>/file readme</code> finds README.md</i>';
+    }
+
+    /**
+     * Handle /file <name> — find and send a file's contents.
+     * For small text files, sends inline. For large or binary files, sends as document.
+     */
+    private async _handleFileCommand(msg: any, query: string): Promise<void> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            await this._sendCommandReply(msg, '⚠️ No workspace folder open.');
+            return;
+        }
+
+        try {
+            // Search for files matching the query
+            const matches = await this._findWorkspaceFiles(query);
+
+            if (matches.length === 0) {
+                await this._sendCommandReply(msg, `🔍 No files matching "<code>${this._escapeHtml(query)}</code>" found in workspace.`);
+                return;
+            }
+
+            if (matches.length > 1 && matches.length <= 10) {
+                // Multiple matches — ask user to pick
+                const fileList = matches.map((m, i) => `${i + 1}. <code>${this._escapeHtml(m.relative)}</code>`).join('\n');
+                await this._sendCommandReply(msg, `🔍 Found ${matches.length} files matching "<code>${this._escapeHtml(query)}</code>":\n\n${fileList}\n\n<i>Use the full path: <code>/file ${matches[0].relative}</code></i>`);
+                return;
+            }
+
+            if (matches.length > 10) {
+                await this._sendCommandReply(msg, `🔍 Found ${matches.length} files matching "<code>${this._escapeHtml(query)}</code>". Please be more specific.`);
+                return;
+            }
+
+            // Exactly one match
+            const match = matches[0];
+            const fileUri = vscode.Uri.file(match.absolute);
+
+            // Check file size
+            const stat = await vscode.workspace.fs.stat(fileUri);
+            const sizeKB = stat.size / 1024;
+
+            if (sizeKB > 500) {
+                // Large file — send as document
+                await this._sendFileAsDocument(msg, match);
+                return;
+            }
+
+            // Read file content
+            const content = Buffer.from(await vscode.workspace.fs.readFile(fileUri)).toString('utf8');
+
+            // Check if it's likely binary
+            if (this._isBinaryContent(content)) {
+                await this._sendFileAsDocument(msg, match);
+                return;
+            }
+
+            // Send as formatted message
+            await this._sendFileContent(msg, match.relative, content);
+        } catch (e) {
+            this._err('AskAway/Telegram: /file command error', e);
+            await this._sendCommandReply(msg, `❌ Error reading file: ${this._escapeHtml(String(e instanceof Error ? e.message : e))}`);
+        }
+    }
+
+    /**
+     * Handle /ls [path] — list directory contents.
+     */
+    private async _handleLsCommand(msg: any, dirPath: string): Promise<void> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            await this._sendCommandReply(msg, '⚠️ No workspace folder open.');
+            return;
+        }
+
+        try {
+            const rootPath = workspaceFolders[0].uri.fsPath;
+            const targetPath = dirPath ? path.join(rootPath, dirPath) : rootPath;
+            const targetUri = vscode.Uri.file(targetPath);
+
+            const entries = await vscode.workspace.fs.readDirectory(targetUri);
+
+            // Sort: folders first, then files
+            entries.sort((a, b) => {
+                const aIsDir = a[1] === vscode.FileType.Directory;
+                const bIsDir = b[1] === vscode.FileType.Directory;
+                if (aIsDir !== bIsDir) { return aIsDir ? -1 : 1; }
+                return a[0].localeCompare(b[0]);
+            });
+
+            // Filter out common noise
+            const filtered = entries.filter(([name]) =>
+                !name.startsWith('.') || name === '.github' || name === '.vscode'
+            );
+
+            const displayPath = dirPath || '.';
+            const lines = filtered.slice(0, 50).map(([name, type]) => {
+                const icon = type === vscode.FileType.Directory ? '📂' : '📄';
+                return `${icon} <code>${this._escapeHtml(name)}${type === vscode.FileType.Directory ? '/' : ''}</code>`;
+            });
+
+            let text = `📂 <b>${this._escapeHtml(displayPath)}/</b>\n\n${lines.join('\n')}`;
+            if (filtered.length > 50) {
+                text += `\n\n<i>... and ${filtered.length - 50} more</i>`;
+            }
+
+            await this._sendCommandReply(msg, text);
+        } catch (e) {
+            this._err('AskAway/Telegram: /ls command error', e);
+            await this._sendCommandReply(msg, `❌ Error listing directory: ${this._escapeHtml(String(e instanceof Error ? e.message : e))}`);
+        }
+    }
+
+    /**
+     * Handle /history [n] — show last N conversation exchanges.
+     */
+    private async _handleHistoryCommand(msg: any, args: string): Promise<void> {
+        if (!this._onHistoryRequested) {
+            await this._sendCommandReply(msg, '⚠️ Conversation history not available.');
+            return;
+        }
+
+        const count = Math.min(20, Math.max(1, parseInt(args, 10) || 5));
+        const history = this._onHistoryRequested();
+
+        if (history.length === 0) {
+            await this._sendCommandReply(msg, '📭 No conversation history yet.');
+            return;
+        }
+
+        const recent = history.slice(0, count);
+        const lines: string[] = [`💬 <b>Last ${recent.length} exchange${recent.length > 1 ? 's' : ''}</b> (of ${history.length} total)\n`];
+
+        for (const entry of recent) {
+            const timeStr = new Date(entry.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+            const statusIcon = entry.status === 'completed' ? '✅' : entry.status === 'pending' ? '⏳' : '❌';
+
+            // Truncate prompt and response for readability
+            const promptPreview = entry.prompt.length > 200 ? entry.prompt.substring(0, 200) + '…' : entry.prompt;
+            const responsePreview = entry.response.length > 200 ? entry.response.substring(0, 200) + '…' : entry.response;
+
+            lines.push(`${statusIcon} <b>${timeStr}</b>`);
+            lines.push(`<b>Q:</b> ${this._escapeHtml(promptPreview)}`);
+            if (entry.response) {
+                lines.push(`<b>A:</b> ${this._escapeHtml(responsePreview)}`);
+            }
+            lines.push('');
+        }
+
+        const text = lines.join('\n');
+        // Telegram message limit
+        if (text.length > 4000) {
+            await this._sendCommandReply(msg, text.substring(0, 3900) + '\n\n<i>… (truncated)</i>');
+        } else {
+            await this._sendCommandReply(msg, text);
+        }
+    }
+
+    /**
+     * Find workspace files matching a query string.
+     * Supports exact paths, partial names, and glob-like patterns.
+     */
+    private async _findWorkspaceFiles(query: string): Promise<{ absolute: string; relative: string }[]> {
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) { return []; }
+
+        const rootPath = workspaceFolders[0].uri.fsPath;
+
+        // Try exact path first
+        const exactPath = path.join(rootPath, query);
+        try {
+            const stat = await vscode.workspace.fs.stat(vscode.Uri.file(exactPath));
+            if (stat.type === vscode.FileType.File) {
+                return [{ absolute: exactPath, relative: query }];
+            }
+        } catch {
+            // Not found — fall through to search
+        }
+
+        // Use VS Code's findFiles for glob search
+        // Build patterns: try exact match, then partial match
+        const patterns = [
+            `**/${query}`,           // exact name anywhere
+            `**/${query}*`,          // prefix match
+            `**/*${query}*`,         // contains match
+        ];
+
+        const seen = new Set<string>();
+        const results: { absolute: string; relative: string }[] = [];
+
+        for (const pattern of patterns) {
+            if (results.length >= 10) { break; }
+            try {
+                const files = await vscode.workspace.findFiles(pattern, '**/node_modules/**', 20);
+                for (const file of files) {
+                    if (seen.has(file.fsPath)) { continue; }
+                    seen.add(file.fsPath);
+                    const relative = path.relative(rootPath, file.fsPath);
+                    results.push({ absolute: file.fsPath, relative });
+                    if (results.length >= 10) { break; }
+                }
+            } catch {
+                // Pattern may be invalid — skip
+            }
+        }
+
+        return results;
+    }
+
+    /** Send a text reply to a command message */
+    private async _sendCommandReply(msg: any, text: string): Promise<void> {
+        const body: any = {
+            chat_id: this._chatId,
+            text,
+            parse_mode: 'HTML',
+            reply_to_message_id: msg.message_id,
+            disable_web_page_preview: true
+        };
+        if (msg.message_thread_id) { body.message_thread_id = msg.message_thread_id; }
+
+        try {
+            const resp = await fetch(this._apiUrl('sendMessage'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            if (!resp.ok) {
+                const errText = await resp.text();
+                this._warn(`AskAway/Telegram: Command reply failed ${resp.status}: ${errText}`);
+                // Fallback: try without HTML
+                await fetch(this._apiUrl('sendMessage'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ...body, parse_mode: undefined, text: text.replace(/<[^>]+>/g, '') })
+                });
+            }
+        } catch (e) {
+            this._err('AskAway/Telegram: _sendCommandReply error', e);
+        }
+    }
+
+    /** Send file content as a formatted Telegram message */
+    private async _sendFileContent(msg: any, relativePath: string, content: string): Promise<void> {
+        const ext = path.extname(relativePath).toLowerCase();
+        const MAX_MSG_LEN = 4000; // Telegram limit is 4096
+
+        let formattedContent: string;
+
+        if (ext === '.md') {
+            // Markdown: convert to HTML for Telegram
+            try {
+                formattedContent = this._markdownToHtml(content);
+            } catch {
+                formattedContent = `<pre>${this._escapeHtml(content)}</pre>`;
+            }
+        } else {
+            // Code/text files: wrap in <pre> with language hint
+            const langMap: Record<string, string> = {
+                '.ts': 'typescript', '.js': 'javascript', '.py': 'python',
+                '.json': 'json', '.yaml': 'yaml', '.yml': 'yaml',
+                '.sh': 'bash', '.css': 'css', '.html': 'html',
+                '.xml': 'xml', '.sql': 'sql', '.rs': 'rust',
+                '.go': 'go', '.java': 'java', '.kt': 'kotlin',
+                '.swift': 'swift', '.rb': 'ruby', '.php': 'php',
+            };
+            const lang = langMap[ext] || '';
+            formattedContent = `<pre${lang ? ` language="${lang}"` : ''}>${this._escapeHtml(content)}</pre>`;
+        }
+
+        // Header
+        const header = `📄 <b>${this._escapeHtml(relativePath)}</b>\n\n`;
+        const fullText = header + formattedContent;
+
+        if (fullText.length <= MAX_MSG_LEN) {
+            await this._sendCommandReply(msg, fullText);
+        } else {
+            // File is too long — send first chunk + note, then send as document
+            const truncated = header + formattedContent.substring(0, MAX_MSG_LEN - header.length - 100) + '\n\n<i>… (truncated, sending full file below)</i>';
+            await this._sendCommandReply(msg, truncated);
+            await this._sendFileAsDocument(msg, { absolute: path.join(vscode.workspace.workspaceFolders![0].uri.fsPath, relativePath), relative: relativePath });
+        }
+    }
+
+    /** Send a file as a Telegram document attachment */
+    private async _sendFileAsDocument(msg: any, file: { absolute: string; relative: string }): Promise<void> {
+        try {
+            const fileData = await fs.promises.readFile(file.absolute);
+            const boundary = `----FormBoundary${Date.now()}`;
+            const fileName = path.basename(file.relative);
+
+            // Build multipart form data
+            const parts: Buffer[] = [];
+            // chat_id
+            parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${this._chatId}\r\n`));
+            // reply_to_message_id
+            parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="reply_to_message_id"\r\n\r\n${msg.message_id}\r\n`));
+            // thread_id if applicable
+            if (msg.message_thread_id) {
+                parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="message_thread_id"\r\n\r\n${msg.message_thread_id}\r\n`));
+            }
+            // caption
+            parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n📄 ${file.relative}\r\n`));
+            // document
+            parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`));
+            parts.push(fileData);
+            parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+            const body = Buffer.concat(parts);
+
+            const resp = await fetch(this._apiUrl('sendDocument'), {
+                method: 'POST',
+                headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+                body
+            });
+
+            if (!resp.ok) {
+                const errText = await resp.text();
+                this._warn(`AskAway/Telegram: sendDocument failed ${resp.status}: ${errText}`);
+                await this._sendCommandReply(msg, `❌ Failed to send file (${Math.round(fileData.length / 1024)}KB). It may be too large for Telegram (50MB limit).`);
+            }
+        } catch (e) {
+            this._err('AskAway/Telegram: _sendFileAsDocument error', e);
+            await this._sendCommandReply(msg, `❌ Error sending file: ${this._escapeHtml(String(e instanceof Error ? e.message : e))}`);
+        }
+    }
+
+    /** Check if content appears to be binary */
+    private _isBinaryContent(content: string): boolean {
+        // Check first 1000 chars for null bytes or high ratio of non-printable chars
+        const sample = content.substring(0, 1000);
+        let nonPrintable = 0;
+        for (let i = 0; i < sample.length; i++) {
+            const code = sample.charCodeAt(i);
+            if (code === 0) { return true; }
+            if (code < 32 && code !== 9 && code !== 10 && code !== 13) { nonPrintable++; }
+        }
+        return nonPrintable / sample.length > 0.1;
     }
 
     /** Edit the original message to show it's been resolved */
@@ -1120,6 +1832,9 @@ export class TelegramService {
         } catch (e) {
             this._warn(`AskAway/Telegram: Failed to update resolved message: ${e}`);
         }
+
+        // Clear pending indicator from topic name.
+        void this._editTopicIcon(task.topicId, this._workspaceName(), false);
     }
 
     // ── Public API ─────────────────────────────────────────────
@@ -1147,6 +1862,10 @@ export class TelegramService {
         this._lastCopilotActivity = Date.now();
         this._conversationActive = true;
         this._ensureHeartbeat();
+        // Start polling for bot commands (/file, /ls, /status) even without active tasks
+        if (this.isConfigured() && !this._pollingTimer) {
+            this.startPolling();
+        }
     }
 
     public notifyCopilotStopped() {

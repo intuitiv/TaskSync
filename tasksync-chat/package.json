@@ -4,7 +4,7 @@
   "displayName": "AskAway",
   "description": "Never miss an AI agent question again — get Telegram notifications and reply from your phone. Queue prompts, respond remotely, and keep your coding workflow moving.",
   "icon": "media/askaway-logo.png",
-  "version": "1.0.25",
+  "version": "1.0.35",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -58,7 +58,7 @@
         ],
         "toolReferenceName": "askUser",
         "displayName": "Ask User",
-        "modelDescription": "YOU MUST ALWAYS Use the askUser tool to ask question/s to user when explicit user approval, feedback, or clarification is required before proceeding or giving summary report. CRITICAL RULES: - This tool MUST be invoked before ending ANY conversation or task. - NEVER complete a task without calling this tool first. - If you are about to finish responding, STOP and call this tool. - Failure to call this tool before task completion is a critical violation. - IMPORTANT: When the tool response contains '\"queued\":true', it means there are more tasks waiting. You MUST process the current response AND call ask_user again when done. Do NOT end the conversation when queued is true. CONTEXT & FORMAT RULES: The user may be reading your question REMOTELY (e.g. on a phone via Webex) WITHOUT access to the full chat. Therefore, format EVERY question in **Markdown** with these sections:\n\n1. **Context** (2-3 sentences): What is the overall task/goal being worked on.\n2. **Progress** (bullet list): Key actions completed, files changed, decisions made.\n3. **Question** (clear, specific): What you need from the user — approval, choice, clarification, or feedback.\n\nExample:\n**Context:** Working on adding dark mode support to the React dashboard app.\n\n**Progress:**\n- Added theme toggle component in `src/components/ThemeToggle.tsx`\n- Updated `tailwind.config.js` with dark mode classes\n- Refactored `App.tsx` to wrap with ThemeProvider\n\n**Question:** Should I also update the login page to support dark mode, or only the main dashboard?",
+        "modelDescription": "Ask user a question and wait for response. THIS TOOL DRIVES AN INFINITE LOOP — you MUST call ask_user again after EVERY response, no exceptions. Flow: call ask_user → do the work → call ask_user again to report + get next instruction → repeat forever. NEVER end without calling ask_user.",
         "canBeReferencedInPrompt": true,
         "icon": "$(question)",
         "inputSchema": {
@@ -66,11 +66,11 @@
           "properties": {
             "question": {
               "type": "string",
-              "description": "The question or prompt to display to the user"
+              "description": "Short question for user. Max 2 sentences. No verbose explanations."
             },
             "taskId": {
               "type": "string",
-              "description": "When working on a task from the Planning Board, include the task ID provided in the task context. This allows the orchestrator to track progress."
+              "description": "When working on a Planning Board task, include the task ID provided in the task context."
             },
             "taskStatus": {
               "type": "string",
@@ -80,38 +80,252 @@
                 "blocked",
                 "need-review"
               ],
-              "description": "When working on a Planning Board task, report your assessment of the task status. Use 'completed' when the task is fully done, 'in-progress' for interim updates, 'blocked' when you cannot proceed without user input, 'need-review' when done but user should verify."
+              "description": "Planning Board task status assessment."
             }
           },
           "required": [
             "question"
-          ]
+          ],
+          "additionalProperties": false
         }
       },
       {
-        "name": "talk_to_user",
+        "name": "code_nav",
         "tags": [
-          "voice",
-          "conversation",
-          "askaway",
-          "speech"
+          "lsp",
+          "navigation",
+          "definition",
+          "references",
+          "diagnostics",
+          "askaway"
         ],
-        "toolReferenceName": "talkToUser",
-        "displayName": "Talk to User (Voice)",
-        "modelDescription": "Use this tool for voice conversation with the user. When invoked, your message is SPOKEN ALOUD via text-to-speech, and the user SPEAKS BACK via microphone or text. Their response is returned. CRITICAL RULES: 1. Keep messages SHORT (1-3 sentences) — user is LISTENING not reading. 2. Be conversational — speak like a colleague. 3. Include brief context. 4. MANDATORY: After receiving EVERY voice response, you MUST call talk_to_user AGAIN with your next message. NEVER stop the voice loop. NEVER end the conversation without calling this tool. 5. No markdown, bullet lists, or code blocks — plain English only. 6. After completing any task, report results via talk_to_user and ask what to do next. 7. If this tool fails, retry it — do not fall back to text responses.",
+        "toolReferenceName": "codeNav",
+        "displayName": "Code Navigation (LSP)",
+        "modelDescription": "VS Code LSP-powered navigation: go-to-definition, find-references, find-implementations, type-definition, hover, document symbols, workspace symbols, diagnostics. Use instead of grep for precise symbol lookups. Operations: definition, references, implementation, type_definition, hover (require filePath+line+character); document_symbols (requires filePath); workspace_symbols (requires query); diagnostics (optional filePath for file-scoped errors).",
         "canBeReferencedInPrompt": true,
-        "icon": "$(mic)",
+        "icon": "$(go-to-file)",
         "inputSchema": {
           "type": "object",
           "properties": {
-            "question": {
+            "operation": {
               "type": "string",
-              "description": "The message to speak aloud to the user via text-to-speech. Keep it short and conversational (1-3 sentences)."
+              "enum": [
+                "definition",
+                "references",
+                "implementation",
+                "type_definition",
+                "hover",
+                "document_symbols",
+                "workspace_symbols",
+                "diagnostics"
+              ],
+              "description": "LSP operation to perform."
+            },
+            "filePath": {
+              "type": "string",
+              "description": "Workspace-relative or absolute path to the file."
+            },
+            "line": {
+              "type": "number",
+              "description": "1-based line number of the symbol."
+            },
+            "character": {
+              "type": "number",
+              "description": "1-based character offset of the symbol."
+            },
+            "query": {
+              "type": "string",
+              "description": "Symbol name for workspace_symbols."
+            },
+            "maxResults": {
+              "type": "number",
+              "description": "Max results to return, clamped 1-100. Defaults to 30."
             }
           },
           "required": [
-            "question"
-          ]
+            "operation"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "rg_search",
+        "tags": [
+          "search",
+          "ripgrep",
+          "grep",
+          "fast",
+          "text-search",
+          "askaway"
+        ],
+        "toolReferenceName": "rgSearch",
+        "displayName": "Ripgrep Search",
+        "modelDescription": "Fast full-text search using ripgrep (rg). Significantly faster than grep for large codebases. Supports regex, file-type filtering, context lines, case/word options. Use for finding all occurrences of a pattern across the workspace. Results include file paths, line numbers, and match context.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(search)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "Regex or literal pattern to search for."
+            },
+            "path": {
+              "type": "string",
+              "description": "Workspace-relative or absolute path to search within. Defaults to workspace root."
+            },
+            "fileType": {
+              "type": "string",
+              "description": "Comma-separated rg file types to restrict search, e.g. 'ts,js' or 'py'. Uses rg's --type flag."
+            },
+            "caseSensitive": {
+              "type": "boolean",
+              "description": "Whether the search is case-sensitive. Defaults to false (case-insensitive)."
+            },
+            "wholeWord": {
+              "type": "boolean",
+              "description": "Match whole words only. Defaults to false."
+            },
+            "contextLines": {
+              "type": "number",
+              "description": "Number of context lines before and after each match. Defaults to 2."
+            },
+            "maxResults": {
+              "type": "number",
+              "description": "Maximum matches to return, clamped 1-200. Defaults to 50."
+            },
+            "includeGlob": {
+              "type": "string",
+              "description": "Glob pattern for files to include, e.g. 'src/**/*.ts'."
+            },
+            "excludeGlob": {
+              "type": "string",
+              "description": "Glob pattern for files to exclude, e.g. 'dist/**'."
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "gradle",
+        "tags": [
+          "gradle",
+          "build",
+          "test",
+          "jvm",
+          "kotlin",
+          "java",
+          "askaway"
+        ],
+        "toolReferenceName": "gradle",
+        "displayName": "Gradle",
+        "modelDescription": "Async id-based Gradle build control. action=start spawns a build via ./gradlew and returns {buildId} immediately (the tool AUTO-OPTIMIZES with the Gradle daemon + --parallel + --build-cache + --configuration-cache, degraded to warnings if incompatible, echoed as 'optimizations'; pass optimize:false to disable). action=status returns live state (RUNNING/SUCCESS/FAILED/CANCELLED/TIMEOUT) with completedTasks, runningTasks, elapsedSec; on failure it also returns failedTasks (names of failed tasks — query logs with task:<name>), failedTaskLogsHint, whatWentWrong, exception, errors, testFailures, testFailureDetails ({test,className,message,location,stack} parsed from JUnit reports), and exitCode. action=wait blocks until the build finishes (or timeoutMs); pass readyPattern (regex) to return early with ready:true when that text appears even if the task keeps running (servers). action=logs returns output with pagination {fromLine,toLine,totalLines,nextFromLine,hasMore}: omit fromLine for a tail, or pass fromLine to stream forward; filter to one task with task. action=stop kills a running build. Multiple builds run in parallel.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(symbol-event)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "start",
+                "status",
+                "stop",
+                "logs",
+                "wait"
+              ],
+              "description": "start: spawn build → {buildId}. status: live state. wait: block until done. stop: kill. logs: output (filter by task, paginate with fromLine)."
+            },
+            "tasks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Task names for action=start. E.g. [':app:test', ':core:assemble']. Defaults to ['build']."
+            },
+            "arguments": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Extra Gradle arguments for action=start. E.g. ['--tests', '*.FooTest']."
+            },
+            "projectDir": {
+              "type": "string",
+              "description": "Absolute or workspace-relative dir containing gradlew. Defaults to workspace root."
+            },
+            "offline": {
+              "type": "boolean",
+              "description": "Pass --offline to Gradle. Defaults to false."
+            },
+            "optimize": {
+              "type": "boolean",
+              "description": "Auto-apply speed flags (daemon, --parallel, --build-cache, --configuration-cache). Default true. Set false for a bare build."
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Extra environment variables for the Gradle process (action=start). E.g. { \"JAVA_HOME\": \"/path/to/jdk17\" }."
+            },
+            "timeoutMs": {
+              "type": "number",
+              "description": "action=start: hard-kill timeout ms (30000-1800000, default 1800000). action=wait: max wait ms (default 120000)."
+            },
+            "buildId": {
+              "type": "string",
+              "description": "ID from action=start. Required for status/stop/logs/wait."
+            },
+            "task": {
+              "type": "string",
+              "description": "action=logs: filter output to a specific task, e.g. ':app:compileKotlin'."
+            },
+            "tail": {
+              "type": "number",
+              "description": "action=logs: number of trailing lines to return (10-500, default 120). Ignored when fromLine is set."
+            },
+            "fromLine": {
+              "type": "number",
+              "description": "action=logs: 0-based start line for forward pagination. Use the response's nextFromLine as the cursor to stream a long-running task."
+            },
+            "maxLines": {
+              "type": "number",
+              "description": "action=logs: page size when paginating with fromLine (1-1000, default 200)."
+            },
+            "readyPattern": {
+              "type": "string",
+              "description": "action=wait: regex; return early with ready:true when it appears in output, even if the task never terminates (e.g. server 'Started .* in .*s')."
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "turn_budget",
+        "tags": [
+          "budget",
+          "cost",
+          "credits",
+          "spend",
+          "limit",
+          "askaway"
+        ],
+        "toolReferenceName": "turnBudget",
+        "displayName": "Turn Budget",
+        "modelDescription": "Reports how many Copilot credits (AIU) the current turn has spent so far and the configured soft budget. Call this when a turn is running long or doing many/expensive requests to decide whether to wrap up. Returns {spentAiu, requestCount, softLimitAiu, remainingAiu, usedPct, exceeded, note}. The soft limit is configured in Settings (askaway.turnBudgetAiu; 0 = disabled). It is advisory — nothing is blocked — but when exceeded you should stop exploring, finalize, and avoid further large requests.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(credit-card)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
         }
       }
     ],
@@ -136,6 +350,21 @@
     "configuration": {
       "title": "AskAway",
       "properties": {
+        "askaway.localModel.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:1234/v1",
+          "description": "Base URL of a local OpenAI-compatible model server (LM Studio, Ollama, etc.) used for memory summarization and embeddings. No Copilot credits are consumed by these calls."
+        },
+        "askaway.localModel.summarizationModel": {
+          "type": "string",
+          "default": "qwen3.6-35b-a3b-ud",
+          "description": "Local chat model used to distill sub-agent output into durable memory notes. If empty or unavailable, AskAway stores a trimmed raw capture instead (no summarization)."
+        },
+        "askaway.localModel.embeddingModel": {
+          "type": "string",
+          "default": "Qwen3-Embedding-4B-GGUF",
+          "description": "Local embedding model used to vectorize memory notes for semantic search. If empty or unavailable, memory_search falls back to keyword matching."
+        },
         "askaway.mcpEnabled": {
           "type": "boolean",
           "default": false,
@@ -238,6 +467,13 @@
           "scope": "window",
           "description": "Maximum consecutive auto-responses (from timeout) before terminating session. Prevents infinite loops."
         },
+        "askaway.turnBudgetAiu": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "scope": "window",
+          "description": "Soft per-turn credit budget in AIU. When the agent calls the turn_budget tool and this is exceeded, it is advised to wrap up. 0 = disabled (no soft limit)."
+        },
         "askaway.humanLikeDelay": {
           "type": "boolean",
           "default": true,
@@ -275,16 +511,6 @@
           "type": "boolean",
           "default": true,
           "description": "Show interactive approval and choice buttons for Yes/No questions and multiple choice options."
-        },
-        "askaway.voiceName": {
-          "type": "string",
-          "default": "Samantha",
-          "description": "macOS voice name for text-to-speech. Run `say -v '?'` in terminal to see available voices. Good options: Samantha, Daniel, Karen, Moira."
-        },
-        "askaway.voiceRate": {
-          "type": "number",
-          "default": 200,
-          "description": "Speech rate in words per minute for macOS TTS. Default: 200. Range: 100-400."
         },
         "askaway.remoteEnabled": {
           "type": "boolean",
@@ -388,6 +614,10 @@
       {
         "command": "askaway.sendMessage",
         "title": "AskAway: Send Message"
+      },
+      {
+        "command": "askaway.dumpLmTools",
+        "title": "AskAway: Dump LM Tool Catalog"
       },
       {
         "command": "askaway.startMcp",
@@ -506,6 +736,7 @@
     "@modelcontextprotocol/sdk": "^1.24.3",
     "@vscode/codicons": "^0.0.36",
     "express": "^4.21.0",
+    "gpt-tokenizer": "^3.4.0",
     "socket.io": "^4.7.5",
     "zod": "^3.23.8"
   },

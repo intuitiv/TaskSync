@@ -1,8 +1,87 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import * as childProcess from 'child_process';
 import { AskAwayWebviewProvider } from './webview/webviewProvider';
 import { getImageMimeType } from './utils/imageUtils';
 import { PlanTaskStatus } from './plan/planTypes';
+import { dispatchGradle, GradleInput } from './gradle/gradleEngine';
+
+/**
+ * Append a per-invocation record for an AskAway LM tool to
+ * ~/.askaway/tool-calls.jsonl for offline "where do we spend output tokens?"
+ * analysis. approxTokens ≈ chars/4 (never sent to the model; best-effort).
+ */
+function logToolCall(tool: string, outputText: string, detail?: string): void {
+    try {
+        const chars = typeof outputText === 'string' ? outputText.length : 0;
+        const record = {
+            ts: Date.now(),
+            tool,
+            detail: detail ?? null,
+            outputChars: chars,
+            approxTokens: Math.ceil(chars / 4),
+        };
+        const dir = path.join(os.homedir(), '.askaway');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(path.join(dir, 'tool-calls.jsonl'), JSON.stringify(record) + '\n', 'utf8');
+    } catch {
+        // Best-effort — never let logging affect a tool call.
+    }
+}
+
+/**
+ * Compute how many credits (nanoAiu) the CURRENT turn has spent, straight from the
+ * active Copilot debug log (independent of the webview being open). Finds the newest
+ * debug-log session for this workspace, then sums copilotUsageNanoAiu of every
+ * llm_request logged at/after the last user_message (= the current turn boundary).
+ */
+async function computeTurnSpend(context: vscode.ExtensionContext): Promise<{ nanoAiu: number; requestCount: number; sessionId: string | null }> {
+    const empty = { nanoAiu: 0, requestCount: 0, sessionId: null as string | null };
+    const storageUriPath = context.storageUri?.fsPath;
+    if (!storageUriPath) { return empty; }
+    const debugRoot = path.join(path.dirname(storageUriPath), 'GitHub.copilot-chat', 'debug-logs');
+    let sessionDirs: fs.Dirent[];
+    try { sessionDirs = await fs.promises.readdir(debugRoot, { withFileTypes: true }); }
+    catch { return empty; }
+
+    // Newest session by main.jsonl mtime = the active chat.
+    let newest: { file: string; mtime: number; sid: string } | null = null;
+    for (const d of sessionDirs) {
+        if (!d.isDirectory()) { continue; }
+        const f = path.join(debugRoot, d.name, 'main.jsonl');
+        try {
+            const st = await fs.promises.stat(f);
+            if (!newest || st.mtimeMs > newest.mtime) { newest = { file: f, mtime: st.mtimeMs, sid: d.name }; }
+        } catch { /* skip unreadable */ }
+    }
+    if (!newest) { return empty; }
+
+    let data: string;
+    try { data = await fs.promises.readFile(newest.file, 'utf8'); } catch { return empty; }
+    const lines = data.split('\n');
+
+    let lastSubmitTs = 0;
+    for (const line of lines) {
+        if (line.indexOf('"type":"user_message"') === -1) { continue; }
+        try { const p = JSON.parse(line) as { ts?: number }; if (typeof p.ts === 'number' && p.ts > lastSubmitTs) { lastSubmitTs = p.ts; } } catch { /* skip */ }
+    }
+
+    let nanoAiu = 0, requestCount = 0;
+    for (const line of lines) {
+        if (line.indexOf('llm_request') === -1) { continue; }
+        let p: { ts?: number; attrs?: { copilotUsageNanoAiu?: number } };
+        try { p = JSON.parse(line); } catch { continue; }
+        const ts = typeof p.ts === 'number' ? p.ts : 0;
+        if (ts < lastSubmitTs) { continue; }
+        nanoAiu += typeof p.attrs?.copilotUsageNanoAiu === 'number' ? p.attrs.copilotUsageNanoAiu : 0;
+        requestCount += 1;
+    }
+    return { nanoAiu, requestCount, sessionId: newest.sid };
+}
+
+
 
 export interface Input {
     question: string;
@@ -16,6 +95,223 @@ export interface AskUserToolResult {
     queue: boolean;
     taskId?: string;
     taskStatus?: PlanTaskStatus;
+}
+
+type LspBridgeOperation = 'definition' | 'references' | 'implementation' | 'type_definition' | 'hover' | 'document_symbols' | 'workspace_symbols' | 'diagnostics';
+
+interface LspBridgeInput {
+    operation: LspBridgeOperation;
+    filePath?: string;
+    line?: number;
+    character?: number;
+    query?: string;
+    maxResults?: number;
+}
+
+function clampMaxResults(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return 30;
+    }
+    return Math.max(1, Math.min(100, Math.floor(value)));
+}
+
+function resolveWorkspaceUri(filePath: string): vscode.Uri {
+    if (path.isAbsolute(filePath)) {
+        return vscode.Uri.file(filePath);
+    }
+
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+        return vscode.Uri.file(path.resolve(filePath));
+    }
+    return vscode.Uri.joinPath(workspaceFolder.uri, filePath);
+}
+
+function formatUri(uri: vscode.Uri): string {
+    if (uri.scheme === 'file') {
+        return vscode.workspace.asRelativePath(uri, false);
+    }
+    return uri.toString();
+}
+
+function formatRange(range: vscode.Range): { start: { line: number; character: number }; end: { line: number; character: number } } {
+    return {
+        start: { line: range.start.line + 1, character: range.start.character + 1 },
+        end: { line: range.end.line + 1, character: range.end.character + 1 }
+    };
+}
+
+function formatLocation(item: vscode.Location | vscode.LocationLink): Record<string, unknown> {
+    if ('targetUri' in item) {
+        return {
+            file: formatUri(item.targetUri),
+            range: formatRange(item.targetRange),
+            selectionRange: item.targetSelectionRange ? formatRange(item.targetSelectionRange) : undefined,
+            originSelectionRange: item.originSelectionRange ? formatRange(item.originSelectionRange) : undefined
+        };
+    }
+
+    return {
+        file: formatUri(item.uri),
+        range: formatRange(item.range)
+    };
+}
+
+function stringifyMarkdown(value: vscode.MarkdownString | vscode.MarkedString): string {
+    if (typeof value === 'string') {
+        return value;
+    }
+    if (value instanceof vscode.MarkdownString) {
+        return value.value;
+    }
+    return `\`\`\`${value.language}\n${value.value}\n\`\`\``;
+}
+
+function formatSymbolKind(kind: vscode.SymbolKind): string {
+    return vscode.SymbolKind[kind] ?? String(kind);
+}
+
+function formatDocumentSymbol(symbol: vscode.DocumentSymbol | vscode.SymbolInformation): Record<string, unknown> {
+    if (symbol instanceof vscode.DocumentSymbol) {
+        return {
+            name: symbol.name,
+            detail: symbol.detail,
+            kind: formatSymbolKind(symbol.kind),
+            range: formatRange(symbol.range),
+            selectionRange: formatRange(symbol.selectionRange),
+            children: symbol.children.map(formatDocumentSymbol)
+        };
+    }
+
+    return {
+        name: symbol.name,
+        kind: formatSymbolKind(symbol.kind),
+        file: formatUri(symbol.location.uri),
+        range: formatRange(symbol.location.range),
+        containerName: symbol.containerName
+    };
+}
+
+function formatDiagnosticSeverity(severity: vscode.DiagnosticSeverity): string {
+    return vscode.DiagnosticSeverity[severity] ?? String(severity);
+}
+
+function requireFileAndPosition(input: LspBridgeInput): { uri: vscode.Uri; position: vscode.Position } | string {
+    if (!input.filePath) {
+        return 'filePath is required for this operation';
+    }
+    if (typeof input.line !== 'number' || typeof input.character !== 'number') {
+        return 'line and character are required for this operation (1-based)';
+    }
+    return {
+        uri: resolveWorkspaceUri(input.filePath),
+        position: new vscode.Position(Math.max(0, Math.floor(input.line) - 1), Math.max(0, Math.floor(input.character) - 1))
+    };
+}
+
+async function runLspBridge(input: LspBridgeInput, token: vscode.CancellationToken): Promise<Record<string, unknown>> {
+    const maxResults = clampMaxResults(input.maxResults);
+
+    switch (input.operation) {
+        case 'definition':
+        case 'references':
+        case 'implementation':
+        case 'type_definition': {
+            const target = requireFileAndPosition(input);
+            if (typeof target === 'string') {
+                return { error: target };
+            }
+            const command = input.operation === 'definition'
+                ? 'vscode.executeDefinitionProvider'
+                : input.operation === 'references'
+                    ? 'vscode.executeReferenceProvider'
+                    : input.operation === 'implementation'
+                        ? 'vscode.executeImplementationProvider'
+                        : 'vscode.executeTypeDefinitionProvider';
+            const locations = await vscode.commands.executeCommand<Array<vscode.Location | vscode.LocationLink>>(command, target.uri, target.position);
+            return {
+                operation: input.operation,
+                file: formatUri(target.uri),
+                position: { line: target.position.line + 1, character: target.position.character + 1 },
+                count: locations?.length ?? 0,
+                results: (locations ?? []).slice(0, maxResults).map(formatLocation)
+            };
+        }
+
+        case 'hover': {
+            const target = requireFileAndPosition(input);
+            if (typeof target === 'string') {
+                return { error: target };
+            }
+            const hovers = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', target.uri, target.position);
+            return {
+                operation: input.operation,
+                file: formatUri(target.uri),
+                position: { line: target.position.line + 1, character: target.position.character + 1 },
+                count: hovers?.length ?? 0,
+                results: (hovers ?? []).slice(0, maxResults).map(hover => ({
+                    contents: hover.contents.map(stringifyMarkdown),
+                    range: hover.range ? formatRange(hover.range) : undefined
+                }))
+            };
+        }
+
+        case 'document_symbols': {
+            if (!input.filePath) {
+                return { error: 'filePath is required for document_symbols' };
+            }
+            const uri = resolveWorkspaceUri(input.filePath);
+            const symbols = await vscode.commands.executeCommand<Array<vscode.DocumentSymbol | vscode.SymbolInformation>>('vscode.executeDocumentSymbolProvider', uri);
+            return {
+                operation: input.operation,
+                file: formatUri(uri),
+                count: symbols?.length ?? 0,
+                results: (symbols ?? []).slice(0, maxResults).map(formatDocumentSymbol)
+            };
+        }
+
+        case 'workspace_symbols': {
+            const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>('vscode.executeWorkspaceSymbolProvider', input.query ?? '');
+            return {
+                operation: input.operation,
+                query: input.query ?? '',
+                count: symbols?.length ?? 0,
+                results: (symbols ?? []).slice(0, maxResults).map(formatDocumentSymbol)
+            };
+        }
+
+        case 'diagnostics': {
+            const diagnostics = input.filePath
+                ? vscode.languages.getDiagnostics(resolveWorkspaceUri(input.filePath))
+                : vscode.languages.getDiagnostics().flatMap(([uri, items]) => items.map(item => ({ uri, item })));
+            const results = Array.isArray(diagnostics) && diagnostics.length > 0 && 'uri' in diagnostics[0]
+                ? (diagnostics as Array<{ uri: vscode.Uri; item: vscode.Diagnostic }>).slice(0, maxResults).map(({ uri, item }) => ({
+                    file: formatUri(uri),
+                    range: formatRange(item.range),
+                    severity: formatDiagnosticSeverity(item.severity),
+                    code: item.code,
+                    source: item.source,
+                    message: item.message
+                }))
+                : (diagnostics as vscode.Diagnostic[]).slice(0, maxResults).map(item => ({
+                    file: input.filePath,
+                    range: formatRange(item.range),
+                    severity: formatDiagnosticSeverity(item.severity),
+                    code: item.code,
+                    source: item.source,
+                    message: item.message
+                }));
+            return {
+                operation: input.operation,
+                file: input.filePath,
+                count: Array.isArray(diagnostics) ? diagnostics.length : 0,
+                results
+            };
+        }
+
+        default:
+            return { error: `Unsupported operation: ${String(input.operation)}` };
+    }
 }
 
 /**
@@ -136,18 +432,15 @@ export async function askUser(
         if (result.attachments && result.attachments.length > 0) {
             for (const att of result.attachments) {
                 if (att.uri.startsWith('context://')) {
-                    // Start of context content
-                    responseText += `\n\n[Attached Context: ${att.name}]\n`;
+                    // Compact context attachment — minimal markers to save tokens
+                    responseText += `\n--- ${att.name} ---\n`;
 
                     const content = await provider.resolveContextContent(att.uri);
                     if (content) {
                         responseText += content;
-                    } else {
-                        responseText += '(Context content not available)';
                     }
 
-                    // End of context content
-                    responseText += '\n[End of Context]\n';
+                    responseText += '\n---\n';
                 } else {
                     // Regular file attachment
                     validAttachments.push(att.uri);
@@ -194,9 +487,124 @@ export async function askUser(
     }
 }
 
-export function registerTools(context: vscode.ExtensionContext, provider: AskAwayWebviewProvider) {
+// ── ripgrep helpers ──────────────────────────────────────────────────────────
 
-    // Register ask_user tool (VS Code native LM tool)
+interface RgSearchInput {
+    pattern: string;
+    path?: string;
+    fileType?: string;
+    caseSensitive?: boolean;
+    wholeWord?: boolean;
+    contextLines?: number;
+    maxResults?: number;
+    includeGlob?: string;
+    excludeGlob?: string;
+}
+
+function findRgBinary(): string | undefined {
+    // 1. System PATH
+    const pathDirs = (process.env.PATH ?? '').split(':');
+    for (const dir of pathDirs) {
+        const candidate = path.join(dir, 'rg');
+        try { fs.accessSync(candidate, fs.constants.X_OK); return candidate; } catch { /* next */ }
+    }
+    // 2. VS Code's bundled ripgrep (covers macOS arm64 and x64)
+    const appRoot = vscode.env.appRoot;
+    const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+    const plaform = process.platform === 'win32' ? 'win32' : process.platform === 'linux' ? 'linux' : 'darwin';
+    for (const pkg of ['@vscode/ripgrep-universal', '@vscode/ripgrep']) {
+        const candidate = path.join(appRoot, 'node_modules', pkg, 'bin', `${plaform}-${arch}`, 'rg');
+        try { fs.accessSync(candidate, fs.constants.X_OK); return candidate; } catch { /* next */ }
+    }
+    return undefined;
+}
+
+async function runRgSearch(input: RgSearchInput): Promise<string> {
+    const rgBin = findRgBinary();
+    if (!rgBin) {
+        return 'Error: ripgrep (rg) not found. Install with: brew install ripgrep';
+    }
+
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const searchPath = input.path
+        ? (path.isAbsolute(input.path) ? input.path : path.join(workspaceRoot, input.path))
+        : workspaceRoot;
+
+    const maxResults = typeof input.maxResults === 'number' ? Math.max(1, Math.min(200, input.maxResults)) : 50;
+    const contextLines = typeof input.contextLines === 'number' ? Math.max(0, Math.min(10, input.contextLines)) : 2;
+
+    const args: string[] = ['--json', '--line-number', `--max-count=${maxResults}`];
+    if (contextLines > 0) { args.push(`-C${contextLines}`); }
+    if (!input.caseSensitive) { args.push('--ignore-case'); }
+    if (input.wholeWord) { args.push('--word-regexp'); }
+    if (input.fileType) {
+        for (const t of input.fileType.split(',').map(s => s.trim()).filter(Boolean)) {
+            args.push('--type', t);
+        }
+    }
+    if (input.includeGlob) { args.push('--glob', input.includeGlob); }
+    if (input.excludeGlob) { args.push('--glob', `!${input.excludeGlob}`); }
+    args.push('--', input.pattern, searchPath);
+
+    return new Promise((resolve) => {
+        const proc = childProcess.spawn(rgBin, args, { timeout: 15000 });
+        const chunks: Buffer[] = [];
+        const errChunks: Buffer[] = [];
+        proc.stdout.on('data', (c: Buffer) => chunks.push(c));
+        proc.stderr.on('data', (c: Buffer) => errChunks.push(c));
+        proc.on('close', (code) => {
+            if (code !== 0 && code !== 1) {
+                // rg exit 1 = no matches (normal), 2+ = error
+                const errMsg = Buffer.concat(errChunks).toString().trim();
+                resolve(`Error (rg exit ${code}): ${errMsg || 'unknown'}`);
+                return;
+            }
+            const raw = Buffer.concat(chunks).toString();
+            if (!raw.trim()) {
+                resolve(`No matches for pattern "${input.pattern}"`);
+                return;
+            }
+            // Parse --json output: lines of type match, begin, end, summary
+            const lines = raw.split('\n').filter(Boolean);
+            let totalMatches = 0;
+            let currentFile = '';
+            const parts: string[] = [];
+
+            for (const line of lines) {
+                try {
+                    const obj = JSON.parse(line) as { type: string; data: Record<string, unknown> };
+                    if (obj.type === 'begin') {
+                        const p = (obj.data as { path: { text: string } }).path?.text ?? '';
+                        currentFile = vscode.workspace.asRelativePath(p, false);
+                        parts.push(`\n${currentFile}`);
+                    } else if (obj.type === 'match') {
+                        const d = obj.data as {
+                            line_number: number;
+                            lines: { text: string };
+                            submatches: Array<{ match: { text: string } }>;
+                        };
+                        const ln = d.line_number;
+                        const text = (d.lines?.text ?? '').replace(/\n$/, '');
+                        parts.push(`  ${ln}: ${text}`);
+                        totalMatches++;
+                    } else if (obj.type === 'context') {
+                        const d = obj.data as { line_number: number; lines: { text: string } };
+                        const text = (d.lines?.text ?? '').replace(/\n$/, '');
+                        parts.push(`  ${d.line_number}- ${text}`);
+                    } else if (obj.type === 'summary') {
+                        const s = obj.data as { stats: { matches: number; files_searched: number } };
+                        const stats = s.stats;
+                        parts.push(`\n--- ${stats?.matches ?? totalMatches} match(es) in ${stats?.files_searched ?? '?'} files searched ---`);
+                    }
+                } catch { /* skip malformed line */ }
+            }
+            resolve(parts.join('\n'));
+        });
+        proc.on('error', (err) => resolve(`Error spawning rg: ${err.message}`));
+    });
+}
+
+export function registerTools(context: vscode.ExtensionContext, provider: AskAwayWebviewProvider) {
     let askUserTool: vscode.Disposable | undefined;
     try {
         askUserTool = vscode.lm.registerTool('ask_user', {
@@ -221,34 +629,38 @@ export function registerTools(context: vscode.ExtensionContext, provider: AskAwa
 
                 // Force queued:true when plan mode is active, so Copilot keeps calling
                 const isQueued = result.queue || !!provider.getActivePlanTaskId();
+                const rtkEnabled = provider.isRtkCompressionEnabled();
+                const rtkDocPrompt = rtkEnabled ? await provider.getRtkInstructionPrompt() : '';
+                const nextInstructions: string[] = [
+                    'Do the work, then call ask_user again to report result and get next instruction.'
+                ];
+                if (rtkEnabled) {
+                    nextInstructions.push(
+                        'RTK is enabled: for shell/file-inspection/build/test work, use regular command-capable tools with explicitly rtk-prefixed simple command parameters, such as `rtk git status`. Do not prefix a compound command; split it into separate simple command tool calls.'
+                    );
+                    if (rtkDocPrompt) {
+                        nextInstructions.push(rtkDocPrompt);
+                    }
+                }
 
                 // Build result parts - text first, then images
+                // Always include next=true and instruction to enforce the recursive loop
                 const resultParts: (vscode.LanguageModelTextPart | vscode.LanguageModelDataPart)[] = [
                     new vscode.LanguageModelTextPart(JSON.stringify({
-                        response: result.response,
-                        queued: isQueued,
-                        attachmentCount: result.attachments.length
+                        r: result.response,
+                        q: true,  // always loop — call ask_user again after processing this response
+                        ...(isQueued && result.taskId && { taskId: result.taskId }),
+                        ...(result.attachments.length > 0 && { a: result.attachments.length }),
+                        next: nextInstructions.join(' ')
                     }))
                 ];
-
-                // When plan mode is active, add a follow-up instruction so Copilot
-                // executes the task and calls ask_user again instead of ending.
-                if (isQueued && !result.taskId) {
-                    // This is a queued plan task — wrap the response with continuation instruction
-                    resultParts[0] = new vscode.LanguageModelTextPart(JSON.stringify({
-                        response: result.response,
-                        queued: true,
-                        attachmentCount: result.attachments.length,
-                        instruction: 'This is a queued task from the planning board. Execute it fully, then call ask_user to report what you did and get the next task.'
-                    }));
-                }
 
                 // Add image attachments as LanguageModelDataPart for vision models
                 if (result.attachments && result.attachments.length > 0) {
                     const imagePromises = result.attachments.map(async (uri) => {
                         try {
-                            const fileUri = vscode.Uri.parse(uri);
-                            const filePath = fileUri.fsPath;
+                            // Handle both URI strings (file:///...) and plain local paths (/tmp/...)
+                            const filePath = uri.startsWith('/') ? uri : vscode.Uri.parse(uri).fsPath;
 
                             // Check if file exists
                             if (!fs.existsSync(filePath)) {
@@ -311,48 +723,246 @@ export function registerTools(context: vscode.ExtensionContext, provider: AskAwa
         context.subscriptions.push(askUserTool);
     }
 
-    // ── Register talk_to_user tool (Voice conversation) ──
-    let talkToUserTool: vscode.Disposable | undefined;
-    try {
-        talkToUserTool = vscode.lm.registerTool('talk_to_user', {
-            prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<Input>) {
-                const rawQuestion = typeof options?.input?.question === 'string' ? options.input.question : '';
-                const questionPreview = rawQuestion.trim().replace(/\s+/g, ' ');
-                const MAX_PREVIEW_LEN = 40;
-                const truncated = questionPreview.length > MAX_PREVIEW_LEN
-                    ? questionPreview.slice(0, MAX_PREVIEW_LEN - 3) + '...'
-                    : questionPreview;
-                return {
-                    invocationMessage: truncated ? `🎤 ${truncated}` : '🎤 talk_to_user'
-                };
+    // ── bash_task + research_on delegated worker tools are DISABLED for shipping ──
+    // Kept in source for future re-enable, but not registered so they never appear to the
+    // agent. Also removed from package.json languageModelTools. Flip to true to restore.
+    const WORKER_TOOLS_ENABLED: boolean = false;
+
+    // ── Register bash_task tool ──
+    let bashTaskTool: vscode.Disposable | undefined;
+    if (WORKER_TOOLS_ENABLED) try {
+        bashTaskTool = vscode.lm.registerTool('bash_task', {
+            prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<{ explanation?: string; task: string; cwd?: string }>) {
+                const cmd = typeof options?.input?.task === 'string' ? options.input.task : '';
+                const preview = cmd.trim().replace(/\s+/g, ' ').slice(0, 40);
+                return { invocationMessage: preview ? `⚡ ${preview}` : '⚡ bash_task' };
             },
-            async invoke(options: vscode.LanguageModelToolInvocationOptions<Input>, token: vscode.CancellationToken) {
-                const params = options.input;
-                try {
-                    // Use voice mode — TTS speaks the question, mic records the answer
-                    const result = await provider.waitForVoiceResponse(params.question, token);
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<{ explanation?: string; task: string; cwd?: string }>, token: vscode.CancellationToken) {
+                const { task, cwd } = options.input;
+                if (!task) {
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart(JSON.stringify({
-                            response: result,
-                            mode: 'voice'
-                        }))
+                        new vscode.LanguageModelTextPart('Error: task is required')
                     ]);
-                } catch (err: unknown) {
-                    if (err instanceof vscode.CancellationError) {
-                        throw err;
+                }
+
+                // Send a task objective, not a shell command. The bash worker decides which
+                // commands to run, and its run_terminal tool handles cwd + RTK wrapping.
+                const taskText = cwd
+                    ? `Working directory: ${cwd}\nTask objective: ${task}`
+                    : `Task objective: ${task}`;
+
+                try {
+                    const resultPromise = provider.sendTaskToWorker('command', taskText);
+                    const cancellation = createCancellationPromise(token);
+                    try {
+                        const result = await Promise.race([resultPromise, cancellation.promise]);
+                        logToolCall('bash_task', result as string);
+                        return new vscode.LanguageModelToolResult([
+                            new vscode.LanguageModelTextPart(result as string)
+                        ]);
+                    } finally {
+                        cancellation.dispose();
                     }
+                } catch (err: unknown) {
+                    if (err instanceof vscode.CancellationError) { throw err; }
                     const message = err instanceof Error ? err.message : 'Unknown error';
                     return new vscode.LanguageModelToolResult([
-                        new vscode.LanguageModelTextPart("Error: " + message)
+                        new vscode.LanguageModelTextPart('Error: ' + message)
                     ]);
                 }
             }
         });
-    } catch (regError) {
-        console.warn('[AskAway] talk_to_user tool already registered, skipping');
+    } catch (e) {
+        console.warn('[AskAway] bash_task tool already registered, skipping');
     }
+    if (bashTaskTool) { context.subscriptions.push(bashTaskTool); }
 
-    if (talkToUserTool) {
-        context.subscriptions.push(talkToUserTool);
+    // ── Register research_on tool ──
+    let researchOnTool: vscode.Disposable | undefined;
+    if (WORKER_TOOLS_ENABLED) try {
+        researchOnTool = vscode.lm.registerTool('research_on', {
+            prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<{ explanation?: string; topic: string; modelId?: string }>) {
+                const exp = typeof options?.input?.explanation === 'string' ? options.input.explanation : '';
+                const preview = exp.trim().replace(/\s+/g, ' ').slice(0, 40);
+                return { invocationMessage: preview ? `🤖 ${preview}` : '🤖 research_on' };
+            },
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<{ explanation?: string; topic: string; modelId?: string }>, token: vscode.CancellationToken) {
+                const { topic, modelId } = options.input;
+                if (!topic) {
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('Error: topic is required')
+                    ]);
+                }
+
+                try {
+                    // Queue the task — the Agents tab will run it with a full agentic loop.
+                    // Memory capture happens generically when the sub-agent worker
+                    // task resolves (see resolveWorkerTask), so it covers research_on
+                    // and any other sub-agent path uniformly.
+                    const resultPromise = provider.sendTaskToWorker('subagent', topic, modelId);
+                    const cancellation = createCancellationPromise(token);
+                    try {
+                        const result = await Promise.race([resultPromise, cancellation.promise]);
+                        logToolCall('research_on', result as string);
+                        return new vscode.LanguageModelToolResult([
+                            new vscode.LanguageModelTextPart(result as string)
+                        ]);
+                    } finally {
+                        cancellation.dispose();
+                    }
+                } catch (err: unknown) {
+                    if (err instanceof vscode.CancellationError) { throw err; }
+                    const message = err instanceof Error ? err.message : 'Unknown error';
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('Error: ' + message)
+                    ]);
+                }
+            }
+        });
+    } catch (e) {
+        console.warn('[AskAway] research_on tool already registered, skipping');
     }
+    if (researchOnTool) { context.subscriptions.push(researchOnTool); }
+
+    // lsp_bridge is a VS Code Copilot built-in agent tool — registering a duplicate
+    // with the same name silently fails. AskAway exposes the same operations as
+    // `code_nav` so the tool is always explicitly callable without collision.
+
+    // ── Register code_nav tool (LSP navigation — avoids collision with Copilot built-in lsp_bridge) ──
+    let codeNavTool: vscode.Disposable | undefined;
+    try {
+        codeNavTool = vscode.lm.registerTool('code_nav', {
+            prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<LspBridgeInput>) {
+                const op = options?.input?.operation ?? 'lsp';
+                const fp = options?.input?.filePath ? ` ${path.basename(options.input.filePath)}` : '';
+                return { invocationMessage: `🔍 code_nav: ${op}${fp}` };
+            },
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<LspBridgeInput>, token: vscode.CancellationToken) {
+                try {
+                    const result = await runLspBridge(options.input, token);
+                    const codeNavText = JSON.stringify(result);
+                    logToolCall('code_nav', codeNavText, options?.input?.operation);
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(codeNavText)
+                    ]);
+                } catch (err: unknown) {
+                    if (err instanceof vscode.CancellationError) { throw err; }
+                    const message = err instanceof Error ? err.message : 'Unknown error';
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('Error: ' + message)
+                    ]);
+                }
+            }
+        });
+    } catch (e) {
+        console.warn('[AskAway] code_nav tool already registered, skipping');
+    }
+    if (codeNavTool) { context.subscriptions.push(codeNavTool); }
+
+    // ── Register rg_search tool (ripgrep-backed fast text search) ──
+    let rgSearchTool: vscode.Disposable | undefined;
+    try {
+        rgSearchTool = vscode.lm.registerTool('rg_search', {
+            prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<RgSearchInput>) {
+                const p = options?.input?.pattern ?? '';
+                return { invocationMessage: `🔎 rg: ${p.slice(0, 50)}` };
+            },
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<RgSearchInput>, _token: vscode.CancellationToken) {
+                try {
+                    const result = await runRgSearch(options.input);
+                    logToolCall('rg_search', result, options?.input?.pattern);
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(result)
+                    ]);
+                } catch (err: unknown) {
+                    if (err instanceof vscode.CancellationError) { throw err; }
+                    const message = err instanceof Error ? err.message : 'Unknown error';
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('Error: ' + message)
+                    ]);
+                }
+            }
+        });
+    } catch (e) {
+        console.warn('[AskAway] rg_search tool already registered, skipping');
+    }
+    if (rgSearchTool) { context.subscriptions.push(rgSearchTool); }
+
+    // ── Register gradle tool (async id-based Gradle build control) ──
+    // Uses the SAME shared engine (dispatchGradle) as the MCP `gradle` tool.
+    // This LM-tool surface makes gradle behave like the other tools inside VS
+    // Code (auto-visible in every workspace); the MCP surface keeps it usable
+    // from external clients (Kiro/Antigravity/CLI). Same engine, no shortcut.
+    let gradleTool: vscode.Disposable | undefined;
+    try {
+        gradleTool = vscode.lm.registerTool('gradle', {
+            prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<GradleInput>) {
+                const action = options?.input?.action ?? 'gradle';
+                const detail = options?.input?.tasks?.join(' ') ?? options?.input?.buildId ?? '';
+                return { invocationMessage: `🐘 gradle: ${action}${detail ? ' ' + detail : ''}` };
+            },
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<GradleInput>, _token: vscode.CancellationToken) {
+                try {
+                    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+                    const result = await dispatchGradle(options.input, root);
+                    const gradleText = JSON.stringify(result, null, 2);
+                    logToolCall('gradle', gradleText, options?.input?.action);
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(gradleText)
+                    ]);
+                } catch (err: unknown) {
+                    if (err instanceof vscode.CancellationError) { throw err; }
+                    const message = err instanceof Error ? err.message : 'Unknown error';
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('Error: ' + message)
+                    ]);
+                }
+            }
+        });
+    } catch (e) {
+        console.warn('[AskAway] gradle tool already registered, skipping');
+    }
+    if (gradleTool) { context.subscriptions.push(gradleTool); }
+
+    // ── Register turn_budget tool (self-reported per-turn spend + soft limit) ──
+    // Lets the agent check how many credits (AIU) it has burned this turn and
+    // compare against a user-configured soft budget (askaway.turnBudgetAiu) so it
+    // can self-regulate (wrap up) before overspending. Advisory only — never blocks.
+    let turnBudgetTool: vscode.Disposable | undefined;
+    try {
+        turnBudgetTool = vscode.lm.registerTool('turn_budget', {
+            prepareInvocation() {
+                return { invocationMessage: '💰 checking turn budget' };
+            },
+            async invoke(_options: vscode.LanguageModelToolInvocationOptions<Record<string, unknown>>, _token: vscode.CancellationToken) {
+                const spend = await computeTurnSpend(context);
+                const spentAiu = spend.nanoAiu / 1e9;
+                const limit = Number(vscode.workspace.getConfiguration('askaway').get('turnBudgetAiu', 0)) || 0;
+                const remaining = limit > 0 ? Math.max(0, limit - spentAiu) : null;
+                const exceeded = limit > 0 && spentAiu >= limit;
+                const pct = limit > 0 ? Math.round(spentAiu / limit * 100) : 0;
+                const result = {
+                    spentAiu: Number(spentAiu.toFixed(2)),
+                    requestCount: spend.requestCount,
+                    softLimitAiu: limit > 0 ? limit : null,
+                    remainingAiu: remaining !== null ? Number(remaining.toFixed(2)) : null,
+                    usedPct: limit > 0 ? pct : null,
+                    exceeded,
+                    note: limit <= 0
+                        ? 'No soft budget set (askaway.turnBudgetAiu = 0 in Settings). Spend shown is informational only.'
+                        : exceeded
+                            ? `SOFT BUDGET EXCEEDED: ${spentAiu.toFixed(2)}/${limit} AIU this turn. Wrap up now — stop exploring, finalize the task, and avoid further large/expensive requests.`
+                            : `Within budget: ${spentAiu.toFixed(2)}/${limit} AIU (${pct}%). ${remaining!.toFixed(2)} AIU remaining this turn.`,
+                };
+                const text = JSON.stringify(result, null, 2);
+                logToolCall('turn_budget', text);
+                return new vscode.LanguageModelToolResult([
+                    new vscode.LanguageModelTextPart(text)
+                ]);
+            }
+        });
+    } catch (e) {
+        console.warn('[AskAway] turn_budget tool already registered, skipping');
+    }
+    if (turnBudgetTool) { context.subscriptions.push(turnBudgetTool); }
 }

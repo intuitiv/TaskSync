@@ -36,3 +36,6 @@ dist/**
 
 # Exclude test coverage output
 coverage/**
+
+# Include askaway resources for bundling in VSIX
+!askaway-resources/**

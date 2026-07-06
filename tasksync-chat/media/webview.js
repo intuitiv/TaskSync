@@ -4,6 +4,7 @@
  */
 (function () {
     const vscode = acquireVsCodeApi();
+    const WEBVIEW_UI_VERSION = 'workers-tools-hierarchy-v7-memories-list';
 
     // Restore persisted state (survives sidebar switch)
     const previousState = vscode.getState() || {};
@@ -39,6 +40,33 @@
     let responseTimeout = 60;
     let sessionWarningHours = 2;
     let maxConsecutiveAutoResponses = 5;
+    let turnBudgetAiu = 0;
+    let debugLoggingEnabled = true;
+    let rtkCompressionEnabled = false;
+    let rtkInstalled = true;
+    let toolScopeMode = 'month'; // 'month' | 'turn' — toggles the tool-call table scope
+    let obsView = 'turn'; // 'turn' | 'month' — drives the whole Observability panel
+    let observabilityMetrics = {
+        requestCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedTokens: 0,
+        nanoAiu: 0,
+        lastRequest: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
+        workspace: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
+        overall: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
+        perModel: [],
+        turnRequests: [],
+        turnEvents: [],
+        rtkCommandCount: 0,
+        rtkSavedTokens: 0,
+        rtkSavingsPct: 0,
+        gradle: { runs: 0, optimizedRuns: 0, tasksAvoided: 0, configCacheReuses: 0, savedTokens: 0 },
+        toolCalls: { totalCalls: 0, totalOutputTokens: 0, byTool: [], turn: { totalCalls: 0, totalOutputTokens: 0, byTool: [] } },
+        source: 'unavailable',
+        updatedAt: 0
+    };
+    let memoriesList = [];
     // Keep timeout options aligned with select values to avoid invalid UI state.
     var RESPONSE_TIMEOUT_ALLOWED_VALUES = new Set([0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 150, 180, 210, 240]);
     var RESPONSE_TIMEOUT_DEFAULT = 60;
@@ -107,9 +135,56 @@
     // Settings modal elements
     let settingsModal, settingsModalOverlay, settingsModalClose;
     let soundToggle, interactiveApprovalToggle, sendShortcutToggle, webexToggle, telegramToggle, autopilotEditBtn, autopilotToggle, autopilotTextInput, promptsList, addPromptBtn, addPromptForm;
+    let debugLoggingToggle, rtkCompressionToggle;
     let autopilotPromptsList, autopilotAddBtn, addAutopilotPromptForm, autopilotPromptInput, saveAutopilotPromptBtn, cancelAutopilotPromptBtn;
     let responseTimeoutSelect, sessionWarningHoursSelect, maxAutoResponsesInput;
+    let turnBudgetInput;
     let humanDelayToggle, humanDelayRangeContainer, humanDelayMinInput, humanDelayMaxInput;
+    let observabilitySessionCalls, observabilityHistoryCount, observabilityPendingCommands, observabilityPendingAgents;
+    let observabilitySource, observabilityRtkLine, observabilityModelTbody;
+    let obsLastReqs, obsLastCredits, obsLastInput, obsLastOutput, obsLastCached;
+    let obsWsReqs, obsWsCredits, obsWsInput, obsWsOutput, obsWsCached;
+    let obsAllReqs, obsAllCredits;
+    let observabilityMemoryList, observabilityMemoryCount;
+
+    // ── Worker tab state ──
+    var workerTasks = []; // [{id, role, task, status, createdAt}]
+    var availableModels = []; // [{id, name, vendor, family, maxInputTokens}]
+    var availableTools = []; // [{name, description}]
+    var activeWorkerTaskId = { command: null, subagent: null };
+    var currentTab = 'chat'; // 'chat' | 'commands' | 'subagents' | 'observability' | 'settings'
+
+    // Mirror backend minimal worker tool allowlist to prevent oversized/stale payloads.
+    var MINIMAL_WORKER_TOOL_NAMES = new Set([
+        'execution_subagent',
+        'search_subagent',
+        'explore_subagent',
+        'skill',
+        'copilot_findFiles',
+        'copilot_findTextInFiles',
+        'copilot_readFile',
+        'copilot_listDirectory',
+        'copilot_getErrors',
+        'copilot_getChangedFiles',
+        'copilot_searchCodebase',
+        'copilot_searchWorkspaceSymbols',
+        'copilot_applyPatch',
+        'copilot_createFile',
+        'copilot_createDirectory',
+        'copilot_replaceString',
+        'copilot_multiReplaceString',
+        'copilot_viewImage',
+        'copilot_fetchWebPage',
+        'copilot_runVscodeCommand',
+        'copilot_getVSCodeAPI'
+    ]);
+
+    function filterMinimalWorkerTools(tools) {
+        var list = Array.isArray(tools) ? tools : [];
+        return list.filter(function (t) {
+            return t && typeof t.name === 'string' && MINIMAL_WORKER_TOOL_NAMES.has(t.name);
+        });
+    }
 
     function init() {
         try {
@@ -119,8 +194,10 @@
             createEditModeUI();
             createApprovalModal();
             createSettingsModal();
+            createObservabilityTab();
             bindEventListeners();
             initVoiceControls();
+            initWorkerTabs();
             unlockAudioOnInteraction(); // Enable audio after first user interaction
             console.log('[TaskSync Webview] Event listeners bound, pendingMessage element:', !!pendingMessage);
             renderQueue();
@@ -144,7 +221,7 @@
 
             // Signal to extension that webview is ready to receive messages
             console.log('[TaskSync Webview] Sending webviewReady message');
-            vscode.postMessage({ type: 'webviewReady' });
+            vscode.postMessage({ type: 'webviewReady', uiVersion: WEBVIEW_UI_VERSION });
         } catch (err) {
             console.error('[TaskSync] Init error:', err);
         }
@@ -333,16 +410,15 @@
     }
 
     function createSettingsModal() {
-        // Create modal overlay
-        settingsModalOverlay = document.createElement('div');
-        settingsModalOverlay.className = 'settings-modal-overlay hidden';
-        settingsModalOverlay.id = 'settings-modal-overlay';
+        var settingsHost = document.getElementById('settings-tab-shell');
+        if (!settingsHost) return;
 
-        // Create modal container
+        settingsModalOverlay = null;
+
         settingsModal = document.createElement('div');
-        settingsModal.className = 'settings-modal';
+        settingsModal.className = 'settings-tab-content';
         settingsModal.id = 'settings-modal';
-        settingsModal.setAttribute('role', 'dialog');
+        settingsModal.setAttribute('role', 'region');
         settingsModal.setAttribute('aria-labelledby', 'settings-modal-title');
 
         // Modal header
@@ -370,13 +446,7 @@
         });
         headerButtons.appendChild(reportBtn);
 
-        // Close button
-        settingsModalClose = document.createElement('button');
-        settingsModalClose.className = 'settings-modal-header-btn';
-        settingsModalClose.innerHTML = '<span class="codicon codicon-close"></span>';
-        settingsModalClose.title = 'Close';
-        settingsModalClose.setAttribute('aria-label', 'Close settings');
-        headerButtons.appendChild(settingsModalClose);
+        settingsModalClose = null;
 
         modalHeader.appendChild(headerButtons);
 
@@ -393,6 +463,34 @@
             '</div>';
         modalContent.appendChild(soundSection);
 
+        // Copilot Debug Logging — observability prerequisite (must be ON for Metrics to work),
+        // so it sits above the Optimization group.
+        var debugLoggingSection = document.createElement('div');
+        debugLoggingSection.className = 'settings-section';
+        debugLoggingSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-bug"></span> Copilot Debug Logging</div>' +
+            '<div class="toggle-switch active" id="debug-logging-toggle" role="switch" aria-checked="true" aria-label="Enable Copilot debug logging" tabindex="0"></div>' +
+            '</div>';
+        modalContent.appendChild(debugLoggingSection);
+
+        // Optimization controls
+        var optimizationHeader = document.createElement('div');
+        optimizationHeader.className = 'settings-section';
+        optimizationHeader.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title" style="font-size:12px;opacity:0.6;text-transform:uppercase;letter-spacing:0.5px;"><span class="codicon codicon-graph"></span> Optimization</div>' +
+            '</div>';
+        modalContent.appendChild(optimizationHeader);
+
+        var rtkSection = document.createElement('div');
+        rtkSection.className = 'settings-section';
+        rtkSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-server-process"></span> RTK Command Compression</div>' +
+            '<div class="toggle-switch" id="rtk-compression-toggle" role="switch" aria-checked="false" aria-label="Enable RTK command compression" tabindex="0"></div>' +
+            '</div>';
+        modalContent.appendChild(rtkSection);
+
+        // Observability moved to its own "Metrics" tab — see createObservabilityTab().
+
         // Interactive approval section - toggle interactive Yes/No + choices UI
         var approvalSection = document.createElement('div');
         approvalSection.className = 'settings-section';
@@ -400,7 +498,6 @@
             '<div class="settings-section-title"><span class="codicon codicon-checklist"></span> Interactive Approvals</div>' +
             '<div class="toggle-switch active" id="interactive-approval-toggle" role="switch" aria-checked="true" aria-label="Enable interactive approval and choice buttons" tabindex="0"></div>' +
             '</div>';
-        modalContent.appendChild(approvalSection);
 
         // Send shortcut section - switch between Enter and Ctrl/Cmd+Enter send
         var sendShortcutSection = document.createElement('div');
@@ -410,6 +507,21 @@
             '<div class="toggle-switch" id="send-shortcut-toggle" role="switch" aria-checked="false" aria-label="Use Ctrl/Cmd+Enter to send messages" tabindex="0"></div>' +
             '</div>';
         modalContent.appendChild(sendShortcutSection);
+
+        // Turn budget (AIU) — soft per-turn credit limit the turn_budget tool checks against.
+        var turnBudgetSection = document.createElement('div');
+        turnBudgetSection.className = 'settings-section';
+        turnBudgetSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-credit-card"></span> Turn Budget (AIU)' +
+            '<span class="settings-info-icon" title="Soft per-turn credit budget in AIU. When the agent calls the turn_budget tool and the turn spend exceeds this, it is advised to wrap up. 0 = disabled (no soft limit). Advisory only — nothing is blocked.">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '</div>' +
+            '<div class="form-row">' +
+            '<input type="number" class="form-input" id="turn-budget-input" min="0" max="1000000" step="100" placeholder="0 = disabled">' +
+            '</div>';
+        modalContent.appendChild(turnBudgetSection);
 
         // Autopilot section with cycling prompts list
         var autopilotSection = document.createElement('div');
@@ -432,7 +544,6 @@
             '<button class="form-btn form-btn-save" id="save-autopilot-prompt-btn">Save</button>' +
             '</div>' +
             '</div>';
-        modalContent.appendChild(autopilotSection);
 
         // Response Timeout section - dropdown for timeout minutes
         var timeoutSection = document.createElement('div');
@@ -466,7 +577,6 @@
             '<option value="240">240 minutes (4h)</option>' +
             '</select>' +
             '</div>';
-        modalContent.appendChild(timeoutSection);
 
         // Session Warning section - warning threshold in hours
         var sessionWarningSection = document.createElement('div');
@@ -491,7 +601,6 @@
             '<option value="8">8 hours</option>' +
             '</select>' +
             '</div>';
-        modalContent.appendChild(sessionWarningSection);
 
         // Max Consecutive Auto-Responses section - number input
         var maxAutoSection = document.createElement('div');
@@ -506,7 +615,6 @@
             '<div class="form-row">' +
             '<input type="number" class="form-input" id="max-auto-responses-input" min="1" max="50" value="5" />' +
             '</div>';
-        modalContent.appendChild(maxAutoSection);
 
         // Human-Like Delay section - toggle + min/max inputs
         var humanDelaySection = document.createElement('div');
@@ -525,7 +633,6 @@
             '<label class="form-label-inline">Max (s):</label>' +
             '<input type="number" class="form-input form-input-small" id="human-delay-max-input" min="2" max="60" value="6" />' +
             '</div>';
-        modalContent.appendChild(humanDelaySection);
 
         // Integrations header
         var integrationsHeader = document.createElement('div');
@@ -571,15 +678,12 @@
             '<div class="form-actions">' +
             '<button class="form-btn form-btn-cancel" id="cancel-prompt-btn">Cancel</button>' +
             '<button class="form-btn form-btn-save" id="save-prompt-btn">Save</button></div></div>';
-        modalContent.appendChild(promptsSection);
 
-        // Assemble modal
+        // Assemble settings panel
         settingsModal.appendChild(modalHeader);
         settingsModal.appendChild(modalContent);
-        settingsModalOverlay.appendChild(settingsModal);
-
-        // Add to DOM
-        document.body.appendChild(settingsModalOverlay);
+        settingsHost.innerHTML = '';
+        settingsHost.appendChild(settingsModal);
 
         // Cache inner elements
         soundToggle = document.getElementById('sound-toggle');
@@ -596,6 +700,7 @@
         responseTimeoutSelect = document.getElementById('response-timeout-select');
         sessionWarningHoursSelect = document.getElementById('session-warning-hours-select');
         maxAutoResponsesInput = document.getElementById('max-auto-responses-input');
+        turnBudgetInput = document.getElementById('turn-budget-input');
         humanDelayToggle = document.getElementById('human-delay-toggle');
         humanDelayRangeContainer = document.getElementById('human-delay-range');
         humanDelayMinInput = document.getElementById('human-delay-min-input');
@@ -603,6 +708,115 @@
         promptsList = document.getElementById('prompts-list');
         addPromptBtn = document.getElementById('add-prompt-btn');
         addPromptForm = document.getElementById('add-prompt-form');
+        debugLoggingToggle = document.getElementById('debug-logging-toggle');
+        rtkCompressionToggle = document.getElementById('rtk-compression-toggle');
+    }
+
+    // Build the Observability ("Metrics") tab: the credits table, RTK/Gradle savings,
+    // per-model + tool-call breakdowns, and the memories list. Kept separate from Settings.
+    function createObservabilityTab() {
+        var host = document.getElementById('observability-tab-shell');
+        if (!host) return;
+
+        var container = document.createElement('div');
+        container.className = 'settings-tab-content';
+
+        var header = document.createElement('div');
+        header.className = 'settings-modal-header';
+        var title = document.createElement('span');
+        title.className = 'settings-modal-title';
+        title.textContent = 'Observability';
+        header.appendChild(title);
+        container.appendChild(header);
+
+        var content = document.createElement('div');
+        content.className = 'settings-modal-content';
+
+        var observabilitySection = document.createElement('div');
+        observabilitySection.className = 'settings-section';
+        observabilitySection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-pulse"></span> Observability</div>' +
+            '</div>' +
+            '<div class="obs-optimizations">' +
+            '<div class="observability-rtk-line" id="observability-rtk-line">RTK: 0 calls \u00b7 0 saved \u00b7 0%</div>' +
+            '<div class="observability-rtk-line" id="observability-gradle-line">Gradle: 0 runs \u00b7 0 optimized \u00b7 ~0 tokens saved</div>' +
+            '</div>' +
+            '<div class="obs-view-toggle">' +
+            '<a href="#" id="obs-view-turn" class="obs-view-btn active">This turn</a>' +
+            '<a href="#" id="obs-view-month" class="obs-view-btn">This month</a>' +
+            '</div>' +
+            // ── This turn: individual requests (growing) + this turn's tool calls ──
+            '<div id="obs-turn-view">' +
+            '<div class="obs-turn-summary" id="obs-turn-summary">No requests yet this turn</div>' +
+            '<div class="observability-model-note">Timeline this turn \u2014 LLM requests in columns \u00b7 expand a tool row for input/output \u00b7 ask me to investigate any <b>ID</b></div>' +
+            '<table class="observability-table observability-model-table obs-timeline-table">' +
+            '<thead><tr><th>ID</th><th>Model / Tool</th><th>Credits</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached / input">Hit%</th></tr></thead>' +
+            '<tbody id="obs-turn-event-tbody"><tr><td colspan="7" class="obs-na">No events yet</td></tr></tbody>' +
+            '</table>' +
+            '<div class="observability-model-note">Tool calls this turn</div>' +
+            '<table class="observability-table observability-model-table">' +
+            '<thead><tr><th>Tool</th><th>Calls</th><th>Out tok</th><th>avg s</th><th>min s</th><th>max s</th><th>err</th></tr></thead>' +
+            '<tbody id="obs-turn-tool-tbody"><tr><td colspan="7" class="obs-na">No data yet</td></tr></tbody>' +
+            '</table>' +
+            '</div>' +
+            // ── This month: consolidated totals + per-model + this month's tool calls ──
+            '<div id="obs-month-view" style="display:none">' +
+            '<div class="observability-scope-note">Credits in AIU \u2014 current calendar month across all AskAway workspaces.</div>' +
+            '<table class="observability-table">' +
+            '<thead><tr><th>Reqs</th><th>Credits</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached / input">Hit%</th><th title="requests with <50% cache">Miss</th></tr></thead>' +
+            '<tbody><tr>' +
+            '<td id="obs-all-reqs">0</td><td id="obs-all-credits">0</td><td id="obs-all-input">0</td><td id="obs-all-output">0</td><td id="obs-all-cached">0</td><td id="obs-all-hit">\u2013</td><td id="obs-all-miss">0</td>' +
+            '</tr></tbody></table>' +
+            '<div class="observability-model-note">Per-model \u2014 this month</div>' +
+            '<table class="observability-table observability-model-table">' +
+            '<thead><tr><th>Model</th><th>Reqs</th><th>Credits</th><th>Input</th><th>Output</th><th>Cached</th></tr></thead>' +
+            '<tbody id="observability-model-tbody"><tr><td colspan="6" class="obs-na">No data yet</td></tr></tbody>' +
+            '</table>' +
+            '<div class="observability-model-note">Tool calls this month</div>' +
+            '<table class="observability-table observability-model-table">' +
+            '<thead><tr><th>Tool</th><th>Calls</th><th>Out tok</th><th>avg s</th><th>min s</th><th>max s</th><th>err</th></tr></thead>' +
+            '<tbody id="obs-month-tool-tbody"><tr><td colspan="7" class="obs-na">No data yet</td></tr></tbody>' +
+            '</table>' +
+            '</div>' +
+            '<details class="settings-debug-details">' +
+            '<summary>Debug Details</summary>' +
+            '<div class="observability-grid debug-observability-grid">' +
+            '<div class="observability-card"><div class="observability-label">Session Calls</div><div class="observability-value" id="observability-session-calls">0</div><div class="observability-subtext">Current AskAway exchange count</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Saved History</div><div class="observability-value" id="observability-history-count">0</div><div class="observability-subtext">Persisted conversation records</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Pending Commands</div><div class="observability-value" id="observability-pending-commands">0</div><div class="observability-subtext">Worker queue items waiting to run</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Pending Agents</div><div class="observability-value" id="observability-pending-agents">0</div><div class="observability-subtext">Research tasks waiting in queue</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Log Source</div><div class="observability-value" id="observability-source">unavailable</div><div class="observability-subtext">Latest debug-log session folder</div></div>' +
+            '</div>' +
+            '</details>' +
+            '<details class="settings-debug-details" id="observability-memories-details">' +
+            '<summary>Memories <span class="obs-mem-count" id="observability-memory-count">0</span></summary>' +
+            '<div class="observability-model-note">Durable notes saved by sub-agents (shared memory store)</div>' +
+            '<ul class="observability-memory-list" id="observability-memory-list"><li class="obs-na">No memories yet</li></ul>' +
+            '</details>';
+        content.appendChild(observabilitySection);
+        container.appendChild(content);
+
+        host.innerHTML = '';
+        host.appendChild(container);
+
+        // View toggle: turn ⇄ month drives the whole panel.
+        var turnBtn = document.getElementById('obs-view-turn');
+        var monthBtn = document.getElementById('obs-view-month');
+        if (turnBtn) turnBtn.addEventListener('click', function (e) { e.preventDefault(); obsView = 'turn'; updateObservabilityUI(); });
+        if (monthBtn) monthBtn.addEventListener('click', function (e) { e.preventDefault(); obsView = 'month'; updateObservabilityUI(); });
+
+        // Cache observability element references now that they exist in the DOM.
+        observabilitySessionCalls = document.getElementById('observability-session-calls');
+        observabilityHistoryCount = document.getElementById('observability-history-count');
+        observabilityPendingCommands = document.getElementById('observability-pending-commands');
+        observabilityPendingAgents = document.getElementById('observability-pending-agents');
+        observabilitySource = document.getElementById('observability-source');
+        observabilityRtkLine = document.getElementById('observability-rtk-line');
+        observabilityModelTbody = document.getElementById('observability-model-tbody');
+        obsAllReqs = document.getElementById('obs-all-reqs');
+        obsAllCredits = document.getElementById('obs-all-credits');
+        observabilityMemoryList = document.getElementById('observability-memory-list');
+        observabilityMemoryCount = document.getElementById('observability-memory-count');
     }
 
     function bindEventListeners() {
@@ -684,6 +898,24 @@
                 }
             });
         }
+        if (debugLoggingToggle) {
+            debugLoggingToggle.addEventListener('click', toggleDebugLoggingSetting);
+            debugLoggingToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleDebugLoggingSetting();
+                }
+            });
+        }
+        if (rtkCompressionToggle) {
+            rtkCompressionToggle.addEventListener('click', toggleRtkCompressionSetting);
+            rtkCompressionToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleRtkCompressionSetting();
+                }
+            });
+        }
         if (webexToggle) {
             webexToggle.addEventListener('click', toggleWebexSetting);
             webexToggle.addEventListener('keydown', function (e) {
@@ -738,6 +970,10 @@
         if (maxAutoResponsesInput) {
             maxAutoResponsesInput.addEventListener('change', handleMaxAutoResponsesChange);
             maxAutoResponsesInput.addEventListener('blur', handleMaxAutoResponsesChange);
+        }
+        if (turnBudgetInput) {
+            turnBudgetInput.addEventListener('change', handleTurnBudgetChange);
+            turnBudgetInput.addEventListener('blur', handleTurnBudgetChange);
         }
         if (humanDelayToggle) {
             humanDelayToggle.addEventListener('click', toggleHumanDelaySetting);
@@ -1141,6 +1377,7 @@
             case 'updateCurrentSession':
                 currentSessionCalls = message.history || [];
                 renderCurrentSession();
+                updateObservabilityUI();
                 // Hide welcome section if we have completed tool calls
                 updateWelcomeSectionVisibility();
                 // Auto-scroll to bottom after rendering
@@ -1149,6 +1386,7 @@
             case 'updatePersistedHistory':
                 persistedHistory = message.history || [];
                 renderHistoryModal();
+                updateObservabilityUI();
                 break;
             case 'openHistoryModal':
                 openHistoryModal();
@@ -1169,12 +1407,32 @@
                 responseTimeout = normalizeResponseTimeout(message.responseTimeout);
                 sessionWarningHours = typeof message.sessionWarningHours === 'number' ? message.sessionWarningHours : 2;
                 maxConsecutiveAutoResponses = typeof message.maxConsecutiveAutoResponses === 'number' ? message.maxConsecutiveAutoResponses : 5;
+                turnBudgetAiu = typeof message.turnBudgetAiu === 'number' ? message.turnBudgetAiu : 0;
                 humanLikeDelayEnabled = message.humanLikeDelayEnabled !== false;
                 humanLikeDelayMin = typeof message.humanLikeDelayMin === 'number' ? message.humanLikeDelayMin : 2;
                 humanLikeDelayMax = typeof message.humanLikeDelayMax === 'number' ? message.humanLikeDelayMax : 6;
+                debugLoggingEnabled = message.debugLoggingEnabled !== false;
+                rtkCompressionEnabled = message.rtkCompressionEnabled === true;
+                rtkInstalled = message.rtkInstalled !== false;
+                if (message.observabilityMetrics && typeof message.observabilityMetrics === 'object') {
+                    observabilityMetrics = {
+                        requestCount: Number(message.observabilityMetrics.requestCount) || 0,
+                        inputTokens: Number(message.observabilityMetrics.inputTokens) || 0,
+                        outputTokens: Number(message.observabilityMetrics.outputTokens) || 0,
+                        cachedTokens: Number(message.observabilityMetrics.cachedTokens) || 0,
+                        nanoAiu: Number(message.observabilityMetrics.nanoAiu) || 0,
+                        rtkCommandCount: Number(message.observabilityMetrics.rtkCommandCount) || 0,
+                        rtkSavedTokens: Number(message.observabilityMetrics.rtkSavedTokens) || 0,
+                        rtkSavingsPct: Number(message.observabilityMetrics.rtkSavingsPct) || 0,
+                        source: typeof message.observabilityMetrics.source === 'string' ? message.observabilityMetrics.source : 'unavailable',
+                        updatedAt: Number(message.observabilityMetrics.updatedAt) || 0
+                    };
+                }
                 updateSoundToggleUI();
                 updateInteractiveApprovalToggleUI();
                 updateSendWithCtrlEnterToggleUI();
+                updateDebugLoggingToggleUI();
+                updateRtkCompressionToggleUI();
                 updateWebexToggleUI();
                 updateWebexStatusUI(message.webexStatus);
                 updateTelegramToggleUI();
@@ -1184,8 +1442,139 @@
                 updateResponseTimeoutUI();
                 updateSessionWarningHoursUI();
                 updateMaxAutoResponsesUI();
+                updateTurnBudgetUI();
                 updateHumanDelayUI();
                 renderPromptsList();
+                updateObservabilityUI();
+                break;
+            case 'updateObservabilityMetrics':
+                if (message.metrics && typeof message.metrics === 'object') {
+                    var sanitizeScope = function (s) {
+                        s = s || {};
+                        return {
+                            requestCount: Number(s.requestCount) || 0,
+                            inputTokens: Number(s.inputTokens) || 0,
+                            outputTokens: Number(s.outputTokens) || 0,
+                            cachedTokens: Number(s.cachedTokens) || 0,
+                            nanoAiu: Number(s.nanoAiu) || 0,
+                            cacheMisses: Number(s.cacheMisses) || 0
+                        };
+                    };
+                    observabilityMetrics = {
+                        requestCount: Number(message.metrics.requestCount) || 0,
+                        inputTokens: Number(message.metrics.inputTokens) || 0,
+                        outputTokens: Number(message.metrics.outputTokens) || 0,
+                        cachedTokens: Number(message.metrics.cachedTokens) || 0,
+                        nanoAiu: Number(message.metrics.nanoAiu) || 0,
+                        lastRequest: sanitizeScope(message.metrics.lastRequest),
+                        workspace: sanitizeScope(message.metrics.workspace),
+                        overall: sanitizeScope(message.metrics.overall),
+                        perModel: Array.isArray(message.metrics.perModel) ? message.metrics.perModel.map(function (m) {
+                            var sc = sanitizeScope(m);
+                            sc.model = typeof m.model === 'string' ? m.model : 'unknown';
+                            return sc;
+                        }) : [],
+                        turnRequests: Array.isArray(message.metrics.turnRequests) ? message.metrics.turnRequests.map(function (r) {
+                            return {
+                                id: typeof r.id === 'string' ? r.id : '?????',
+                                model: typeof r.model === 'string' ? r.model : 'unknown',
+                                nanoAiu: Number(r.nanoAiu) || 0,
+                                inputTokens: Number(r.inputTokens) || 0,
+                                outputTokens: Number(r.outputTokens) || 0,
+                                cachedTokens: Number(r.cachedTokens) || 0,
+                                cacheHitPct: Number(r.cacheHitPct) || 0
+                            };
+                        }) : [],
+                        turnEvents: Array.isArray(message.metrics.turnEvents) ? message.metrics.turnEvents.map(function (event) {
+                            if (event && event.kind === 'tool') {
+                                return {
+                                    kind: 'tool',
+                                    id: typeof event.id === 'string' ? event.id : '?????',
+                                    tool: typeof event.tool === 'string' ? event.tool : 'unknown',
+                                    status: typeof event.status === 'string' ? event.status : 'ok',
+                                    durMs: Number(event.durMs) || 0,
+                                    inputTokens: Number(event.inputTokens) || 0,
+                                    outputTokens: Number(event.outputTokens) || 0,
+                                    group: typeof event.group === 'string' ? event.group : 'default',
+                                    inputPreview: typeof event.inputPreview === 'string' ? event.inputPreview : '',
+                                    outputPreview: typeof event.outputPreview === 'string' ? event.outputPreview : ''
+                                };
+                            }
+                            return {
+                                kind: 'request',
+                                id: event && typeof event.id === 'string' ? event.id : '?????',
+                                model: event && typeof event.model === 'string' ? event.model : 'unknown',
+                                nanoAiu: Number(event && event.nanoAiu) || 0,
+                                inputTokens: Number(event && event.inputTokens) || 0,
+                                outputTokens: Number(event && event.outputTokens) || 0,
+                                cachedTokens: Number(event && event.cachedTokens) || 0,
+                                cacheHitPct: Number(event && event.cacheHitPct) || 0,
+                                firstOfTurn: !!(event && event.firstOfTurn),
+                                split: (event && event.split && typeof event.split === 'object') ? {
+                                    systemTokens: Number(event.split.systemTokens) || 0,
+                                    toolsTokens: Number(event.split.toolsTokens) || 0,
+                                    conversationTokens: Number(event.split.conversationTokens) || 0,
+                                    newMessageTokens: Number(event.split.newMessageTokens) || 0,
+                                    cachedPriorTokens: Number(event.split.cachedPriorTokens) || 0,
+                                    userTokens: Number(event.split.userTokens) || 0,
+                                    totalInputTokens: Number(event.split.totalInputTokens) || 0,
+                                    skillsCount: Number(event.split.skillsCount) || 0,
+                                    toolsCount: Number(event.split.toolsCount) || 0,
+                                    messageCount: Number(event.split.messageCount) || 0,
+                                    cachedTokens: Number(event.split.cachedTokens) || 0
+                                } : null
+                            };
+                        }) : [],
+                        rtkCommandCount: Number(message.metrics.rtkCommandCount) || 0,
+                        rtkSavedTokens: Number(message.metrics.rtkSavedTokens) || 0,
+                        rtkSavingsPct: Number(message.metrics.rtkSavingsPct) || 0,
+                        gradle: (function (g) {
+                            g = g || {};
+                            return {
+                                runs: Number(g.runs) || 0,
+                                optimizedRuns: Number(g.optimizedRuns) || 0,
+                                tasksAvoided: Number(g.tasksAvoided) || 0,
+                                configCacheReuses: Number(g.configCacheReuses) || 0,
+                                savedTokens: Number(g.savedTokens) || 0
+                            };
+                        })(message.metrics.gradle),
+                        toolCalls: (function (t) {
+                            t = t || {};
+                            function mapScope(s) {
+                                s = s || {};
+                                return {
+                                    totalCalls: Number(s.totalCalls) || 0,
+                                    totalOutputTokens: Number(s.totalOutputTokens) || 0,
+                                    byTool: Array.isArray(s.byTool) ? s.byTool.map(function (r) {
+                                        return {
+                                            tool: typeof r.tool === 'string' ? r.tool : 'unknown',
+                                            calls: Number(r.calls) || 0,
+                                            outputTokens: Number(r.outputTokens) || 0,
+                                            avgMs: Number(r.avgMs) || 0,
+                                            minMs: Number(r.minMs) || 0,
+                                            maxMs: Number(r.maxMs) || 0,
+                                            errors: Number(r.errors) || 0,
+                                            cacheRisk: !!r.cacheRisk,
+                                            groups: Array.isArray(r.groups) ? r.groups.map(function (gg) {
+                                                return { group: typeof gg.group === 'string' ? gg.group : '?', calls: Number(gg.calls) || 0 };
+                                            }) : []
+                                        };
+                                    }) : []
+                                };
+                            }
+                            var month = mapScope(t);
+                            month.turn = mapScope(t.turn);
+                            return month;
+                        })(message.metrics.toolCalls),
+                        source: typeof message.metrics.source === 'string' ? message.metrics.source : 'unavailable',
+                        updatedAt: Number(message.metrics.updatedAt) || 0
+                    };
+                }
+                updateObservabilityUI();
+                break;
+            case 'updateMemoriesList':
+                memoriesList = Array.isArray(message.memories) ? message.memories : [];
+                renderMemoriesList();
                 break;
             case 'slashCommandResults':
                 showSlashDropdown(message.prompts || []);
@@ -1260,6 +1649,25 @@
             case 'planExecutionPaused':
                 planExecuting = false;
                 updatePlanExecutionUI();
+                break;
+            case 'updateWorkerQueue':
+                handleWorkerQueueUpdate(message.tasks);
+                break;
+            case 'availableModels':
+                availableModels = message.models || [];
+                initWorkerModelDefault('command');
+                initWorkerModelDefault('subagent');
+                break;
+            case 'availableTools':
+                availableTools = filterMinimalWorkerTools(message.tools);
+                ['command', 'subagent'].forEach(function(role) {
+                    var lbl = document.getElementById(role + '-tools-label');
+                    var total = availableTools.length;
+                    var sel = workerSelectedTools[role];
+                    var cnt = sel ? sel.size : total;
+                    if (lbl) lbl.textContent = cnt + '/' + total + ' tools selected';
+                    if (workerToolsExpanded[role]) renderToolsPicker(role);
+                });
                 break;
         }
     }
@@ -2073,16 +2481,14 @@
     // ===== SETTINGS MODAL FUNCTIONS =====
 
     function openSettingsModal() {
-        if (!settingsModalOverlay) return;
+        switchTab('settings');
         vscode.postMessage({ type: 'openSettingsModal' });
-        settingsModalOverlay.classList.remove('hidden');
     }
 
     function closeSettingsModal() {
-        if (!settingsModalOverlay) return;
         flushAutopilotTextUpdate();
-        settingsModalOverlay.classList.add('hidden');
         hideAddPromptForm();
+        hideAddAutopilotPromptForm();
     }
 
     function toggleSoundSetting() {
@@ -2182,6 +2588,364 @@
         sendShortcutToggle.setAttribute('aria-checked', sendWithCtrlEnter ? 'true' : 'false');
     }
 
+    function toggleDebugLoggingSetting() {
+        debugLoggingEnabled = !debugLoggingEnabled;
+        updateDebugLoggingToggleUI();
+        vscode.postMessage({ type: 'updateDebugLoggingSetting', enabled: debugLoggingEnabled });
+    }
+
+    function updateDebugLoggingToggleUI() {
+        if (!debugLoggingToggle) return;
+        debugLoggingToggle.classList.toggle('active', debugLoggingEnabled);
+        debugLoggingToggle.setAttribute('aria-checked', debugLoggingEnabled ? 'true' : 'false');
+    }
+
+    function toggleRtkCompressionSetting() {
+        if (!rtkInstalled) { return; }
+        rtkCompressionEnabled = !rtkCompressionEnabled;
+        updateRtkCompressionToggleUI();
+        vscode.postMessage({ type: 'updateRtkCompressionSetting', enabled: rtkCompressionEnabled });
+    }
+
+    function updateRtkCompressionToggleUI() {
+        if (!rtkCompressionToggle) return;
+        rtkCompressionToggle.classList.toggle('active', rtkCompressionEnabled && rtkInstalled);
+        rtkCompressionToggle.setAttribute('aria-checked', (rtkCompressionEnabled && rtkInstalled) ? 'true' : 'false');
+        rtkCompressionToggle.classList.toggle('toggle-disabled', !rtkInstalled);
+        var section = rtkCompressionToggle.closest('.settings-section');
+        if (section) {
+            var titleEl = section.querySelector('.settings-section-title');
+            if (titleEl) {
+                titleEl.innerHTML = '<span class="codicon codicon-server-process"></span> RTK Command Compression' +
+                    (rtkInstalled ? '' : ' <span class="obs-na" style="font-size:10px">(rtk not installed)</span>');
+            }
+        }
+    }
+
+    function updateObservabilityUI() {
+        var pendingCommands = workerTasks.filter(function (t) { return t.role === 'command' && t.status !== 'done'; }).length;
+        var pendingAgents = workerTasks.filter(function (t) { return t.role === 'subagent' && t.status !== 'done'; }).length;
+        if (observabilitySessionCalls) observabilitySessionCalls.textContent = String(currentSessionCalls.length);
+        if (observabilityHistoryCount) observabilityHistoryCount.textContent = String(persistedHistory.length);
+        if (observabilityPendingCommands) observabilityPendingCommands.textContent = String(pendingCommands);
+        if (observabilityPendingAgents) observabilityPendingAgents.textContent = String(pendingAgents);
+        if (observabilitySource) observabilitySource.textContent = observabilityMetrics.source || 'unavailable';
+
+        var aiu = function (nano) { return formatObservabilityCompact((Number(nano) || 0) / 1000000000); };
+        var num = formatObservabilityNumber;
+        var tok = formatObservabilityCompact;
+
+        var aiu = function (nano) { return formatObservabilityCompact((Number(nano) || 0) / 1000000000); };
+        var num = formatObservabilityNumber;
+        var tok = formatObservabilityCompact;
+        var sec = function (ms) { return ((Number(ms) || 0) / 1000).toFixed(2); };
+
+        var all = observabilityMetrics.overall || {};
+        var tc = observabilityMetrics.toolCalls || {};
+
+        var hitPct = function (s) {
+            var inp = Number(s.inputTokens) || 0;
+            if (inp <= 0) return '\u2013';
+            return Math.round((Number(s.cachedTokens) || 0) / inp * 100) + '%';
+        };
+        var setCell = function (id, val) { var el = document.getElementById(id); if (el) el.textContent = val; };
+        var setHit = function (id, s) {
+            var el = document.getElementById(id); if (!el) return;
+            el.textContent = hitPct(s);
+            var inp = Number(s.inputTokens) || 0;
+            var pct = inp > 0 ? (Number(s.cachedTokens) || 0) / inp : 1;
+            el.className = (inp > 0 && pct < 0.5) ? 'obs-cache-risk' : '';
+        };
+        // Render a per-tool table (times in seconds, 2dp) into the given tbody.
+        var renderToolTable = function (tbodyId, scope) {
+            var tb = document.getElementById(tbodyId);
+            if (!tb) return;
+            var bt = (scope && scope.byTool) || [];
+            if (!bt.length) { tb.innerHTML = '<tr><td colspan="7" class="obs-na">No data yet</td></tr>'; return; }
+            var rows = '';
+            for (var j = 0; j < bt.length; j++) {
+                var r = bt[j];
+                var name = escapeHtml(String(r.tool || 'unknown'));
+                if (r.cacheRisk) name += ' \u26a0';
+                var maxCls = r.cacheRisk ? ' class="obs-cache-risk"' : '';
+                rows += '<tr><td class="obs-scope">' + name + '</td>' +
+                    '<td>' + num(r.calls) + '</td>' +
+                    '<td>' + tok(r.outputTokens) + '</td>' +
+                    '<td>' + sec(r.avgMs) + '</td>' +
+                    '<td>' + sec(r.minMs) + '</td>' +
+                    '<td' + maxCls + '>' + sec(r.maxMs) + '</td>' +
+                    '<td>' + (r.errors ? num(r.errors) : '\u2013') + '</td></tr>';
+            }
+            tb.innerHTML = rows;
+        };
+
+        // ── View toggle: turn ⇄ month ──
+        var turnView = document.getElementById('obs-turn-view');
+        var monthView = document.getElementById('obs-month-view');
+        var turnBtn = document.getElementById('obs-view-turn');
+        var monthBtn = document.getElementById('obs-view-month');
+        if (turnView) turnView.style.display = (obsView === 'turn') ? '' : 'none';
+        if (monthView) monthView.style.display = (obsView === 'month') ? '' : 'none';
+        if (turnBtn) turnBtn.classList.toggle('active', obsView === 'turn');
+        if (monthBtn) monthBtn.classList.toggle('active', obsView === 'month');
+
+        // Renders the per-request input breakdown shown inside an expandable detail row.
+        function renderSplitDetail(split) {
+            var sysT = Number(split.systemTokens) || 0;
+            var toolsT = Number(split.toolsTokens) || 0;
+            var convT = Number(split.conversationTokens) || 0;
+            var userT = Number(split.userTokens) || 0;
+            var msgs = Number(split.messageCount) || 0;
+            var total = Number(split.totalInputTokens) || (sysT + toolsT + convT);
+            // Plain-language label for what this request actually is.
+            var kind = convT <= Math.max(50, sysT * 0.02)
+                ? 'Start of conversation'
+                : (userT > 0 ? 'Your message + history' : 'Follow-up after tool calls');
+            var bar = '';
+            if (total > 0) {
+                var pctOf = function (v) { return v > 0 ? Math.max(2, Math.round(v / total * 100)) : 0; };
+                var seg = function (cls, v, label) {
+                    return v > 0 ? '<span class="obs-split-seg ' + cls + '" style="width:' + pctOf(v) + '%" title="' + label + ': ' + tok(v) + ' tok (' + Math.round(v / total * 100) + '%)"></span>' : '';
+                };
+                bar = '<div class="obs-split-bar">' +
+                    seg('obs-split-sys', sysT, 'System prompt') +
+                    seg('obs-split-tools', toolsT, 'Tool definitions') +
+                    seg('obs-split-hist', convT, 'Conversation history') +
+                    '</div>';
+            }
+            var line = function (cls, label, val, extra) {
+                return '<div class="obs-split-line"><i class="' + cls + '"></i>' +
+                    '<span class="obs-split-k">' + label + '</span>' +
+                    '<span class="obs-split-v">' + val + '</span>' +
+                    (extra ? '<span class="obs-split-x">' + extra + '</span>' : '') + '</div>';
+            };
+            return '<div class="obs-split">' +
+                '<div class="obs-split-title">' + kind + ' \u2014 ' + tok(total) + ' tok total input</div>' +
+                bar +
+                '<div class="obs-split-lines">' +
+                line('obs-split-sys', 'System prompt', tok(sysT) + ' tok', (Number(split.skillsCount) || 0) + ' skills') +
+                line('obs-split-tools', 'Tool definitions', tok(toolsT) + ' tok', (Number(split.toolsCount) || 0) + ' tools') +
+                line('obs-split-hist', 'Conversation history', tok(convT) + ' tok', msgs + ' msgs') +
+                line('obs-split-user', 'Latest message', tok(userT) + ' tok', '') +
+                '</div></div>';
+        }
+
+        // ── This turn: chronological timeline — LLM rows in columns, tool rows expandable ──
+        var eventTbody = document.getElementById('obs-turn-event-tbody');
+        if (eventTbody) {
+            var events = observabilityMetrics.turnEvents || [];
+            if (!events.length && observabilityMetrics.turnRequests && observabilityMetrics.turnRequests.length) {
+                events = observabilityMetrics.turnRequests.map(function (req) {
+                    var copy = Object.assign({}, req);
+                    copy.kind = 'request';
+                    return copy;
+                });
+            }
+            // Preserve which tool rows / request rows are currently expanded across 2s re-renders.
+            var openIds = {};
+            var openNodes = eventTbody.querySelectorAll('details[open]');
+            for (var oi = 0; oi < openNodes.length; oi++) {
+                openIds[openNodes[oi].getAttribute('data-eid')] = true;
+            }
+            var openReqNodes = eventTbody.querySelectorAll('tr.obs-detail-row.obs-open');
+            for (var ori = 0; ori < openReqNodes.length; ori++) {
+                openIds[openReqNodes[ori].getAttribute('data-for')] = true;
+            }
+            if (!events.length) {
+                eventTbody.innerHTML = '<tr><td colspan="7" class="obs-na">No events yet</td></tr>';
+            } else {
+                var eventRows = '';
+                for (var k = 0; k < events.length; k++) {
+                    var ev = events[k];
+                    if (ev.kind === 'tool') {
+                        var eid = 't:' + String(ev.id || '') + ':' + k;
+                        var openAttr = openIds[eid] ? ' open' : '';
+                        var statusOk = !(ev.status && ev.status !== 'ok' && ev.status !== 'success');
+                        var timeCls = statusOk ? 'obs-tl-time' : 'obs-tl-time obs-cache-risk';
+                        var toolHeavy = (Number(ev.inputTokens) || 0) > 1000;
+                        var toolRowCls = 'obs-event-tool' + (toolHeavy ? ' obs-row-flag' : '');
+                        eventRows += '<tr class="' + toolRowCls + '"><td colspan="7" class="obs-tool-cell">' +
+                            '<details class="obs-tl-item obs-tl-tool" data-eid="' + eid + '"' + openAttr + '>' +
+                            '<summary class="obs-tl-head">' +
+                            '<span class="obs-tl-kind">tool</span>' +
+                            '<span class="obs-tl-name"><span class="obs-req-id">' + escapeHtml(String(ev.id || '?')) + '</span> ' + escapeHtml(String(ev.tool || 'unknown')) + '</span>' +
+                            '<span class="obs-tl-metric" title="input tokens">\u2193' + tok(ev.inputTokens) + '</span>' +
+                            '<span class="obs-tl-metric" title="output tokens">\u2191' + tok(ev.outputTokens) + '</span>' +
+                            '<span class="' + timeCls + '" title="duration">' + sec(ev.durMs) + 's</span>' +
+                            '</summary>' +
+                            '<div class="obs-tl-body">' +
+                            '<div class="obs-tl-field"><span class="obs-tl-label">Input</span><pre class="obs-tl-pre">' + escapeHtml(String(ev.inputPreview || '\u2013')) + '</pre></div>' +
+                            '<div class="obs-tl-field"><span class="obs-tl-label">Output</span><pre class="obs-tl-pre">' + escapeHtml(String(ev.outputPreview || '\u2013')) + '</pre></div>' +
+                            '<div class="obs-tl-meta">status ' + escapeHtml(String(ev.status || 'ok')) + ' \u00b7 group ' + escapeHtml(String(ev.group || 'default')) + '</div>' +
+                            '</div></details>' +
+                            '</td></tr>';
+                    } else {
+                        var reid = 'r:' + String(ev.id || '') + ':' + k;
+                        var isOpen = !!openIds[reid];
+                        var inp = Number(ev.inputTokens) || 0;
+                        var pct = inp > 0 ? Math.round((Number(ev.cachedTokens) || 0) / inp * 100) : 100;
+                        var missed = (inp > 0 && pct < 50);
+                        var bigOut = (Number(ev.outputTokens) || 0) > 1000;
+                        var hitCls = missed ? ' class="obs-cache-risk"' : '';
+                        var outCls = bigOut ? ' class="obs-cache-risk"' : '';
+                        var hasSplit = !!ev.split;
+                        var reqRowCls = 'obs-event-request' +
+                            ((missed || bigOut) ? ' obs-row-flag' : '') +
+                            (hasSplit ? ' obs-clickable' : '') +
+                            (isOpen ? ' obs-expanded' : '');
+                        var caret = hasSplit ? '<span class="obs-caret">\u25B8</span>' : '<span class="obs-caret-spacer"></span>';
+                        var subTag = ev.firstOfTurn ? '<span class="obs-sub-tag" title="This turn\u2019s initiating request \u2014 your submission">submission</span> ' : '';
+                        eventRows += '<tr class="' + reqRowCls + '" data-eid="' + reid + '">' +
+                            '<td>' + caret + '<span class="obs-req-id">' + escapeHtml(String(ev.id || '?')) + '</span></td>' +
+                            '<td class="obs-scope">' + subTag + escapeHtml(String(ev.model || 'unknown')) + '</td>' +
+                            '<td>' + aiu(ev.nanoAiu) + '</td>' +
+                            '<td>' + tok(ev.inputTokens) + '</td>' +
+                            '<td' + outCls + '>' + tok(ev.outputTokens) + '</td>' +
+                            '<td>' + tok(ev.cachedTokens) + '</td>' +
+                            '<td' + hitCls + '>' + pct + '%</td></tr>';
+                        if (hasSplit) {
+                            eventRows += '<tr class="obs-detail-row' + (isOpen ? ' obs-open' : '') + '" data-for="' + reid + '"' +
+                                (isOpen ? '' : ' style="display:none"') + '>' +
+                                '<td colspan="7">' + renderSplitDetail(ev.split) + '</td></tr>';
+                        }
+                    }
+                }
+                eventTbody.innerHTML = eventRows;
+            }
+            // Delegated click: toggle a request row's detail row (bound once).
+            if (!eventTbody._obsClickBound) {
+                eventTbody._obsClickBound = true;
+                eventTbody.addEventListener('click', function (e) {
+                    var row = e.target && e.target.closest ? e.target.closest('tr.obs-clickable') : null;
+                    if (!row || !eventTbody.contains(row)) { return; }
+                    var forId = row.getAttribute('data-eid');
+                    var detail = eventTbody.querySelector('tr.obs-detail-row[data-for="' + forId + '"]');
+                    if (!detail) { return; }
+                    var nowOpen = detail.style.display === 'none';
+                    detail.style.display = nowOpen ? '' : 'none';
+                    detail.classList.toggle('obs-open', nowOpen);
+                    row.classList.toggle('obs-expanded', nowOpen);
+                });
+            }
+        }
+        var turnSummary = document.getElementById('obs-turn-summary');
+        if (turnSummary) {
+            var lastScope = observabilityMetrics.lastRequest || {};
+            var n = Number(lastScope.requestCount) || 0;
+            var usd = ((Number(lastScope.nanoAiu) || 0) / 1e9 / 100);
+            var usdStr = '<span style="color:#f14c4c">($' + usd.toFixed(2) + ')</span>';
+            turnSummary.innerHTML = n
+                ? (n + ' request' + (n === 1 ? '' : 's') + ' \u00b7 ' + aiu(lastScope.nanoAiu) + ' AIU ' + usdStr + ' \u00b7 ' +
+                    tok(lastScope.inputTokens) + ' in / ' + tok(lastScope.outputTokens) + ' out \u00b7 ' + hitPct(lastScope) + ' cache hit')
+                : 'No requests yet this turn';
+        }
+        renderToolTable('obs-turn-tool-tbody', tc.turn || {});
+
+        // ── This month: consolidated totals + per-model + tools ──
+        setCell('obs-all-reqs', num(all.requestCount));
+        setCell('obs-all-credits', aiu(all.nanoAiu));
+        setCell('obs-all-input', tok(all.inputTokens));
+        setCell('obs-all-output', tok(all.outputTokens));
+        setCell('obs-all-cached', tok(all.cachedTokens));
+        setHit('obs-all-hit', all);
+        setCell('obs-all-miss', num(all.cacheMisses || 0));
+        renderToolTable('obs-month-tool-tbody', tc);
+
+        if (observabilityRtkLine) {
+            observabilityRtkLine.textContent = 'RTK: ' + num(observabilityMetrics.rtkCommandCount) +
+                ' calls \u00b7 ' + tok(observabilityMetrics.rtkSavedTokens) + ' saved \u00b7 ' +
+                formatPercent(observabilityMetrics.rtkSavingsPct);
+        }
+
+        if (observabilityModelTbody) {
+            var models = observabilityMetrics.perModel || [];
+            if (!models.length) {
+                observabilityModelTbody.innerHTML = '<tr><td colspan="6" class="obs-na">No data yet</td></tr>';
+            } else {
+                var rows = '';
+                for (var i = 0; i < models.length; i++) {
+                    var m = models[i];
+                    rows += '<tr><td class="obs-scope">' + escapeHtml(String(m.model || 'unknown')) + '</td>' +
+                        '<td>' + num(m.requestCount) + '</td>' +
+                        '<td>' + aiu(m.nanoAiu) + '</td>' +
+                        '<td>' + tok(m.inputTokens) + '</td>' +
+                        '<td>' + tok(m.outputTokens) + '</td>' +
+                        '<td>' + tok(m.cachedTokens) + '</td></tr>';
+                }
+                observabilityModelTbody.innerHTML = rows;
+            }
+        }
+
+        var gradleLine = document.getElementById('observability-gradle-line');
+        if (gradleLine) {
+            var g = observabilityMetrics.gradle || {};
+            gradleLine.textContent = 'Gradle: ' + num(g.runs) + ' runs \u00b7 ' + num(g.optimizedRuns) +
+                ' optimized \u00b7 ~' + tok(g.savedTokens) + ' tokens saved' +
+                (g.tasksAvoided ? ' \u00b7 ' + num(g.tasksAvoided) + ' tasks cached' : '') +
+                (g.configCacheReuses ? ' \u00b7 ' + num(g.configCacheReuses) + ' cfg-cache reuse' : '');
+        }
+    }
+
+    function renderMemoriesList() {
+        if (observabilityMemoryCount) observabilityMemoryCount.textContent = String(memoriesList.length);
+        if (!observabilityMemoryList) return;
+        if (!memoriesList.length) {
+            observabilityMemoryList.innerHTML = '<li class="obs-na">No memories yet</li>';
+            return;
+        }
+        var html = '';
+        for (var i = 0; i < memoriesList.length; i++) {
+            var m = memoriesList[i];
+            var when = m.modified ? new Date(m.modified).toLocaleDateString() : '';
+            var kb = m.size ? (m.size >= 1024 ? Math.round(m.size / 1024) + 'K' : m.size + 'B') : '';
+            html += '<li class="obs-mem-item" title="' + escapeHtml(String(m.file || '')) + '">' +
+                '<span class="obs-mem-title">' + escapeHtml(String(m.title || m.file || 'memory')) + '</span>' +
+                '<span class="obs-mem-meta">' + escapeHtml(when) + (kb ? ' \u00b7 ' + kb : '') + '</span></li>';
+        }
+        observabilityMemoryList.innerHTML = html;
+    }
+
+    function formatObservabilityNumber(value) {
+        var n = Number(value);
+        if (!isFinite(n)) {
+            return '0';
+        }
+        return Math.round(n).toLocaleString();
+    }
+
+    function formatObservabilityCompact(value) {
+        var n = Number(value);
+        if (!isFinite(n)) {
+            return '0';
+        }
+
+        var sign = n < 0 ? '-' : '';
+        var abs = Math.abs(n);
+
+        if (abs >= 1000000) {
+            return sign + compactWithSuffix(abs / 1000000, 'M');
+        }
+        if (abs >= 1000) {
+            return sign + compactWithSuffix(abs / 1000, 'K');
+        }
+        return sign + Math.round(abs).toLocaleString();
+    }
+
+    function compactWithSuffix(value, suffix) {
+        var decimals = value >= 100 ? 0 : 2;
+        var rounded = value.toFixed(decimals).replace(/\.0+$/, '');
+        return rounded + suffix;
+    }
+
+    function formatPercent(value) {
+        var n = Number(value);
+        if (!isFinite(n)) {
+            return '0%';
+        }
+        var rounded = (Math.round(n * 100) / 100).toFixed(2).replace(/\.0+$/, '');
+        return rounded + '%';
+    }
+
     function normalizeResponseTimeout(value) {
         if (!Number.isFinite(value)) {
             return RESPONSE_TIMEOUT_DEFAULT;
@@ -2237,6 +3001,20 @@
     function updateMaxAutoResponsesUI() {
         if (!maxAutoResponsesInput) return;
         maxAutoResponsesInput.value = maxConsecutiveAutoResponses;
+    }
+
+    function handleTurnBudgetChange() {
+        if (!turnBudgetInput) return;
+        var value = parseInt(turnBudgetInput.value, 10);
+        if (isNaN(value) || value < 0) { value = 0; }
+        turnBudgetAiu = value;
+        turnBudgetInput.value = value;
+        vscode.postMessage({ type: 'updateTurnBudgetAiu', value: value });
+    }
+
+    function updateTurnBudgetUI() {
+        if (!turnBudgetInput) return;
+        turnBudgetInput.value = turnBudgetAiu;
     }
 
     function toggleHumanDelaySetting() {
@@ -3805,6 +4583,590 @@
                 vscode.postMessage({ type: 'openPlanBoard' });
             });
         }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // ── Worker Tabs (Commands + Sub-Agents) ──
+    // ══════════════════════════════════════════════════════════
+
+    // Per-panel autopilot state (independent from global autopilotEnabled)
+    var workerAutopilotEnabled = { command: false, subagent: false };
+    // Per-panel selected model id — set when user picks via native model picker or on models load
+    var workerSelectedModelId = { command: '', subagent: '' };
+    // Per-panel tool selection: null = all tools, Set<string> = selected subset
+    var workerSelectedTools = { command: null, subagent: null };
+    // Track which tool groups are expanded
+    var workerToolsExpanded = { command: false, subagent: false };
+    // Track which tool groups within a panel are expanded: { command: Set<groupName>, subagent: Set<groupName> }
+    var workerGroupsExpanded = { command: new Set(), subagent: new Set() };
+
+    function initWorkerTabs() {
+        // Tab switching
+        var tabs = document.querySelectorAll('.widget-tab');
+        tabs.forEach(function(tab) {
+            tab.addEventListener('click', function() {
+                switchTab(tab.getAttribute('data-tab'));
+            });
+        });
+
+        ['command', 'subagent'].forEach(function(role) {
+            // Run/Autopilot button
+            var runBtn = document.getElementById(role + '-autopilot-btn');
+            if (runBtn) runBtn.addEventListener('click', function() { workerAutopilot(role); });
+
+            // Submit manual
+            var submitBtn = document.getElementById(role + '-submit-btn');
+            if (submitBtn) submitBtn.addEventListener('click', function() { workerSubmit(role); });
+
+            // Per-panel autopilot toggle
+            var autoToggle = document.getElementById(role + '-autopilot-toggle');
+            if (autoToggle) {
+                autoToggle.addEventListener('click', function() { toggleWorkerAutopilot(role); });
+                autoToggle.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleWorkerAutopilot(role); }
+                });
+            }
+
+            // Model select + effort change → update formed label
+            var modelSel = document.getElementById(role + '-model-select');
+            if (modelSel) modelSel.addEventListener('change', function() { updateFormedModelLabel(role); });
+            var effortSel = document.getElementById(role + '-effort-select');
+            if (effortSel) effortSel.addEventListener('change', function() { updateFormedModelLabel(role); });
+
+            // Tools panel header toggle
+            var toolsBtn = document.getElementById(role + '-tools-header-btn');
+            if (toolsBtn) toolsBtn.addEventListener('click', function() { toggleToolsPanel(role); });
+        });
+
+        // Task card click → select it
+        document.addEventListener('click', function(e) {
+            var card = e.target.closest('.worker-task-card');
+            if (!card) return;
+            var role = card.getAttribute('data-role');
+            var id = card.getAttribute('data-id');
+            if (role && id) selectWorkerTask(role, id);
+        });
+
+        // Request models from extension
+        vscode.postMessage({ type: 'requestModels' });
+        updateWorkerManualControlsVisibility('command');
+        updateWorkerManualControlsVisibility('subagent');
+    }
+
+    function switchTab(tab) {
+        currentTab = tab;
+        document.querySelectorAll('.widget-tab').forEach(function(btn) {
+            btn.classList.toggle('active', btn.getAttribute('data-tab') === tab);
+        });
+        document.querySelectorAll('.tab-panel').forEach(function(panel) {
+            panel.classList.toggle('active', panel.id === 'panel-' + tab);
+        });
+        if (tab === 'subagents') {
+            populateModelSelect('subagent-model-select');
+            updateFormedModelLabel('subagent');
+            if (workerToolsExpanded.subagent) renderToolsPicker('subagent');
+        } else if (tab === 'commands') {
+            populateModelSelect('command-model-select');
+            updateFormedModelLabel('command');
+            if (workerToolsExpanded.command) renderToolsPicker('command');
+        } else if (tab === 'settings') {
+            vscode.postMessage({ type: 'openSettingsModal' });
+        } else if (tab === 'observability') {
+            updateObservabilityUI();
+        }
+    }
+
+    function updateTabBadges() {
+        var cmdCount = workerTasks.filter(function(t) { return t.role === 'command' && t.status !== 'done'; }).length;
+        var agentCount = workerTasks.filter(function(t) { return t.role === 'subagent' && t.status !== 'done'; }).length;
+
+        var cmdBadge = document.getElementById('tab-badge-commands');
+        var agentBadge = document.getElementById('tab-badge-subagents');
+
+        if (cmdBadge) {
+            cmdBadge.textContent = cmdCount;
+            cmdBadge.classList.toggle('hidden', cmdCount === 0);
+        }
+        if (agentBadge) {
+            agentBadge.textContent = agentCount;
+            agentBadge.classList.toggle('hidden', agentCount === 0);
+        }
+    }
+
+    /** Set default model for a role from the first available model (deduplicated by backend) */
+    function initWorkerModelDefault(role) {
+        if (!workerSelectedModelId[role] && availableModels.length > 0) {
+            workerSelectedModelId[role] = availableModels[0].id;
+        }
+        populateModelSelect(role + '-model-select');
+        updateFormedModelLabel(role);
+    }
+
+    /** Populate model select with clean deduplicated names */
+    function populateModelSelect(selectId) {
+        var sel = document.getElementById(selectId);
+        if (!sel) return;
+        var role = selectId.replace('-model-select', '');
+        var prev = workerSelectedModelId[role] || sel.value;
+        sel.innerHTML = '';
+        if (availableModels.length === 0) {
+            sel.innerHTML = '<option value="">No models available</option>';
+            return;
+        }
+        availableModels.forEach(function(m) {
+            var opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = m.name;
+            sel.appendChild(opt);
+        });
+        if (prev && Array.from(sel.options).some(function(o) { return o.value === prev; })) {
+            sel.value = prev;
+            workerSelectedModelId[role] = prev;
+        } else if (availableModels.length > 0) {
+            sel.value = availableModels[0].id;
+            workerSelectedModelId[role] = availableModels[0].id;
+        }
+        updateFormedModelLabel(role);
+    }
+
+    /** Build and display "ModelName · Med" label */
+    function updateFormedModelLabel(role) {
+        var modelSel = document.getElementById(role + '-model-select');
+        var effortSel = document.getElementById(role + '-effort-select');
+        var label = document.getElementById(role + '-formed-model');
+        if (!label) return;
+
+        var modelName = modelSel && modelSel.selectedOptions[0] ? modelSel.selectedOptions[0].textContent.trim() : '';
+        if (modelSel) workerSelectedModelId[role] = modelSel.value;
+        var effort = effortSel ? effortSel.value : 'medium';
+        var effortDisplay = { low: 'Low ⚡', medium: 'Med', high: 'High 🔥' }[effort] || effort;
+
+        label.textContent = modelName ? modelName + ' · ' + effortDisplay : '—';
+    }
+
+    // ── Tool picker ──────────────────────────────────────────
+
+    /** Toggle the tools panel header open/closed */
+    function toggleToolsPanel(role) {
+        workerToolsExpanded[role] = !workerToolsExpanded[role];
+        var body = document.getElementById(role + '-tools-body');
+        var chevron = document.getElementById(role + '-tools-chevron');
+        var btn = document.getElementById(role + '-tools-header-btn');
+        if (body) body.classList.toggle('hidden', !workerToolsExpanded[role]);
+        if (btn) btn.setAttribute('aria-expanded', workerToolsExpanded[role] ? 'true' : 'false');
+        if (chevron) {
+            chevron.classList.toggle('codicon-chevron-right', !workerToolsExpanded[role]);
+            chevron.classList.toggle('codicon-chevron-down', workerToolsExpanded[role]);
+        }
+        if (workerToolsExpanded[role]) renderToolsPicker(role);
+    }
+
+    /**
+     * Build a picker shape aligned to Copilot's tool picker buckets:
+     * - Built-In bucket first
+     * - Other buckets derived from tool source tags
+     * - Built-In renders direct tool-key rows (agent, browser, edit, execute, ...)
+     */
+    function groupTools(tools) {
+        var builtInToolOrder = ['agent', 'browser', 'edit', 'execute', 'read', 'search', 'todo', 'vscode', 'web', 'memory'];
+        var genericTags = new Set(['vscode', 'copilot', 'tool', 'tools', 'built-in', 'builtin', 'mcp', 'internal', 'extension', 'user']);
+
+        function normalizeTags(rawTags) {
+            return Array.isArray(rawTags) ? rawTags.map(function(t) { return String(t).toLowerCase(); }) : [];
+        }
+
+        function getToolKey(tool) {
+            var n = String(tool.name || '').toLowerCase();
+            var first = n.split(/[._:/-]/)[0] || n;
+            if (builtInToolOrder.indexOf(first) >= 0) return first;
+            if (n.indexOf('todo') >= 0) return 'todo';
+            if (n.indexOf('browser') >= 0) return 'browser';
+            if (n.indexOf('edit') >= 0) return 'edit';
+            if (n.indexOf('execute') >= 0 || n.indexOf('terminal') >= 0 || n.indexOf('command') >= 0) return 'execute';
+            if (n.indexOf('read') >= 0) return 'read';
+            if (n.indexOf('search') >= 0) return 'search';
+            if (n.indexOf('agent') >= 0) return 'agent';
+            if (n.indexOf('web') >= 0) return 'web';
+            if (n.indexOf('vscode') >= 0) return 'vscode';
+            return first || 'vscode';
+        }
+
+        function inferBucket(tool, tags) {
+            var i;
+
+            if (tags.indexOf('built-in') >= 0 || tags.indexOf('builtin') >= 0 || tags.indexOf('internal') >= 0) {
+                return { name: 'Built-In', type: 'built-in' };
+            }
+            if (builtInToolOrder.indexOf(getToolKey(tool)) >= 0) {
+                return { name: 'Built-In', type: 'built-in' };
+            }
+
+            for (i = 0; i < tags.length; i++) {
+                if (tags[i].indexOf('mcp:') === 0) {
+                    return { name: tags[i].slice(4) || 'MCP Server', type: 'mcp' };
+                }
+                if (tags[i].indexOf('server:') === 0) {
+                    return { name: tags[i].slice(7) || 'MCP Server', type: 'mcp' };
+                }
+            }
+            if (tags.indexOf('mcp') >= 0) {
+                return { name: 'MCP Server', type: 'mcp' };
+            }
+
+            for (i = 0; i < tags.length; i++) {
+                if (tags[i].indexOf('extension:') === 0) {
+                    return { name: tags[i].slice(10) || 'Extension', type: 'extension' };
+                }
+            }
+            if (tags.indexOf('extension') >= 0) {
+                return { name: 'Extension', type: 'extension' };
+            }
+
+            if (tags.indexOf('user') >= 0 || tags.indexOf('toolset') >= 0) {
+                return { name: 'User Defined Tool Sets', type: 'user' };
+            }
+
+            for (i = 0; i < tags.length; i++) {
+                if (!genericTags.has(tags[i])) {
+                    return { name: tags[i], type: 'external' };
+                }
+            }
+
+            return { name: 'Extension', type: 'extension' };
+        }
+
+        var result = {}; // { bucketName: { type, tools, builtInRows } }
+        tools.forEach(function(tool) {
+            var tags = normalizeTags(tool.tags);
+            var bucket = inferBucket(tool, tags);
+            if (!result[bucket.name]) {
+                result[bucket.name] = {
+                    type: bucket.type,
+                    tools: [],
+                    builtInRows: {}
+                };
+            }
+            result[bucket.name].tools.push(tool);
+            if (bucket.type === 'built-in') {
+                var key = getToolKey(tool);
+                if (!result[bucket.name].builtInRows[key]) result[bucket.name].builtInRows[key] = [];
+                result[bucket.name].builtInRows[key].push(tool);
+            }
+        });
+
+        return result;
+    }
+
+    /** Render the grouped per-panel tool picker */
+    function renderToolsPicker(role) {
+        var body = document.getElementById(role + '-tools-body');
+        var headerLabel = document.getElementById(role + '-tools-label');
+        if (!body) return;
+
+        var totalTools = availableTools.length;
+        var selectedSet = workerSelectedTools[role];
+        var selectedCount = selectedSet ? selectedSet.size : totalTools;
+        if (headerLabel) {
+            headerLabel.textContent = selectedCount + '/' + totalTools + ' tools selected';
+        }
+
+        if (totalTools === 0) {
+            body.innerHTML = '<div class="worker-tools-empty">No tools registered. Enable MCP servers or VS Code tools first.</div>';
+            return;
+        }
+
+        var grouped = groupTools(availableTools);
+        var html = '<div class="tools-picker">';
+        var topGroupNames = Object.keys(grouped).sort(function(a, b) {
+            if (a === 'Built-In') return -1;
+            if (b === 'Built-In') return 1;
+            return a.localeCompare(b);
+        });
+
+        topGroupNames.forEach(function(topGroupName) {
+            var group = grouped[topGroupName];
+            var topTools = group.tools;
+
+            var topAll = topTools.every(function(t) { return !selectedSet || selectedSet.has(t.name); });
+            var topSome = !topAll && topTools.some(function(t) { return !selectedSet || selectedSet.has(t.name); });
+            var topState = topAll ? 'all' : (topSome ? 'some' : 'none');
+
+            var topKey = topGroupName;
+            var topExpanded = workerGroupsExpanded[role].has(topKey);
+            var et = escapeHtml(topGroupName);
+
+            html += '<div class="tools-group tools-top-group">';
+            html += '<div class="tools-group-header" data-role="' + role + '" data-group="' + escapeHtml(topKey) + '">';
+            html += '<span class="tools-group-check ' + topState + '" data-role="' + role + '" data-group="' + escapeHtml(topKey) + '"></span>';
+            html += '<span class="tools-group-name">' + et + '</span>';
+            html += '<span class="tools-group-count">' + topTools.length + '</span>';
+            html += '<span class="codicon ' + (topExpanded ? 'codicon-chevron-down' : 'codicon-chevron-right') + ' tools-group-chevron"></span>';
+            html += '</div>';
+            html += '<div class="tools-group-items tools-top-items' + (topExpanded ? '' : ' hidden') + '">';
+
+            if (group.type === 'built-in') {
+                var order = ['agent', 'browser', 'edit', 'execute', 'read', 'search', 'todo', 'vscode', 'web', 'memory'];
+                var rowKeys = Object.keys(group.builtInRows).sort(function(a, b) {
+                    var ai = order.indexOf(a);
+                    var bi = order.indexOf(b);
+                    if (ai === -1 && bi === -1) return a.localeCompare(b);
+                    if (ai === -1) return 1;
+                    if (bi === -1) return -1;
+                    return ai - bi;
+                });
+
+                rowKeys.forEach(function(rowKey) {
+                    var rowTools = group.builtInRows[rowKey];
+                    var rowAll = rowTools.every(function(t) { return !selectedSet || selectedSet.has(t.name); });
+                    var rowCount = rowTools.length;
+
+                    html += '<div class="tools-item tools-item-builtinkey">';
+                    html += '<input type="checkbox" class="tools-item-check" data-role="' + role + '" data-builtinkey="' + escapeHtml(topGroupName + '::' + rowKey) + '" ' + (rowAll ? 'checked' : '') + '>';
+                    html += '<div class="tools-item-info"><span class="tools-item-name">' + escapeHtml(rowKey) + '</span>';
+                    if (rowCount > 1) html += '<span class="tools-item-desc">' + rowCount + ' tools</span>';
+                    html += '</div></div>';
+                });
+            } else {
+                // Copilot-like shape for non-built-ins: top group -> tools directly.
+                topTools.forEach(function(t) {
+                    var checked = !selectedSet || selectedSet.has(t.name);
+                    html += '<div class="tools-item tools-item-external">';
+                    html += '<input type="checkbox" class="tools-item-check" data-role="' + role + '" data-name="' + escapeHtml(t.name) + '" ' + (checked ? 'checked' : '') + '>';
+                    html += '<div class="tools-item-info"><span class="tools-item-name">' + escapeHtml(t.name) + '</span>';
+                    if (t.description) html += '<span class="tools-item-desc">' + escapeHtml(t.description.slice(0, 90)) + '</span>';
+                    html += '</div></div>';
+                });
+            }
+
+            html += '</div></div>';
+        });
+        html += '</div>';
+        body.innerHTML = html;
+
+        body.querySelectorAll('.tools-group-header').forEach(function(header) {
+            header.addEventListener('click', function(e) {
+                if (e.target.classList.contains('tools-group-check')) return;
+                var r = header.getAttribute('data-role');
+                var g = header.getAttribute('data-group');
+                if (workerGroupsExpanded[r].has(g)) { workerGroupsExpanded[r].delete(g); } else { workerGroupsExpanded[r].add(g); }
+                renderToolsPicker(r);
+            });
+        });
+        body.querySelectorAll('.tools-group-check').forEach(function(span) {
+            span.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var r = span.getAttribute('data-role');
+                var g = span.getAttribute('data-group');
+                var grouped2 = groupTools(availableTools);
+                var gl = [];
+                if (grouped2[g]) {
+                    gl = grouped2[g].tools.slice();
+                }
+                if (!workerSelectedTools[r]) workerSelectedTools[r] = new Set(availableTools.map(function(t) { return t.name; }));
+                var allSel = gl.every(function(t) { return workerSelectedTools[r].has(t.name); });
+                gl.forEach(function(t) { if (allSel) { workerSelectedTools[r].delete(t.name); } else { workerSelectedTools[r].add(t.name); } });
+                if (workerSelectedTools[r].size === availableTools.length) workerSelectedTools[r] = null;
+                renderToolsPicker(r);
+            });
+        });
+        body.querySelectorAll('.tools-item-check').forEach(function(chk) {
+            chk.addEventListener('change', function() {
+                var r = chk.getAttribute('data-role');
+                var n = chk.getAttribute('data-name');
+                var builtInKey = chk.getAttribute('data-builtinkey');
+                if (!workerSelectedTools[r]) workerSelectedTools[r] = new Set(availableTools.map(function(t) { return t.name; }));
+                if (builtInKey) {
+                    var bits = builtInKey.split('::');
+                    var top = bits[0];
+                    var key = bits.slice(1).join('::');
+                    var grouped3 = groupTools(availableTools);
+                    var rowTools = (grouped3[top] && grouped3[top].builtInRows && grouped3[top].builtInRows[key]) ? grouped3[top].builtInRows[key] : [];
+                    rowTools.forEach(function(t) {
+                        if (chk.checked) {
+                            workerSelectedTools[r].add(t.name);
+                        } else {
+                            workerSelectedTools[r].delete(t.name);
+                        }
+                    });
+                } else {
+                    if (chk.checked) { workerSelectedTools[r].add(n); } else { workerSelectedTools[r].delete(n); }
+                }
+                if (workerSelectedTools[r].size === availableTools.length) workerSelectedTools[r] = null;
+                renderToolsPicker(r);
+            });
+        });
+
+        // Native checkboxes support indeterminate state only via property, not markup.
+        body.querySelectorAll('.tools-item-check[data-builtinkey]').forEach(function(chk) {
+            var r = chk.getAttribute('data-role');
+            var builtInKey = chk.getAttribute('data-builtinkey');
+            if (!builtInKey) return;
+            var bits = builtInKey.split('::');
+            var top = bits[0];
+            var key = bits.slice(1).join('::');
+            var grouped4 = groupTools(availableTools);
+            var rowTools = (grouped4[top] && grouped4[top].builtInRows && grouped4[top].builtInRows[key]) ? grouped4[top].builtInRows[key] : [];
+            var allSel = rowTools.length > 0 && rowTools.every(function(t) { return !workerSelectedTools[r] || workerSelectedTools[r].has(t.name); });
+            var someSel = !allSel && rowTools.some(function(t) { return !workerSelectedTools[r] || workerSelectedTools[r].has(t.name); });
+            chk.indeterminate = someSel;
+        });
+    }
+
+    /** Toggle per-panel autopilot on/off */
+    function toggleWorkerAutopilot(role) {
+        workerAutopilotEnabled[role] = !workerAutopilotEnabled[role];
+        var toggle = document.getElementById(role + '-autopilot-toggle');
+        if (toggle) {
+            toggle.classList.toggle('active', workerAutopilotEnabled[role]);
+            toggle.setAttribute('aria-checked', workerAutopilotEnabled[role] ? 'true' : 'false');
+        }
+        updateWorkerManualControlsVisibility(role);
+        // If turning ON and there's a pending task, run it automatically
+        if (workerAutopilotEnabled[role]) {
+            var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+            if (pending) {
+                selectWorkerTask(role, pending.id);
+                workerAutopilot(role);
+            }
+        }
+    }
+
+    /** Hide/show manual input+submit per panel based on autopilot state */
+    function updateWorkerManualControlsVisibility(role) {
+        var hideManual = workerAutopilotEnabled[role];
+        var input = document.getElementById(role + '-response-input');
+        var submitBtn = document.getElementById(role + '-submit-btn');
+        if (input) input.style.display = hideManual ? 'none' : '';
+        if (submitBtn) submitBtn.style.display = hideManual ? 'none' : '';
+    }
+
+    /** Run worker task with selected model/effort */
+    function workerAutopilot(role) {
+        var id = activeWorkerTaskId[role];
+        if (!id) {
+            var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+            if (pending) { selectWorkerTask(role, pending.id); id = pending.id; }
+        }
+        if (!id) return;
+
+        var modelSel = document.getElementById(role + '-model-select');
+        var modelId = modelSel ? modelSel.value : (workerSelectedModelId[role] || '');
+        if (!modelId && availableModels.length > 0) modelId = availableModels[0].id;
+        if (!modelId) return;
+
+        var opts = getWorkerRunOptions(role);
+        vscode.postMessage({
+            type: 'workerRunAutopilot',
+            taskId: id,
+            modelId: modelId,
+            agentName: opts.agentName,
+            thinkingEffort: opts.thinkingEffort
+        });
+    }
+
+    function getWorkerRunOptions(role) {
+        var agentSel = document.getElementById(role + '-agent-select');
+        var effortSel = document.getElementById(role + '-effort-select');
+        return {
+            agentName: agentSel ? agentSel.value : 'default',
+            thinkingEffort: effortSel ? effortSel.value : 'medium'
+        };
+    }
+
+    // ── Tool count display (config opens native VS Code dialog) ──────────────────────────────────────────
+
+    function updateToolsCount(role) {
+        // kept for any legacy call sites — no-op now that count is in renderToolsPicker header
+    }
+
+    // groupTools is defined above with two-level hierarchy; keep single source of truth.
+
+    // ── Queue / task rendering ───────────────────────────────
+
+    function renderWorkerQueue(role) {
+        var listId = role === 'command' ? 'command-task-list' : 'subagent-task-list';
+        var list = document.getElementById(listId);
+        if (!list) return;
+
+        var tasks = workerTasks.filter(function(t) { return t.role === role; });
+        if (tasks.length === 0) {
+            list.innerHTML = '<div class="worker-empty">No pending ' + (role === 'command' ? 'commands' : 'agent tasks') + '</div>';
+            return;
+        }
+
+        list.innerHTML = tasks.map(function(t) {
+            var summary = t.task.length > 120 ? t.task.slice(0, 120) + '…' : t.task;
+            var isActive = activeWorkerTaskId[role] === t.id;
+            var statusLabel = t.status === 'running' ? 'Running…' : t.status === 'done' ? '✓ Done' : 'Pending';
+            return '<div class="worker-task-card' + (isActive ? ' active-task' : '') + '" data-id="' + t.id + '" data-role="' + role + '">' +
+                '<div class="worker-task-card-header">' +
+                '<span class="worker-task-role">' + (role === 'command' ? 'CMD' : 'AGENT') + '</span>' +
+                '<span class="worker-task-status ' + t.status + '">' + statusLabel + '</span>' +
+                '</div>' +
+                '<div class="worker-task-summary">' + escapeHtml(summary) + '</div>' +
+                '</div>';
+        }).join('');
+    }
+
+    function selectWorkerTask(role, id) {
+        activeWorkerTaskId[role] = id;
+        var task = workerTasks.find(function(t) { return t.id === id; });
+        if (!task) return;
+
+        var displayId = role === 'command' ? 'command-task-display' : 'subagent-task-display';
+        var textId = role === 'command' ? 'command-task-text' : 'subagent-task-text';
+        var display = document.getElementById(displayId);
+        var textEl = document.getElementById(textId);
+
+        if (display) display.classList.remove('hidden');
+        if (textEl) textEl.textContent = task.task;
+
+        renderWorkerQueue(role);
+    }
+
+    function workerSubmit(role) {
+        var id = activeWorkerTaskId[role];
+        if (!id) {
+            var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+            if (pending) { selectWorkerTask(role, pending.id); id = pending.id; }
+        }
+        if (!id) return;
+
+        var inputId = role === 'command' ? 'command-response-input' : 'subagent-response-input';
+        var input = document.getElementById(inputId);
+        var result = input ? input.value.trim() : '';
+        if (!result) return;
+
+        vscode.postMessage({ type: 'workerResolveManual', taskId: id, result: result });
+        if (input) input.value = '';
+        activeWorkerTaskId[role] = null;
+
+        var displayId = role === 'command' ? 'command-task-display' : 'subagent-task-display';
+        var display = document.getElementById(displayId);
+        if (display) display.classList.add('hidden');
+    }
+
+    function handleWorkerQueueUpdate(tasks) {
+        workerTasks = tasks || [];
+        renderWorkerQueue('command');
+        renderWorkerQueue('subagent');
+        updateTabBadges();
+        updateObservabilityUI();
+
+        ['command', 'subagent'].forEach(function(role) {
+            if (!activeWorkerTaskId[role]) {
+                var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+                if (pending) selectWorkerTask(role, pending.id);
+            }
+            // If autopilot is on and a new pending task arrives, run it
+            if (workerAutopilotEnabled[role]) {
+                var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+                if (pending) {
+                    selectWorkerTask(role, pending.id);
+                    workerAutopilot(role);
+                }
+            }
+        });
     }
 
     // ══════════════════════════════════════════════════════════
