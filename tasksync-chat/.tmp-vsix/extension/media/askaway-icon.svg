@@ -1,0 +1,38 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- Chat bubble -->
+  <path d="M64 12
+       C34 12 12 34 12 60
+       C12 78 22 92 38 100
+       L38 116
+       L54 104
+       C58 105 61 106 64 106
+       C94 106 116 84 116 60
+       C116 34 94 12 64 12
+       Z" fill="black"></path>
+
+  <!-- Arrow -->
+  <path d="M78 22
+       L104 16
+       L92 42
+       L88 34
+       Z" fill="black"></path>
+
+  <!-- Question mark -->
+  <path d="M64 36
+       C54 36 48 42 48 50
+       H56
+       C56 46 60 44 64 44
+       C68 44 72 46 72 50
+       C72 54 68 56 64 58
+       C58 62 56 66 56 72
+       V74
+       H64
+       V72
+       C64 68 68 66 72 64
+       C78 60 80 56 80 50
+       C80 42 72 36 64 36
+       Z" fill="white"></path>
+
+  <!-- Question dot -->
+  <circle cx="64" cy="86" r="4" fill="white"></circle>
+</svg>

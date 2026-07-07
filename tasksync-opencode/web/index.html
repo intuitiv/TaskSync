@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TaskSync Dashboard</title>
+<style>
+  :root {
+    --bg: #1e1e2e; --surface: #313244; --surface2: #45475a; --overlay: #585b70;
+    --text: #cdd6f4; --subtext: #a6adc8; --blue: #89b4fa; --green: #a6e3a1;
+    --red: #f38ba8; --yellow: #f9e2af; --mauve: #cba6f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; background: var(--bg); color: var(--text); padding: 20px; min-height: 100vh; }
+  
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; border-bottom: 1px solid var(--surface2); padding-bottom: 16px; }
+  h1 { font-size: 1.4em; color: var(--blue); font-weight: 600; }
+  .token-summary { font-size: 0.85em; color: var(--subtext); text-align: right; }
+  .token-summary span { color: var(--mauve); font-weight: 600; }
+
+  .empty-state { text-align: center; padding: 80px 20px; color: var(--overlay); }
+  .empty-state h2 { color: var(--subtext); margin-bottom: 12px; }
+  .empty-state code { background: var(--surface); padding: 2px 8px; border-radius: 4px; color: var(--green); }
+
+  .session { background: var(--surface); border-radius: 10px; padding: 20px; margin-bottom: 16px; border-left: 4px solid var(--surface2); transition: border-color 0.2s; }
+  .session.has-pending { border-left-color: var(--red); animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { border-left-color: var(--red); } 50% { border-left-color: var(--yellow); } }
+
+  .session-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .session-name { font-size: 1.1em; font-weight: 600; color: var(--blue); }
+  .session-tokens { font-size: 0.8em; color: var(--subtext); }
+
+  .pending-section { background: var(--bg); border-radius: 8px; padding: 16px; margin: 12px 0; }
+  .pending-label { font-size: 0.75em; text-transform: uppercase; letter-spacing: 1px; color: var(--red); margin-bottom: 8px; font-weight: 600; }
+  .pending-question { color: var(--yellow); white-space: pre-wrap; word-break: break-word; line-height: 1.5; max-height: 300px; overflow-y: auto; }
+  .pending-time { font-size: 0.75em; color: var(--overlay); margin-top: 8px; }
+  
+  .reply-form { display: flex; gap: 8px; margin-top: 12px; }
+  .reply-input { flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--overlay); background: var(--surface2); color: var(--text); font-family: inherit; font-size: 0.9em; resize: none; min-height: 40px; max-height: 150px; }
+  .reply-input:focus { outline: none; border-color: var(--blue); }
+  .reply-btn { padding: 10px 20px; border-radius: 8px; border: none; background: var(--blue); color: var(--bg); font-weight: 600; cursor: pointer; font-family: inherit; white-space: nowrap; }
+  .reply-btn:hover { opacity: 0.9; }
+  .reply-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .no-pending { color: var(--overlay); font-size: 0.9em; font-style: italic; }
+
+  details { margin-top: 12px; }
+  summary { cursor: pointer; color: var(--subtext); font-size: 0.85em; }
+  .history-list { margin-top: 8px; }
+  .history-entry { padding: 8px 0; border-bottom: 1px solid var(--surface2); font-size: 0.85em; }
+  .history-entry:last-child { border-bottom: none; }
+  .h-q { color: var(--blue); }
+  .h-a { color: var(--green); }
+  .h-pending { color: var(--yellow); font-style: italic; }
+  .h-tokens { color: var(--overlay); font-size: 0.8em; }
+
+  .status-bar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); padding: 8px 20px; display: flex; justify-content: space-between; font-size: 0.8em; color: var(--subtext); border-top: 1px solid var(--surface2); }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .status-dot.connected { background: var(--green); }
+  .status-dot.disconnected { background: var(--red); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ TaskSync</h1>
+  <div class="token-summary" id="tokenSummary"></div>
+</header>
+
+<div id="app" class="empty-state">
+  <h2>Connecting to server...</h2>
+</div>
+
+<div class="status-bar">
+  <div><span class="status-dot disconnected" id="statusDot"></span><span id="statusText">Connecting...</span></div>
+  <div id="sessionCount"></div>
+</div>
+
+<script>
+let ws;
+let reconnectTimer;
+
+function connect() {
+  ws = new WebSocket('ws://' + location.host + '/ui');
+  
+  ws.onopen = () => {
+    document.getElementById('statusDot').className = 'status-dot connected';
+    document.getElementById('statusText').textContent = 'Connected';
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'state') render(msg.sessions);
+  };
+
+  ws.onclose = () => {
+    document.getElementById('statusDot').className = 'status-dot disconnected';
+    document.getElementById('statusText').textContent = 'Disconnected — reconnecting...';
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => {};
+}
+
+function render(sessions) {
+  const app = document.getElementById('app');
+  const tokenSummary = document.getElementById('tokenSummary');
+  const sessionCount = document.getElementById('sessionCount');
+  
+  sessionCount.textContent = sessions.length + ' session' + (sessions.length !== 1 ? 's' : '');
+
+  // Aggregate tokens
+  let totalIn = 0, totalOut = 0;
+  sessions.forEach(s => { totalIn += s.tokenUsage.totalInput; totalOut += s.tokenUsage.totalOutput; });
+  tokenSummary.innerHTML = 'Est. tokens: <span>~' + totalIn.toLocaleString() + ' in</span> / <span>~' + totalOut.toLocaleString() + ' out</span>';
+
+  if (!sessions.length) {
+    app.innerHTML = '<div class="empty-state"><h2>No active sessions</h2><p>Start an OpenCode instance with the TaskSync MCP relay configured:</p><br><code>TASKSYNC_SERVER=ws://127.0.0.1:' + location.port + ' npx tasksync-relay</code></div>';
+    app.className = '';
+    return;
+  }
+
+  app.className = '';
+  app.innerHTML = sessions.map(s => {
+    const hasPending = !!s.pending;
+    let pendingHTML;
+    if (hasPending) {
+      const elapsed = Math.round((Date.now() - s.pending.timestamp) / 1000);
+      const timeStr = elapsed < 60 ? elapsed + 's ago' : Math.round(elapsed / 60) + 'm ago';
+      pendingHTML = '<div class="pending-section">' +
+        '<div class="pending-label">⏳ Pending Question</div>' +
+        '<div class="pending-question">' + esc(s.pending.question) + '</div>' +
+        '<div class="pending-time">Asked ' + timeStr + '</div>' +
+        '<div class="reply-form">' +
+          '<textarea class="reply-input" id="reply-' + s.id + '" placeholder="Type your reply..." rows="1" onkeydown="handleKey(event, \'' + s.id + '\')"></textarea>' +
+          '<button class="reply-btn" onclick="sendReply(\'' + s.id + '\')">Send ↵</button>' +
+        '</div></div>';
+    } else {
+      pendingHTML = '<div class="no-pending">No pending question</div>';
+    }
+
+    const historyHTML = (s.history || []).slice().reverse().slice(0, 10).map(h => {
+      const tokenInfo = h.tokenEstimate ? ' <span class="h-tokens">[~' + (h.tokenEstimate.question + h.tokenEstimate.response) + ' tok]</span>' : '';
+      return '<div class="history-entry">' +
+        '<span class="h-q">Q:</span> ' + esc(truncate(h.question, 120)) + tokenInfo +
+        (h.response ? '<br><span class="h-a">A:</span> ' + esc(truncate(h.response, 120)) : '<br><span class="h-pending">awaiting response...</span>') +
+        '</div>';
+    }).join('');
+
+    return '<div class="session ' + (hasPending ? 'has-pending' : '') + '">' +
+      '<div class="session-header">' +
+        '<span class="session-name">' + esc(s.name) + '</span>' +
+        '<span class="session-tokens">~' + s.tokenUsage.totalInput.toLocaleString() + ' in / ~' + s.tokenUsage.totalOutput.toLocaleString() + ' out</span>' +
+      '</div>' +
+      pendingHTML +
+      (s.historyCount > 0 ? '<details><summary>History (' + s.historyCount + ' exchanges)</summary><div class="history-list">' + historyHTML + '</div></details>' : '') +
+      '</div>';
+  }).join('');
+
+  // Auto-focus first pending reply input
+  const firstPending = sessions.find(s => s.pending);
+  if (firstPending) {
+    const input = document.getElementById('reply-' + firstPending.id);
+    if (input && document.activeElement.tagName !== 'TEXTAREA') input.focus();
+  }
+}
+
+function handleKey(e, sessionId) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendReply(sessionId);
+  }
+}
+
+async function sendReply(sessionId) {
+  const input = document.getElementById('reply-' + sessionId);
+  if (!input || !input.value.trim()) return;
+  const btn = input.parentElement.querySelector('.reply-btn');
+  btn.disabled = true;
+  btn.textContent = 'Sending...';
+  try {
+    const res = await fetch('/api/respond', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, response: input.value.trim() }),
+    });
+    const data = await res.json();
+    if (data.ok) input.value = '';
+  } catch (err) {
+    console.error('Failed to send:', err);
+  }
+  btn.disabled = false;
+  btn.textContent = 'Send ↵';
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function truncate(s, n) { return s.length > n ? s.substring(0, n) + '…' : s; }
+
+connect();
+
+// Update pending time display every 10s
+setInterval(() => {
+  document.querySelectorAll('.pending-time').forEach(el => {
+    // Just trigger a re-render by re-requesting state
+  });
+}, 10000);
+</script>
+</body>
+</html>

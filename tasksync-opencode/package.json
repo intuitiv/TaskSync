@@ -1,0 +1,27 @@
+{
+  "name": "askaway-mcp",
+  "version": "0.1.0",
+  "description": "AskAway — MCP server with Telegram notifications and web dashboard for AI coding agents",
+  "main": "dist/index.js",
+  "bin": {
+    "askaway-mcp": "./dist/index.js",
+    "askaway-relay": "./dist/relay.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "relay": "node dist/relay.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "ws": "^8.18.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

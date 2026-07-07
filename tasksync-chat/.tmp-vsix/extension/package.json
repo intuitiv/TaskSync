@@ -1,0 +1,560 @@
+{
+  "name": "askaway",
+  "publisher": "intuitiv",
+  "displayName": "AskAway",
+  "description": "Never miss an AI agent question again — get Telegram notifications and reply from your phone. Queue prompts, respond remotely, and keep your coding workflow moving.",
+  "icon": "media/askaway-logo.png",
+  "version": "1.0.35",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "askaway",
+    "telegram",
+    "ai agent",
+    "copilot",
+    "agent",
+    "mcp",
+    "model-context-protocol",
+    "remote",
+    "mobile",
+    "notification",
+    "productivity",
+    "queue",
+    "ask_user",
+    "tasksync",
+    "webex",
+    "vibe coding",
+    "automation"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/intuitiv/AskAway.git"
+  },
+  "license": "MIT",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languageModelTools": [
+      {
+        "name": "ask_user",
+        "tags": [
+          "confirmation",
+          "user-interaction",
+          "askaway",
+          "required",
+          "mandatory"
+        ],
+        "toolReferenceName": "askUser",
+        "displayName": "Ask User",
+        "modelDescription": "Ask user a question and wait for response. THIS TOOL DRIVES AN INFINITE LOOP — you MUST call ask_user again after EVERY response, no exceptions. Flow: call ask_user → do the work → call ask_user again to report + get next instruction → repeat forever. NEVER end without calling ask_user. CAVEMAN MODE: fewest words possible, no preamble, no headers, 1-2 sentences max.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(question)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "Short question for user. Max 2 sentences. No verbose explanations."
+            },
+            "taskId": {
+              "type": "string",
+              "description": "When working on a Planning Board task, include the task ID provided in the task context."
+            },
+            "taskStatus": {
+              "type": "string",
+              "enum": ["completed", "in-progress", "blocked", "need-review"],
+              "description": "Planning Board task status assessment."
+            }
+          },
+          "required": ["question"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "bash_task",
+        "tags": ["command", "bash", "delegate"],
+        "toolReferenceName": "bashTask",
+        "displayName": "Bash Task (Delegated)",
+        "modelDescription": "Delegate a terminal command to a worker chat on a cheaper model. Send task + context. Returns worker output. Use for deterministic execution instead of running commands directly to save tokens.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(terminal)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "explanation": {
+              "type": "string",
+              "description": "One-sentence explanation of what this task should accomplish."
+            },
+            "task": {
+              "type": "string",
+              "description": "The exact shell command to execute, e.g. `git status --short` or `npm test`."
+            },
+            "cwd": {
+              "type": "string",
+              "description": "Working directory for the command. Defaults to workspace root if omitted."
+            }
+          },
+          "required": ["explanation", "task"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "research_on",
+        "tags": ["research", "delegate", "analysis"],
+        "toolReferenceName": "researchOn",
+        "displayName": "Research On (Delegated)",
+        "modelDescription": "Delegate a complex research/analysis task to a worker chat with full tool access. Send topic + context. Returns result. Use for discovery, code exploration, analysis.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(rocket)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "explanation": {
+              "type": "string",
+              "description": "One-sentence description of what this research should accomplish."
+            },
+            "topic": {
+              "type": "string",
+              "description": "Full research topic/question with all necessary context. The research agent starts fresh with no prior conversation history."
+            },
+            "modelId": {
+              "type": "string",
+              "description": "Optional: specific model ID to use for this research (e.g. a more capable model for complex analysis)."
+            }
+          },
+          "required": ["explanation", "topic"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "perform_task",
+        "tags": ["worker", "askaway"],
+        "toolReferenceName": "performTask",
+        "displayName": "Perform Task (Worker)",
+        "modelDescription": "Worker tool. Call to register as worker and receive tasks. First call: pass role ('command'/'subagent'). Subsequent calls: pass result of completed task. Blocks until next task arrives. When response has no task, worker session is done.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(gear)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "role": {
+              "type": "string",
+              "enum": ["command", "subagent"],
+              "description": "Worker role. Set on first call."
+            },
+            "result": {
+              "type": "string",
+              "description": "Result from previous task. Empty on first call."
+            }
+          },
+          "required": []
+        }
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "askAwayContainer",
+          "title": "AskAway",
+          "icon": "media/askaway-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "askAwayContainer": [
+        {
+          "type": "webview",
+          "id": "askAwayView",
+          "name": "AskAway"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AskAway",
+      "properties": {
+        "askaway.mcpEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Always start MCP server on activation. Enable this if you use AskAway with external IDEs like Kiro, Cursor, or Antigravity."
+        },
+        "askaway.mcpAutoStartIfClients": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start MCP server if external client configurations are detected (Kiro, Cursor, Antigravity)."
+        },
+        "askaway.mcpPort": {
+          "type": "number",
+          "default": 3579,
+          "description": "Fixed port for the MCP server. Set to 0 for dynamic port assignment."
+        },
+        "askaway.autoRegisterMcp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically register MCP server with Kiro and other supported clients."
+        },
+        "askaway.autopilot": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Autopilot to automatically respond to ask_user prompts without waiting for your input, using a customizable prompt you can configure in Settings. Queued prompts always take priority over Autopilot responses."
+        },
+        "askaway.autopilotText": {
+          "type": "string",
+          "default": "You are temporarily in autonomous mode and must now make your own decision. If another question arises, be sure to ask it, as autonomous mode is temporary.",
+          "scope": "window",
+          "description": "Text returned when Autopilot is enabled. The agent receives this as an automatic response."
+        },
+        "askaway.autopilotPrompts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "window",
+          "description": "Array of prompts that cycle in order during Autopilot (1→2→3→1...). Each prompt is sent sequentially with human-like delay. When empty, falls back to autopilotText."
+        },
+        "askaway.responseTimeout": {
+          "type": "string",
+          "default": "60",
+          "scope": "window",
+          "enum": [
+            "0",
+            "5",
+            "10",
+            "20",
+            "30",
+            "40",
+            "50",
+            "60",
+            "70",
+            "80",
+            "90",
+            "100",
+            "110",
+            "120",
+            "150",
+            "180",
+            "210",
+            "240"
+          ],
+          "enumDescriptions": [
+            "Disabled (no auto-response)",
+            "5 minutes",
+            "10 minutes",
+            "20 minutes",
+            "30 minutes",
+            "40 minutes",
+            "50 minutes",
+            "60 minutes",
+            "70 minutes",
+            "80 minutes",
+            "90 minutes (1.5 hours)",
+            "100 minutes",
+            "110 minutes",
+            "120 minutes (2 hours)",
+            "150 minutes (2.5 hours)",
+            "180 minutes (3 hours)",
+            "210 minutes (3.5 hours)",
+            "240 minutes (4 hours)"
+          ],
+          "description": "Auto-respond to pending tool calls if user doesn't respond within this time. When Autopilot is enabled, the Autopilot text is sent. When disabled, a session termination message is sent."
+        },
+        "askaway.sessionWarningHours": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 8,
+          "scope": "window",
+          "description": "Show a one-time warning after this many hours (0..8) in the same session. Set to 0 to disable session warning."
+        },
+        "askaway.maxConsecutiveAutoResponses": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 50,
+          "scope": "window",
+          "description": "Maximum consecutive auto-responses (from timeout) before terminating session. Prevents infinite loops."
+        },
+        "askaway.humanLikeDelay": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "description": "Add random human-like delays before auto-responses (Autopilot, Queue, Timeout). Simulates natural reading and typing time."
+        },
+        "askaway.humanLikeDelayMin": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 30,
+          "scope": "window",
+          "description": "Minimum delay in seconds before auto-responses when human-like delay is enabled."
+        },
+        "askaway.humanLikeDelayMax": {
+          "type": "number",
+          "default": 6,
+          "minimum": 2,
+          "maximum": 60,
+          "scope": "window",
+          "description": "Maximum delay in seconds before auto-responses when human-like delay is enabled."
+        },
+        "askaway.sendWithCtrlEnter": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Use Ctrl+Enter (Cmd+Enter on macOS) to send messages instead of Enter."
+        },
+        "askaway.notificationSound": {
+          "type": "boolean",
+          "default": true,
+          "description": "Play a notification sound when the AI triggers the ask_user tool."
+        },
+        "askaway.interactiveApproval": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show interactive approval and choice buttons for Yes/No questions and multiple choice options."
+        },
+
+        "askaway.remoteEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start the Remote UI server on activation. Allows access to AskAway from mobile/web browsers."
+        },
+        "askaway.remotePort": {
+          "type": "number",
+          "default": 3000,
+          "description": "Preferred port for the Remote UI server. Will auto-increment if in use."
+        },
+        "askaway.webex.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Webex integration to post questions and receive answers via a Webex space."
+        },
+        "askaway.webex.tokenFilePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a JSON file containing a Webex access_token (e.g. ~/PycharmProjects/AET/session_data/webex_token.json)."
+        },
+        "askaway.webex.accessToken": {
+          "type": "string",
+          "default": "",
+          "description": "Webex personal access token (used only if tokenFilePath is not set)."
+        },
+        "askaway.webex.roomId": {
+          "type": "string",
+          "default": "",
+          "description": "Webex Room/Space ID where AskAway posts questions. Get this from the Webex API (GET /rooms)."
+        },
+        "askaway.webex.clientId": {
+          "type": "string",
+          "default": "",
+          "description": "Webex Integration Client ID for OAuth token refresh. Get this from developer.webex.com/my-apps."
+        },
+        "askaway.webex.clientSecret": {
+          "type": "string",
+          "default": "",
+          "description": "Webex Integration Client Secret for OAuth token refresh."
+        },
+        "askaway.webex.refreshToken": {
+          "type": "string",
+          "default": "",
+          "description": "Webex OAuth Refresh Token. Used to auto-renew access tokens when they expire. Obtained via the OAuth authorization flow."
+        },
+        "askaway.telegram.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Telegram integration to post questions and receive answers via a Telegram bot."
+        },
+        "askaway.telegram.botToken": {
+          "type": "string",
+          "default": "",
+          "description": "Telegram Bot Token. Create a bot via @BotFather on Telegram to get this."
+        },
+        "askaway.telegram.chatId": {
+          "type": "string",
+          "default": "",
+          "description": "Telegram Chat ID where AskAway posts questions. Use the 'AskAway: Get Telegram Chat ID' command to auto-detect."
+        },
+        "askaway.telegram.retryIntervalSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "maximum": 900,
+          "description": "Telegram reply polling retry interval in seconds after initial quick retries. Increase for lower API traffic, decrease for faster pickup of late replies."
+        },
+        "askaway.telegram.idlePauseMinutes": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 720,
+          "description": "Pause Telegram polling when Copilot is idle for this many minutes. Set to 0 to disable idle pause so replies can still be picked up later."
+        },
+        "askaway.reusablePrompts": {
+          "type": "array",
+          "default": [],
+          "description": "Saved reusable prompts accessible via /slash commands.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Short name for the prompt (used with /slash command)"
+              },
+              "prompt": {
+                "type": "string",
+                "description": "The full prompt text"
+              }
+            },
+            "required": [
+              "name",
+              "prompt"
+            ]
+          }
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "askaway.sendMessage",
+        "title": "AskAway: Send Message"
+      },
+      {
+        "command": "askaway.startMcp",
+        "title": "AskAway: Start MCP Server"
+      },
+      {
+        "command": "askaway.restartMcp",
+        "title": "AskAway: Restart MCP Server"
+      },
+      {
+        "command": "askaway.showMcpConfig",
+        "title": "AskAway: Show MCP Configuration"
+      },
+      {
+        "command": "askaway.openHistory",
+        "title": "View History",
+        "icon": "$(history)"
+      },
+      {
+        "command": "askaway.newSession",
+        "title": "New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "askaway.clearCurrentSession",
+        "title": "Clear Current Session",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "askaway.openSettings",
+        "title": "AskAway Settings",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "askaway.startRemote",
+        "title": "AskAway: Start Remote Server",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "askaway.stopRemote",
+        "title": "AskAway: Stop Remote Server",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "askaway.toggleRemote",
+        "title": "AskAway: Toggle Remote Server",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "askaway.toggleRemoteStart",
+        "title": "AskAway: Start Remote Server",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "askaway.toggleRemoteStop",
+        "title": "AskAway: Remote Server (Running)",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "askaway.showRemoteUrl",
+        "title": "AskAway: Show Remote URL",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "askaway.authorizeWebex",
+        "title": "AskAway: Authorize Webex (OAuth)"
+      },
+      {
+        "command": "askaway.getTelegramChatId",
+        "title": "AskAway: Get Telegram Chat ID"
+      },
+      {
+        "command": "askaway.openPlanBoard",
+        "title": "AskAway: Open Plan Board",
+        "icon": "$(project)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "askaway.toggleRemoteStart",
+          "when": "view == askAwayView && !askaway.remoteServerRunning",
+          "group": "navigation@0"
+        },
+        {
+          "command": "askaway.toggleRemoteStop",
+          "when": "view == askAwayView && askaway.remoteServerRunning",
+          "group": "navigation@0"
+        },
+        {
+          "command": "askaway.newSession",
+          "when": "view == askAwayView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "askaway.openHistory",
+          "when": "view == askAwayView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "askaway.openSettings",
+          "when": "view == askAwayView",
+          "group": "navigation@3"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.js",
+    "compile": "tsc -p ./",
+    "watch": "node esbuild.js --watch",
+    "lint": "eslint src --ext ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.24.3",
+    "@vscode/codicons": "^0.0.36",
+    "express": "^4.21.0",
+    "socket.io": "^4.7.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "20.x",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.7.1",
+    "esbuild": "^0.27.2",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.3"
+  }
+}

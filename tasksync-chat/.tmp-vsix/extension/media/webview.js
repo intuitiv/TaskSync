@@ -1,0 +1,4673 @@
+/**
+ * TaskSync Extension - Webview Script
+ * Handles tool call history, prompt queue, attachments, and file autocomplete
+ */
+(function () {
+    const vscode = acquireVsCodeApi();
+    const WEBVIEW_UI_VERSION = 'workers-tools-hierarchy-v4';
+
+    // Restore persisted state (survives sidebar switch)
+    const previousState = vscode.getState() || {};
+
+    // State
+    let promptQueue = [];
+    let queueEnabled = true; // Default to true (Queue mode ON by default)
+    let planEnabled = false; // Plan mode
+    let dropdownOpen = false;
+    let currentAttachments = previousState.attachments || []; // Restore attachments
+    let selectedCard = 'queue';
+    let currentSessionCalls = []; // Current session tool calls (shown in chat)
+    let persistedHistory = []; // Past sessions history (shown in modal)
+    let pendingToolCall = null;
+    let isProcessingResponse = false; // True when AI is processing user's response
+
+    // Plan board state
+    let currentPlan = null;
+    let planExecuting = false;
+    let proposedSplit = null; // { taskId, subtasks } for pending split review
+    let isApprovalQuestion = false; // True when current pending question is an approval-type question
+    let currentChoices = []; // Parsed choices from multi-choice questions
+
+    // Settings state
+    let soundEnabled = true;
+    let interactiveApprovalEnabled = true;
+    let sendWithCtrlEnter = false;
+    let webexEnabled = false;
+    let telegramEnabled = false;
+    let autopilotEnabled = false;
+    let autopilotText = '';
+    let autopilotPrompts = [];
+    let responseTimeout = 60;
+    let sessionWarningHours = 2;
+    let maxConsecutiveAutoResponses = 5;
+    let debugLoggingEnabled = true;
+    let rtkCompressionEnabled = false;
+    let cavemanEnabled = true;
+    let observabilityMetrics = {
+        requestCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedTokens: 0,
+        nanoAiu: 0,
+        rtkSavedTokens: 0,
+        rtkSavingsPct: 0,
+        source: 'unavailable',
+        updatedAt: 0
+    };
+    // Keep timeout options aligned with select values to avoid invalid UI state.
+    var RESPONSE_TIMEOUT_ALLOWED_VALUES = new Set([0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 150, 180, 210, 240]);
+    var RESPONSE_TIMEOUT_DEFAULT = 60;
+    // Human-like delay: random jitter simulates natural reading/typing time
+    let humanLikeDelayEnabled = true;
+    let humanLikeDelayMin = 2;  // minimum seconds
+    let humanLikeDelayMax = 6;  // maximum seconds
+    let autopilotTextDebounceTimer = null;
+    let lastContextMenuTarget = null; // Tracks where right-click was triggered for copy fallback behavior
+    let lastContextMenuTimestamp = 0; // Ensures stale right-click targets are not reused for copy
+    var CONTEXT_MENU_COPY_MAX_AGE_MS = 30000;
+
+    // Tracks local edits to prevent stale settings overwriting user input mid-typing.
+    let autopilotTextEditVersion = 0;
+    let autopilotTextLastSentVersion = 0;
+    let reusablePrompts = [];
+    let audioUnlocked = false; // Track if audio playback has been unlocked by user gesture
+
+    // Slash command autocomplete state
+    let slashDropdownVisible = false;
+    let slashResults = [];
+    let selectedSlashIndex = -1;
+    let slashStartPos = -1;
+    let slashDebounceTimer = null;
+
+    // Persisted input value (restored from state)
+    let persistedInputValue = previousState.inputValue || '';
+
+    // Edit mode state
+    let editingPromptId = null;
+
+    // ── Voice Mode State ──
+    let voiceMode = false;
+    let voiceTaskId = null;
+    let voiceRecognition = null;   // SpeechRecognition instance
+    let voiceAudioContext = null;  // AudioContext for waveform
+    let voiceAnalyser = null;      // AnalyserNode for waveform data
+    let voiceStream = null;        // MediaStream from mic
+    let voiceAnimationFrame = null;
+    let voiceTranscript = '';      // Accumulated transcript
+    let voiceInterimTranscript = ''; // Current interim result
+    let editingOriginalPrompt = null;
+    let savedInputValue = ''; // Save input value when entering edit mode
+
+    // Autocomplete state
+    let autocompleteVisible = false;
+    let autocompleteResults = [];
+    let selectedAutocompleteIndex = -1;
+    let autocompleteStartPos = -1;
+    let searchDebounceTimer = null;
+
+    // DOM Elements
+    let chatInput, sendBtn, attachBtn, modeBtn, modeDropdown, modeLabel;
+    let inputHighlighter; // Overlay for syntax highlighting in input
+    let queueSection, queueHeader, queueList, queueCount;
+    let chatContainer, chipsContainer, autocompleteDropdown, autocompleteList, autocompleteEmpty;
+    let inputContainer, inputAreaContainer, welcomeSection;
+    let cardVibe, cardSpec, toolHistoryArea, pendingMessage;
+    let historyModal, historyModalOverlay, historyModalList, historyModalClose, historyModalClearAll;
+    // Edit mode elements
+    let actionsLeft, actionsBar, editActionsContainer, editCancelBtn, editConfirmBtn;
+    // Approval modal elements
+    let approvalModal, approvalContinueBtn, approvalNoBtn;
+    // Slash command elements
+    let slashDropdown, slashList, slashEmpty;
+    // Settings modal elements
+    let settingsModal, settingsModalOverlay, settingsModalClose;
+    let soundToggle, interactiveApprovalToggle, sendShortcutToggle, webexToggle, telegramToggle, autopilotEditBtn, autopilotToggle, autopilotTextInput, promptsList, addPromptBtn, addPromptForm;
+    let debugLoggingToggle, rtkCompressionToggle, cavemanToggle;
+    let autopilotPromptsList, autopilotAddBtn, addAutopilotPromptForm, autopilotPromptInput, saveAutopilotPromptBtn, cancelAutopilotPromptBtn;
+    let responseTimeoutSelect, sessionWarningHoursSelect, maxAutoResponsesInput;
+    let humanDelayToggle, humanDelayRangeContainer, humanDelayMinInput, humanDelayMaxInput;
+    let observabilitySessionCalls, observabilityHistoryCount, observabilityPendingCommands, observabilityPendingAgents;
+    let observabilityLlmRequests, observabilityInputTokens, observabilityOutputTokens, observabilityCachedTokens, observabilityCredits, observabilityRtkSaved, observabilityRtkSavings, observabilitySource;
+
+    // ── Worker tab state ──
+    var workerTasks = []; // [{id, role, task, status, createdAt}]
+    var availableModels = []; // [{id, name, vendor, family, maxInputTokens}]
+    var availableTools = []; // [{name, description}]
+    var activeWorkerTaskId = { command: null, subagent: null };
+    var currentTab = 'chat'; // 'chat' | 'commands' | 'subagents' | 'settings'
+
+    function init() {
+        try {
+            console.log('[TaskSync Webview] init() starting...');
+            cacheDOMElements();
+            createHistoryModal();
+            createEditModeUI();
+            createApprovalModal();
+            createSettingsModal();
+            bindEventListeners();
+            initVoiceControls();
+            initWorkerTabs();
+            unlockAudioOnInteraction(); // Enable audio after first user interaction
+            console.log('[TaskSync Webview] Event listeners bound, pendingMessage element:', !!pendingMessage);
+            renderQueue();
+            updateModeUI();
+            updateQueueVisibility();
+            initCardSelection();
+            initPlanBoard();
+
+            // Restore persisted input value (when user switches sidebar tabs and comes back)
+            if (chatInput && persistedInputValue) {
+                chatInput.value = persistedInputValue;
+                autoResizeTextarea();
+                updateInputHighlighter();
+                updateSendButtonState();
+            }
+
+            // Restore attachments display
+            if (currentAttachments.length > 0) {
+                updateChipsDisplay();
+            }
+
+            // Signal to extension that webview is ready to receive messages
+            console.log('[TaskSync Webview] Sending webviewReady message');
+            vscode.postMessage({ type: 'webviewReady', uiVersion: WEBVIEW_UI_VERSION });
+        } catch (err) {
+            console.error('[TaskSync] Init error:', err);
+        }
+    }
+
+    /**
+     * Save webview state to persist across sidebar visibility changes
+     */
+    function saveWebviewState() {
+        vscode.setState({
+            inputValue: chatInput ? chatInput.value : '',
+            attachments: currentAttachments.filter(function (a) { return !a.isTemporary; }) // Don't persist temp images
+        });
+    }
+
+    function cacheDOMElements() {
+        chatInput = document.getElementById('chat-input');
+        inputHighlighter = document.getElementById('input-highlighter');
+        sendBtn = document.getElementById('send-btn');
+        attachBtn = document.getElementById('attach-btn');
+        modeBtn = document.getElementById('mode-btn');
+        modeDropdown = document.getElementById('mode-dropdown');
+        modeLabel = document.getElementById('mode-label');
+
+        queueSection = document.getElementById('queue-section');
+        queueHeader = document.getElementById('queue-header');
+        queueList = document.getElementById('queue-list');
+        queueCount = document.getElementById('queue-count');
+        chatContainer = document.getElementById('chat-container');
+        chipsContainer = document.getElementById('chips-container');
+        autocompleteDropdown = document.getElementById('autocomplete-dropdown');
+        autocompleteList = document.getElementById('autocomplete-list');
+        autocompleteEmpty = document.getElementById('autocomplete-empty');
+        inputContainer = document.getElementById('input-container');
+        inputAreaContainer = document.getElementById('input-area-container');
+        welcomeSection = document.getElementById('welcome-section');
+        cardVibe = document.getElementById('card-vibe');
+        cardSpec = document.getElementById('card-spec');
+        autopilotToggle = document.getElementById('autopilot-toggle');
+        toolHistoryArea = document.getElementById('tool-history-area');
+        pendingMessage = document.getElementById('pending-message');
+        // Slash command dropdown
+        slashDropdown = document.getElementById('slash-dropdown');
+        slashList = document.getElementById('slash-list');
+        slashEmpty = document.getElementById('slash-empty');
+        // Get actions bar elements for edit mode
+        actionsBar = document.querySelector('.actions-bar');
+        actionsLeft = document.querySelector('.actions-left');
+    }
+
+    function createHistoryModal() {
+        // Create modal overlay
+        historyModalOverlay = document.createElement('div');
+        historyModalOverlay.className = 'history-modal-overlay hidden';
+        historyModalOverlay.id = 'history-modal-overlay';
+
+        // Create modal container
+        historyModal = document.createElement('div');
+        historyModal.className = 'history-modal';
+        historyModal.id = 'history-modal';
+
+        // Modal header
+        var modalHeader = document.createElement('div');
+        modalHeader.className = 'history-modal-header';
+
+        var titleSpan = document.createElement('span');
+        titleSpan.className = 'history-modal-title';
+        titleSpan.textContent = 'History';
+        modalHeader.appendChild(titleSpan);
+
+        // Info text - left aligned after title
+        var infoSpan = document.createElement('span');
+        infoSpan.className = 'history-modal-info';
+        infoSpan.textContent = 'History is stored in VS Code globalStorage/tool-history.json';
+        modalHeader.appendChild(infoSpan);
+
+        // Clear all button (icon only)
+        historyModalClearAll = document.createElement('button');
+        historyModalClearAll.className = 'history-modal-clear-btn';
+        historyModalClearAll.innerHTML = '<span class="codicon codicon-trash"></span>';
+        historyModalClearAll.title = 'Clear all history';
+        modalHeader.appendChild(historyModalClearAll);
+
+        // Close button
+        historyModalClose = document.createElement('button');
+        historyModalClose.className = 'history-modal-close-btn';
+        historyModalClose.innerHTML = '<span class="codicon codicon-close"></span>';
+        historyModalClose.title = 'Close';
+        modalHeader.appendChild(historyModalClose);
+
+        // Modal body (list)
+        historyModalList = document.createElement('div');
+        historyModalList.className = 'history-modal-list';
+        historyModalList.id = 'history-modal-list';
+
+        // Assemble modal
+        historyModal.appendChild(modalHeader);
+        historyModal.appendChild(historyModalList);
+        historyModalOverlay.appendChild(historyModal);
+
+        // Add to DOM
+        document.body.appendChild(historyModalOverlay);
+    }
+
+    function createEditModeUI() {
+        // Create edit actions container (hidden by default)
+        editActionsContainer = document.createElement('div');
+        editActionsContainer.className = 'edit-actions-container hidden';
+        editActionsContainer.id = 'edit-actions-container';
+
+        // Edit mode label
+        var editLabel = document.createElement('span');
+        editLabel.className = 'edit-mode-label';
+        editLabel.textContent = 'Editing prompt';
+
+        // Cancel button (X)
+        editCancelBtn = document.createElement('button');
+        editCancelBtn.className = 'icon-btn edit-cancel-btn';
+        editCancelBtn.title = 'Cancel edit (Esc)';
+        editCancelBtn.setAttribute('aria-label', 'Cancel editing');
+        editCancelBtn.innerHTML = '<span class="codicon codicon-close"></span>';
+
+        // Confirm button (✓)
+        editConfirmBtn = document.createElement('button');
+        editConfirmBtn.className = 'icon-btn edit-confirm-btn';
+        editConfirmBtn.title = 'Confirm edit (Enter)';
+        editConfirmBtn.setAttribute('aria-label', 'Confirm edit');
+        editConfirmBtn.innerHTML = '<span class="codicon codicon-check"></span>';
+
+        // Assemble edit actions
+        editActionsContainer.appendChild(editLabel);
+        var btnGroup = document.createElement('div');
+        btnGroup.className = 'edit-btn-group';
+        btnGroup.appendChild(editCancelBtn);
+        btnGroup.appendChild(editConfirmBtn);
+        editActionsContainer.appendChild(btnGroup);
+
+        // Insert into actions bar (will be shown/hidden as needed)
+        if (actionsBar) {
+            actionsBar.appendChild(editActionsContainer);
+        }
+    }
+
+    function createApprovalModal() {
+        // Create approval bar that appears at the top of input-wrapper (inside the border)
+        approvalModal = document.createElement('div');
+        approvalModal.className = 'approval-bar hidden';
+        approvalModal.id = 'approval-bar';
+        approvalModal.setAttribute('role', 'toolbar');
+        approvalModal.setAttribute('aria-label', 'Quick approval options');
+
+        // Left side label
+        var labelSpan = document.createElement('span');
+        labelSpan.className = 'approval-label';
+        labelSpan.textContent = 'Waiting on your input..';
+
+        // Right side buttons container
+        var buttonsContainer = document.createElement('div');
+        buttonsContainer.className = 'approval-buttons';
+
+        // No/Reject button (secondary action - text only)
+        approvalNoBtn = document.createElement('button');
+        approvalNoBtn.className = 'approval-btn approval-reject-btn';
+        approvalNoBtn.setAttribute('aria-label', 'Reject and provide custom response');
+        approvalNoBtn.textContent = 'No';
+
+        // Continue/Accept button (primary action)
+        approvalContinueBtn = document.createElement('button');
+        approvalContinueBtn.className = 'approval-btn approval-accept-btn';
+        approvalContinueBtn.setAttribute('aria-label', 'Yes and continue');
+        approvalContinueBtn.textContent = 'Yes';
+
+        // Assemble buttons
+        buttonsContainer.appendChild(approvalNoBtn);
+        buttonsContainer.appendChild(approvalContinueBtn);
+
+        // Assemble bar
+        approvalModal.appendChild(labelSpan);
+        approvalModal.appendChild(buttonsContainer);
+
+        // Insert at top of input-wrapper (inside the border)
+        var inputWrapper = document.getElementById('input-wrapper');
+        if (inputWrapper) {
+            inputWrapper.insertBefore(approvalModal, inputWrapper.firstChild);
+        }
+    }
+
+    function createSettingsModal() {
+        var settingsHost = document.getElementById('settings-tab-shell');
+        if (!settingsHost) return;
+
+        settingsModalOverlay = null;
+
+        settingsModal = document.createElement('div');
+        settingsModal.className = 'settings-tab-content';
+        settingsModal.id = 'settings-modal';
+        settingsModal.setAttribute('role', 'region');
+        settingsModal.setAttribute('aria-labelledby', 'settings-modal-title');
+
+        // Modal header
+        var modalHeader = document.createElement('div');
+        modalHeader.className = 'settings-modal-header';
+
+        var titleSpan = document.createElement('span');
+        titleSpan.className = 'settings-modal-title';
+        titleSpan.id = 'settings-modal-title';
+        titleSpan.textContent = 'Settings';
+        modalHeader.appendChild(titleSpan);
+
+        // Header buttons container
+        var headerButtons = document.createElement('div');
+        headerButtons.className = 'settings-modal-header-buttons';
+
+        // Report Issue button
+        var reportBtn = document.createElement('button');
+        reportBtn.className = 'settings-modal-header-btn';
+        reportBtn.innerHTML = '<span class="codicon codicon-report"></span>';
+        reportBtn.title = 'Report Issue';
+        reportBtn.setAttribute('aria-label', 'Report an issue on GitHub');
+        reportBtn.addEventListener('click', function () {
+            vscode.postMessage({ type: 'openExternal', url: 'https://github.com/intuitiv/TaskSync/issues/new' });
+        });
+        headerButtons.appendChild(reportBtn);
+
+        settingsModalClose = null;
+
+        modalHeader.appendChild(headerButtons);
+
+        // Modal content
+        var modalContent = document.createElement('div');
+        modalContent.className = 'settings-modal-content';
+
+        // Sound section - simplified, toggle right next to header
+        var soundSection = document.createElement('div');
+        soundSection.className = 'settings-section';
+        soundSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-unmute"></span> Notifications</div>' +
+            '<div class="toggle-switch active" id="sound-toggle" role="switch" aria-checked="true" aria-label="Enable notification sound" tabindex="0"></div>' +
+            '</div>';
+        modalContent.appendChild(soundSection);
+
+        // Optimization controls
+        var optimizationHeader = document.createElement('div');
+        optimizationHeader.className = 'settings-section';
+        optimizationHeader.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title" style="font-size:12px;opacity:0.6;text-transform:uppercase;letter-spacing:0.5px;"><span class="codicon codicon-graph"></span> Optimization</div>' +
+            '</div>';
+        modalContent.appendChild(optimizationHeader);
+
+        var debugLoggingSection = document.createElement('div');
+        debugLoggingSection.className = 'settings-section';
+        debugLoggingSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-bug"></span> Copilot Debug Logging</div>' +
+            '<div class="toggle-switch active" id="debug-logging-toggle" role="switch" aria-checked="true" aria-label="Enable Copilot debug logging" tabindex="0"></div>' +
+            '</div>';
+        modalContent.appendChild(debugLoggingSection);
+
+        var rtkSection = document.createElement('div');
+        rtkSection.className = 'settings-section';
+        rtkSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-server-process"></span> RTK Command Compression</div>' +
+            '<div class="toggle-switch" id="rtk-compression-toggle" role="switch" aria-checked="false" aria-label="Enable RTK command compression" tabindex="0"></div>' +
+            '</div>';
+        modalContent.appendChild(rtkSection);
+
+        var cavemanSection = document.createElement('div');
+        cavemanSection.className = 'settings-section';
+        cavemanSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-symbol-string"></span> Caveman Commentary</div>' +
+            '<div class="toggle-switch active" id="caveman-toggle" role="switch" aria-checked="true" aria-label="Enable caveman commentary style" tabindex="0"></div>' +
+            '</div>';
+        modalContent.appendChild(cavemanSection);
+
+        var observabilitySection = document.createElement('div');
+        observabilitySection.className = 'settings-section';
+        observabilitySection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-pulse"></span> Observability</div>' +
+            '</div>' +
+            '<div class="observability-scope-note">Workspace-scoped \u2014 all conversations + sub-agents in this workspace session</div>' +
+            '<div class="observability-grid">' +
+            '<div class="observability-card"><div class="observability-label">LLM Requests</div><div class="observability-value" id="observability-llm-requests">0</div><div class="observability-subtext">All requests incl. sub-agents</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Input Tokens</div><div class="observability-value" id="observability-input-tokens">0</div><div class="observability-subtext">All requests incl. sub-agents</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Output Tokens</div><div class="observability-value" id="observability-output-tokens">0</div><div class="observability-subtext">All requests incl. sub-agents</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Cached Tokens</div><div class="observability-value" id="observability-cached-tokens">0</div><div class="observability-subtext">All requests incl. sub-agents</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Credits (AIU)</div><div class="observability-value" id="observability-credits">0</div><div class="observability-subtext">All requests incl. sub-agents</div></div>' +
+            '<div class="observability-card"><div class="observability-label">RTK Saved Tokens</div><div class="observability-value" id="observability-rtk-saved">0</div><div class="observability-subtext">From rtk gain summary.total_saved</div></div>' +
+            '<div class="observability-card"><div class="observability-label">RTK Savings %</div><div class="observability-value" id="observability-rtk-savings">0%</div><div class="observability-subtext">From rtk gain summary.avg_savings_pct</div></div>' +
+            '</div>' +
+            '<details class="settings-debug-details">' +
+            '<summary>Debug Details</summary>' +
+            '<div class="observability-grid debug-observability-grid">' +
+            '<div class="observability-card"><div class="observability-label">Session Calls</div><div class="observability-value" id="observability-session-calls">0</div><div class="observability-subtext">Current AskAway exchange count</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Saved History</div><div class="observability-value" id="observability-history-count">0</div><div class="observability-subtext">Persisted conversation records</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Pending Commands</div><div class="observability-value" id="observability-pending-commands">0</div><div class="observability-subtext">Worker queue items waiting to run</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Pending Agents</div><div class="observability-value" id="observability-pending-agents">0</div><div class="observability-subtext">Research tasks waiting in queue</div></div>' +
+            '<div class="observability-card"><div class="observability-label">Log Source</div><div class="observability-value" id="observability-source">unavailable</div><div class="observability-subtext">Latest debug-log session folder</div></div>' +
+            '</div>' +
+            '</details>';
+        modalContent.appendChild(observabilitySection);
+
+        // Interactive approval section - toggle interactive Yes/No + choices UI
+        var approvalSection = document.createElement('div');
+        approvalSection.className = 'settings-section';
+        approvalSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-checklist"></span> Interactive Approvals</div>' +
+            '<div class="toggle-switch active" id="interactive-approval-toggle" role="switch" aria-checked="true" aria-label="Enable interactive approval and choice buttons" tabindex="0"></div>' +
+            '</div>';
+
+        // Send shortcut section - switch between Enter and Ctrl/Cmd+Enter send
+        var sendShortcutSection = document.createElement('div');
+        sendShortcutSection.className = 'settings-section';
+        sendShortcutSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-keyboard"></span> Ctrl/Cmd+Enter to Send</div>' +
+            '<div class="toggle-switch" id="send-shortcut-toggle" role="switch" aria-checked="false" aria-label="Use Ctrl/Cmd+Enter to send messages" tabindex="0"></div>' +
+            '</div>';
+        modalContent.appendChild(sendShortcutSection);
+
+        // Autopilot section with cycling prompts list
+        var autopilotSection = document.createElement('div');
+        autopilotSection.className = 'settings-section';
+        autopilotSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-rocket"></span> Autopilot Prompts' +
+            '<span class="settings-info-icon" title="Prompts cycle in order (1→2→3→1...) with human-like delay.\n\nHow it works:\n• The agent calls ask_user → Autopilot sends the next prompt in sequence\n• Add multiple prompts to alternate between different instructions\n• Drag to reorder, edit or delete individual prompts\n\nQueue Priority:\n• Queued prompts ALWAYS take priority over Autopilot\n• Autopilot only activates when the queue is empty">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '<button class="add-prompt-btn-inline" id="autopilot-add-btn" title="Add Autopilot prompt" aria-label="Add Autopilot prompt"><span class="codicon codicon-add"></span></button>' +
+            '</div>' +
+            '<div class="autopilot-prompts-list" id="autopilot-prompts-list"></div>' +
+            '<div class="add-autopilot-prompt-form hidden" id="add-autopilot-prompt-form">' +
+            '<div class="form-row">' +
+            '<textarea class="form-input form-textarea" id="autopilot-prompt-input" placeholder="Enter Autopilot prompt text..." maxlength="2000"></textarea>' +
+            '</div>' +
+            '<div class="form-actions">' +
+            '<button class="form-btn form-btn-cancel" id="cancel-autopilot-prompt-btn">Cancel</button>' +
+            '<button class="form-btn form-btn-save" id="save-autopilot-prompt-btn">Save</button>' +
+            '</div>' +
+            '</div>';
+
+        // Response Timeout section - dropdown for timeout minutes
+        var timeoutSection = document.createElement('div');
+        timeoutSection.className = 'settings-section';
+        timeoutSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-clock"></span> Response Timeout' +
+            '<span class="settings-info-icon" title="If no response is received within this time, it will automatically send the session termination message.">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '</div>' +
+            '<div class="form-row">' +
+            '<select class="form-input form-select" id="response-timeout-select">' +
+            '<option value="0">Disabled</option>' +
+            '<option value="5">5 minutes</option>' +
+            '<option value="10">10 minutes</option>' +
+            '<option value="20">20 minutes</option>' +
+            '<option value="30">30 minutes</option>' +
+            '<option value="40">40 minutes</option>' +
+            '<option value="50">50 minutes</option>' +
+            '<option value="60">60 minutes (default)</option>' +
+            '<option value="70">70 minutes</option>' +
+            '<option value="80">80 minutes</option>' +
+            '<option value="90">90 minutes</option>' +
+            '<option value="100">100 minutes</option>' +
+            '<option value="110">110 minutes</option>' +
+            '<option value="120">120 minutes (2h)</option>' +
+            '<option value="150">150 minutes (2.5h)</option>' +
+            '<option value="180">180 minutes (3h)</option>' +
+            '<option value="210">210 minutes (3.5h)</option>' +
+            '<option value="240">240 minutes (4h)</option>' +
+            '</select>' +
+            '</div>';
+
+        // Session Warning section - warning threshold in hours
+        var sessionWarningSection = document.createElement('div');
+        sessionWarningSection.className = 'settings-section';
+        sessionWarningSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-watch"></span> Session Warning' +
+            '<span class="settings-info-icon" title="Show a one-time warning after this many hours in the same session. Set to 0 to disable.">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '</div>' +
+            '<div class="form-row">' +
+            '<select class="form-input form-select" id="session-warning-hours-select">' +
+            '<option value="0">Disabled</option>' +
+            '<option value="1">1 hour</option>' +
+            '<option value="2">2 hours</option>' +
+            '<option value="3">3 hours</option>' +
+            '<option value="4">4 hours</option>' +
+            '<option value="5">5 hours</option>' +
+            '<option value="6">6 hours</option>' +
+            '<option value="7">7 hours</option>' +
+            '<option value="8">8 hours</option>' +
+            '</select>' +
+            '</div>';
+
+        // Max Consecutive Auto-Responses section - number input
+        var maxAutoSection = document.createElement('div');
+        maxAutoSection.className = 'settings-section';
+        maxAutoSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-stop-circle"></span> Max Auto-Responses' +
+            '<span class="settings-info-icon" title="Maximum consecutive auto-responses using Autopilot before pausing and requiring manual input. Prevents infinite loops.">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '</div>' +
+            '<div class="form-row">' +
+            '<input type="number" class="form-input" id="max-auto-responses-input" min="1" max="50" value="5" />' +
+            '</div>';
+
+        // Human-Like Delay section - toggle + min/max inputs
+        var humanDelaySection = document.createElement('div');
+        humanDelaySection.className = 'settings-section';
+        humanDelaySection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-pulse"></span> Human-Like Delay' +
+            '<span class="settings-info-icon" title="Add random delays (2-6s by default) before auto-responses. Simulates natural pacing for automated responses.">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '<div class="toggle-switch active" id="human-delay-toggle" role="switch" aria-checked="true" aria-label="Toggle Human-Like Delay" tabindex="0"></div>' +
+            '</div>' +
+            '<div class="form-row human-delay-range" id="human-delay-range">' +
+            '<label class="form-label-inline">Min (s):</label>' +
+            '<input type="number" class="form-input form-input-small" id="human-delay-min-input" min="1" max="30" value="2" />' +
+            '<label class="form-label-inline">Max (s):</label>' +
+            '<input type="number" class="form-input form-input-small" id="human-delay-max-input" min="2" max="60" value="6" />' +
+            '</div>';
+
+        // Integrations header
+        var integrationsHeader = document.createElement('div');
+        integrationsHeader.className = 'settings-section';
+        integrationsHeader.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title" style="font-size:12px;opacity:0.6;text-transform:uppercase;letter-spacing:0.5px;"><span class="codicon codicon-plug"></span> Integrations</div>' +
+            '</div>';
+        modalContent.appendChild(integrationsHeader);
+
+        // Webex integration toggle
+        var webexSection = document.createElement('div');
+        webexSection.className = 'settings-section';
+        webexSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-broadcast"></span> Webex</div>' +
+            '<div class="toggle-switch" id="webex-toggle" role="switch" aria-checked="false" aria-label="Enable Webex integration" tabindex="0"></div>' +
+            '</div>' +
+            '<div class="settings-status" id="webex-status"></div>';
+        modalContent.appendChild(webexSection);
+
+        // Telegram integration toggle
+        var telegramSection = document.createElement('div');
+        telegramSection.className = 'settings-section';
+        telegramSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-comment-discussion"></span> Telegram</div>' +
+            '<div class="toggle-switch" id="telegram-toggle" role="switch" aria-checked="false" aria-label="Enable Telegram integration" tabindex="0"></div>' +
+            '</div>' +
+            '<div class="settings-status" id="telegram-status"></div>';
+        modalContent.appendChild(telegramSection);
+
+        // Reusable Prompts section - plus button next to title
+        var promptsSection = document.createElement('div');
+        promptsSection.className = 'settings-section';
+        promptsSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title"><span class="codicon codicon-symbol-keyword"></span> Reusable Prompts</div>' +
+            '<button class="add-prompt-btn-inline" id="add-prompt-btn" title="Add Prompt" aria-label="Add reusable prompt"><span class="codicon codicon-add"></span></button>' +
+            '</div>' +
+            '<div class="prompts-list" id="prompts-list"></div>' +
+            '<div class="add-prompt-form hidden" id="add-prompt-form">' +
+            '<div class="form-row"><label class="form-label" for="prompt-name-input">Name (used as /command)</label>' +
+            '<input type="text" class="form-input" id="prompt-name-input" placeholder="e.g., fix, test, refactor" maxlength="30"></div>' +
+            '<div class="form-row"><label class="form-label" for="prompt-text-input">Prompt Text</label>' +
+            '<textarea class="form-input form-textarea" id="prompt-text-input" placeholder="Enter the full prompt text..." maxlength="2000"></textarea></div>' +
+            '<div class="form-actions">' +
+            '<button class="form-btn form-btn-cancel" id="cancel-prompt-btn">Cancel</button>' +
+            '<button class="form-btn form-btn-save" id="save-prompt-btn">Save</button></div></div>';
+
+        // Assemble settings panel
+        settingsModal.appendChild(modalHeader);
+        settingsModal.appendChild(modalContent);
+        settingsHost.innerHTML = '';
+        settingsHost.appendChild(settingsModal);
+
+        // Cache inner elements
+        soundToggle = document.getElementById('sound-toggle');
+        interactiveApprovalToggle = document.getElementById('interactive-approval-toggle');
+        sendShortcutToggle = document.getElementById('send-shortcut-toggle');
+        webexToggle = document.getElementById('webex-toggle');
+        telegramToggle = document.getElementById('telegram-toggle');
+        autopilotPromptsList = document.getElementById('autopilot-prompts-list');
+        autopilotAddBtn = document.getElementById('autopilot-add-btn');
+        addAutopilotPromptForm = document.getElementById('add-autopilot-prompt-form');
+        autopilotPromptInput = document.getElementById('autopilot-prompt-input');
+        saveAutopilotPromptBtn = document.getElementById('save-autopilot-prompt-btn');
+        cancelAutopilotPromptBtn = document.getElementById('cancel-autopilot-prompt-btn');
+        responseTimeoutSelect = document.getElementById('response-timeout-select');
+        sessionWarningHoursSelect = document.getElementById('session-warning-hours-select');
+        maxAutoResponsesInput = document.getElementById('max-auto-responses-input');
+        humanDelayToggle = document.getElementById('human-delay-toggle');
+        humanDelayRangeContainer = document.getElementById('human-delay-range');
+        humanDelayMinInput = document.getElementById('human-delay-min-input');
+        humanDelayMaxInput = document.getElementById('human-delay-max-input');
+        promptsList = document.getElementById('prompts-list');
+        addPromptBtn = document.getElementById('add-prompt-btn');
+        addPromptForm = document.getElementById('add-prompt-form');
+        debugLoggingToggle = document.getElementById('debug-logging-toggle');
+        rtkCompressionToggle = document.getElementById('rtk-compression-toggle');
+        cavemanToggle = document.getElementById('caveman-toggle');
+        observabilitySessionCalls = document.getElementById('observability-session-calls');
+        observabilityHistoryCount = document.getElementById('observability-history-count');
+        observabilityPendingCommands = document.getElementById('observability-pending-commands');
+        observabilityPendingAgents = document.getElementById('observability-pending-agents');
+        observabilityLlmRequests = document.getElementById('observability-llm-requests');
+        observabilityInputTokens = document.getElementById('observability-input-tokens');
+        observabilityOutputTokens = document.getElementById('observability-output-tokens');
+        observabilityCachedTokens = document.getElementById('observability-cached-tokens');
+        observabilityCredits = document.getElementById('observability-credits');
+        observabilityRtkSaved = document.getElementById('observability-rtk-saved');
+        observabilityRtkSavings = document.getElementById('observability-rtk-savings');
+        observabilitySource = document.getElementById('observability-source');
+    }
+
+    function bindEventListeners() {
+        if (chatInput) {
+            chatInput.addEventListener('input', handleTextareaInput);
+            chatInput.addEventListener('keydown', handleTextareaKeydown);
+            chatInput.addEventListener('paste', handlePaste);
+            // Sync scroll between textarea and highlighter
+            chatInput.addEventListener('scroll', function () {
+                if (inputHighlighter) {
+                    inputHighlighter.scrollTop = chatInput.scrollTop;
+                }
+            });
+        }
+        if (sendBtn) sendBtn.addEventListener('click', handleSend);
+        if (attachBtn) attachBtn.addEventListener('click', handleAttach);
+        if (modeBtn) modeBtn.addEventListener('click', toggleModeDropdown);
+
+        document.querySelectorAll('.mode-option[data-mode]').forEach(function (option) {
+            option.addEventListener('click', function () {
+                setMode(option.getAttribute('data-mode'), true);
+                closeModeDropdown();
+            });
+        });
+
+        document.addEventListener('click', function (e) {
+            if (dropdownOpen && !e.target.closest('.mode-selector') && !e.target.closest('.mode-dropdown')) closeModeDropdown();
+            if (autocompleteVisible && !e.target.closest('.autocomplete-dropdown') && !e.target.closest('#chat-input')) hideAutocomplete();
+            if (slashDropdownVisible && !e.target.closest('.slash-dropdown') && !e.target.closest('#chat-input')) hideSlashDropdown();
+        });
+
+        if (queueHeader) queueHeader.addEventListener('click', handleQueueHeaderClick);
+        if (historyModalClose) historyModalClose.addEventListener('click', closeHistoryModal);
+        if (historyModalClearAll) historyModalClearAll.addEventListener('click', clearAllPersistedHistory);
+        if (historyModalOverlay) {
+            historyModalOverlay.addEventListener('click', function (e) {
+                if (e.target === historyModalOverlay) closeHistoryModal();
+            });
+        }
+        // Edit mode button events
+        if (editCancelBtn) editCancelBtn.addEventListener('click', cancelEditMode);
+        if (editConfirmBtn) editConfirmBtn.addEventListener('click', confirmEditMode);
+
+        // Approval modal button events
+        if (approvalContinueBtn) approvalContinueBtn.addEventListener('click', handleApprovalContinue);
+        if (approvalNoBtn) approvalNoBtn.addEventListener('click', handleApprovalNo);
+
+        // Settings modal events
+        if (settingsModalClose) settingsModalClose.addEventListener('click', closeSettingsModal);
+        if (settingsModalOverlay) {
+            settingsModalOverlay.addEventListener('click', function (e) {
+                if (e.target === settingsModalOverlay) closeSettingsModal();
+            });
+        }
+        if (soundToggle) {
+            soundToggle.addEventListener('click', toggleSoundSetting);
+            soundToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleSoundSetting();
+                }
+            });
+        }
+        if (interactiveApprovalToggle) {
+            interactiveApprovalToggle.addEventListener('click', toggleInteractiveApprovalSetting);
+            interactiveApprovalToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleInteractiveApprovalSetting();
+                }
+            });
+        }
+        if (sendShortcutToggle) {
+            sendShortcutToggle.addEventListener('click', toggleSendWithCtrlEnterSetting);
+            sendShortcutToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleSendWithCtrlEnterSetting();
+                }
+            });
+        }
+        if (debugLoggingToggle) {
+            debugLoggingToggle.addEventListener('click', toggleDebugLoggingSetting);
+            debugLoggingToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleDebugLoggingSetting();
+                }
+            });
+        }
+        if (rtkCompressionToggle) {
+            rtkCompressionToggle.addEventListener('click', toggleRtkCompressionSetting);
+            rtkCompressionToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleRtkCompressionSetting();
+                }
+            });
+        }
+        if (cavemanToggle) {
+            cavemanToggle.addEventListener('click', toggleCavemanSetting);
+            cavemanToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleCavemanSetting();
+                }
+            });
+        }
+        if (webexToggle) {
+            webexToggle.addEventListener('click', toggleWebexSetting);
+            webexToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleWebexSetting();
+                }
+            });
+        }
+        if (telegramToggle) {
+            telegramToggle.addEventListener('click', toggleTelegramSetting);
+            telegramToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleTelegramSetting();
+                }
+            });
+        }
+        if (autopilotToggle) {
+            autopilotToggle.addEventListener('click', toggleAutopilotSetting);
+            autopilotToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleAutopilotSetting();
+                }
+            });
+        }
+        // Autopilot prompts list event listeners
+        if (autopilotAddBtn) {
+            autopilotAddBtn.addEventListener('click', showAddAutopilotPromptForm);
+        }
+        if (saveAutopilotPromptBtn) {
+            saveAutopilotPromptBtn.addEventListener('click', saveAutopilotPrompt);
+        }
+        if (cancelAutopilotPromptBtn) {
+            cancelAutopilotPromptBtn.addEventListener('click', hideAddAutopilotPromptForm);
+        }
+        if (autopilotPromptsList) {
+            autopilotPromptsList.addEventListener('click', handleAutopilotPromptsListClick);
+            // Drag and drop for reordering
+            autopilotPromptsList.addEventListener('dragstart', handleAutopilotDragStart);
+            autopilotPromptsList.addEventListener('dragover', handleAutopilotDragOver);
+            autopilotPromptsList.addEventListener('dragend', handleAutopilotDragEnd);
+            autopilotPromptsList.addEventListener('drop', handleAutopilotDrop);
+        }
+        if (responseTimeoutSelect) {
+            responseTimeoutSelect.addEventListener('change', handleResponseTimeoutChange);
+        }
+        if (sessionWarningHoursSelect) {
+            sessionWarningHoursSelect.addEventListener('change', handleSessionWarningHoursChange);
+        }
+        if (maxAutoResponsesInput) {
+            maxAutoResponsesInput.addEventListener('change', handleMaxAutoResponsesChange);
+            maxAutoResponsesInput.addEventListener('blur', handleMaxAutoResponsesChange);
+        }
+        if (humanDelayToggle) {
+            humanDelayToggle.addEventListener('click', toggleHumanDelaySetting);
+            humanDelayToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleHumanDelaySetting();
+                }
+            });
+        }
+        if (humanDelayMinInput) {
+            humanDelayMinInput.addEventListener('change', handleHumanDelayMinChange);
+            humanDelayMinInput.addEventListener('blur', handleHumanDelayMinChange);
+        }
+        if (humanDelayMaxInput) {
+            humanDelayMaxInput.addEventListener('change', handleHumanDelayMaxChange);
+            humanDelayMaxInput.addEventListener('blur', handleHumanDelayMaxChange);
+        }
+        if (addPromptBtn) addPromptBtn.addEventListener('click', showAddPromptForm);
+        // Add prompt form events (deferred - bind after modal created)
+        var cancelPromptBtn = document.getElementById('cancel-prompt-btn');
+        var savePromptBtn = document.getElementById('save-prompt-btn');
+        if (cancelPromptBtn) cancelPromptBtn.addEventListener('click', hideAddPromptForm);
+        if (savePromptBtn) savePromptBtn.addEventListener('click', saveNewPrompt);
+
+        // Context menu and copy handling
+        document.addEventListener('contextmenu', handleContextMenu);
+        document.addEventListener('copy', handleCopy);
+
+        window.addEventListener('message', handleExtensionMessage);
+    }
+
+    function openHistoryModal() {
+        if (!historyModalOverlay) return;
+        // Request persisted history from extension
+        vscode.postMessage({ type: 'openHistoryModal' });
+        historyModalOverlay.classList.remove('hidden');
+    }
+
+    function closeHistoryModal() {
+        if (!historyModalOverlay) return;
+        historyModalOverlay.classList.add('hidden');
+    }
+
+    function clearAllPersistedHistory() {
+        if (persistedHistory.length === 0) return;
+        vscode.postMessage({ type: 'clearPersistedHistory' });
+        persistedHistory = [];
+        renderHistoryModal();
+    }
+
+    function initCardSelection() {
+        if (cardVibe) {
+            cardVibe.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                selectCard('normal', true);
+            });
+        }
+        if (cardSpec) {
+            cardSpec.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                selectCard('queue', true);
+            });
+        }
+        var cardPlan = document.getElementById('card-plan');
+        if (cardPlan) {
+            cardPlan.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                selectCard('plan', true);
+            });
+        }
+        // Don't set default here - wait for updateQueue message from extension
+        // which contains the persisted enabled state
+        updateCardSelection();
+    }
+
+    function selectCard(card, notify) {
+        selectedCard = card;
+        queueEnabled = card === 'queue';
+        planEnabled = card === 'plan';
+        updateCardSelection();
+        updateModeUI();
+        updateQueueVisibility();
+        updatePlanBoardVisibility();
+
+        // Only notify extension if user clicked (not on init from persisted state)
+        if (notify) {
+            if (planEnabled) {
+                vscode.postMessage({ type: 'planSetMode', enabled: true });
+                // Plan mode uses the queue to feed tasks to Copilot — keep it enabled
+                vscode.postMessage({ type: 'toggleQueue', enabled: true });
+            } else {
+                vscode.postMessage({ type: 'planSetMode', enabled: false });
+                vscode.postMessage({ type: 'toggleQueue', enabled: queueEnabled });
+            }
+        }
+    }
+
+    function updateCardSelection() {
+        // card-vibe = Normal mode, card-spec = Queue mode, card-plan = Plan mode
+        if (cardVibe) cardVibe.classList.toggle('selected', selectedCard === 'normal');
+        if (cardSpec) cardSpec.classList.toggle('selected', selectedCard === 'queue');
+        var cardPlan = document.getElementById('card-plan');
+        if (cardPlan) cardPlan.classList.toggle('selected', selectedCard === 'plan');
+    }
+
+    function autoResizeTextarea() {
+        if (!chatInput) return;
+        chatInput.style.height = 'auto';
+        chatInput.style.height = Math.min(chatInput.scrollHeight, 150) + 'px';
+    }
+
+    /**
+     * Update the input highlighter overlay to show syntax highlighting
+     * for slash commands (/command) and file references (#file)
+     */
+    function updateInputHighlighter() {
+        if (!inputHighlighter || !chatInput) return;
+
+        var text = chatInput.value;
+        if (!text) {
+            inputHighlighter.innerHTML = '';
+            return;
+        }
+
+        // Build a list of known slash command names for exact matching
+        var knownSlashNames = reusablePrompts.map(function (p) { return p.name; });
+        // Also add any pending stored mappings
+        var mappings = chatInput._slashPrompts || {};
+        Object.keys(mappings).forEach(function (name) {
+            if (knownSlashNames.indexOf(name) === -1) knownSlashNames.push(name);
+        });
+
+        // Escape HTML first
+        var html = escapeHtml(text);
+
+        // Highlight slash commands - match /word patterns
+        // Only highlight if it's a known command OR any /word pattern
+        html = html.replace(/(^|\s)(\/[a-zA-Z0-9_-]+)(\s|$)/g, function (match, before, slash, after) {
+            var cmdName = slash.substring(1); // Remove the /
+            // Highlight if it's a known command or if we have prompts defined
+            if (knownSlashNames.length === 0 || knownSlashNames.indexOf(cmdName) >= 0) {
+                return before + '<span class="slash-highlight">' + slash + '</span>' + after;
+            }
+            // Still highlight as generic slash command
+            return before + '<span class="slash-highlight">' + slash + '</span>' + after;
+        });
+
+        // Highlight file references - match #word patterns
+        html = html.replace(/(^|\s)(#[a-zA-Z0-9_.\/-]+)(\s|$)/g, function (match, before, hash, after) {
+            return before + '<span class="hash-highlight">' + hash + '</span>' + after;
+        });
+
+        // Don't add trailing space - causes visual artifacts
+        // html += '&nbsp;';
+
+        inputHighlighter.innerHTML = html;
+
+        // Sync scroll position
+        inputHighlighter.scrollTop = chatInput.scrollTop;
+    }
+
+    function handleTextareaInput() {
+        autoResizeTextarea();
+        updateInputHighlighter();
+        handleAutocomplete();
+        handleSlashCommands();
+        // Context items (#terminal, #problems) now handled via handleAutocomplete()
+        syncAttachmentsWithText();
+        updateSendButtonState();
+        // Persist input value so it survives sidebar tab switches
+        saveWebviewState();
+    }
+
+    function updateSendButtonState() {
+        if (!sendBtn || !chatInput) return;
+        var hasText = chatInput.value.trim().length > 0;
+        sendBtn.classList.toggle('has-text', hasText);
+    }
+
+    function handleTextareaKeydown(e) {
+        // Handle approval modal keyboard shortcuts when visible
+        if (isApprovalQuestion && approvalModal && !approvalModal.classList.contains('hidden')) {
+            // Enter sends "Continue" when approval modal is visible and input is empty
+            if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+                var inputText = chatInput ? chatInput.value.trim() : '';
+                if (!inputText) {
+                    e.preventDefault();
+                    handleApprovalContinue();
+                    return;
+                }
+                // If there's text, fall through to normal send behavior
+            }
+            // Escape dismisses approval modal
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                handleApprovalNo();
+                return;
+            }
+        }
+
+        // Handle edit mode keyboard shortcuts
+        if (editingPromptId) {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelEditMode();
+                return;
+            }
+            if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                confirmEditMode();
+                return;
+            }
+            // Allow other keys in edit mode
+            return;
+        }
+
+        // Handle slash command dropdown navigation
+        if (slashDropdownVisible) {
+            if (e.key === 'ArrowDown') { e.preventDefault(); if (selectedSlashIndex < slashResults.length - 1) { selectedSlashIndex++; updateSlashSelection(); } return; }
+            if (e.key === 'ArrowUp') { e.preventDefault(); if (selectedSlashIndex > 0) { selectedSlashIndex--; updateSlashSelection(); } return; }
+            if ((e.key === 'Enter' || e.key === 'Tab') && selectedSlashIndex >= 0) { e.preventDefault(); selectSlashItem(selectedSlashIndex); return; }
+            if (e.key === 'Escape') { e.preventDefault(); hideSlashDropdown(); return; }
+        }
+
+        if (autocompleteVisible) {
+            if (e.key === 'ArrowDown') { e.preventDefault(); if (selectedAutocompleteIndex < autocompleteResults.length - 1) { selectedAutocompleteIndex++; updateAutocompleteSelection(); } return; }
+            if (e.key === 'ArrowUp') { e.preventDefault(); if (selectedAutocompleteIndex > 0) { selectedAutocompleteIndex--; updateAutocompleteSelection(); } return; }
+            if ((e.key === 'Enter' || e.key === 'Tab') && selectedAutocompleteIndex >= 0) { e.preventDefault(); selectAutocompleteItem(selectedAutocompleteIndex); return; }
+            if (e.key === 'Escape') { e.preventDefault(); hideAutocomplete(); return; }
+        }
+
+        // Context dropdown navigation removed - context now uses # via file autocomplete
+
+        var isPlainEnter = e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey;
+        var isCtrlOrCmdEnter = e.key === 'Enter' && !e.shiftKey && (e.ctrlKey || e.metaKey);
+
+        if (!sendWithCtrlEnter && isPlainEnter) {
+            e.preventDefault();
+            handleSend();
+            return;
+        }
+
+        if (sendWithCtrlEnter && isCtrlOrCmdEnter) {
+            e.preventDefault();
+            handleSend();
+            return;
+        }
+    }
+
+    function handleSend() {
+        var text = chatInput ? chatInput.value.trim() : '';
+        if (!text && currentAttachments.length === 0) return;
+
+        // Expand slash commands to full prompt text
+        text = expandSlashCommands(text);
+
+        // Hide approval modal when sending any response
+        hideApprovalModal();
+
+        // If processing response (AI working), auto-queue the message
+        if (isProcessingResponse && text) {
+            addToQueue(text);
+            // This reduces friction - user's prompt is in queue, so show them queue mode
+            if (!queueEnabled) {
+                queueEnabled = true;
+                updateModeUI();
+                updateQueueVisibility();
+                updateCardSelection();
+                vscode.postMessage({ type: 'toggleQueue', enabled: true });
+            }
+            if (chatInput) {
+                chatInput.value = '';
+                chatInput.style.height = 'auto';
+                updateInputHighlighter();
+            }
+            currentAttachments = [];
+            updateChipsDisplay();
+            updateSendButtonState();
+            // Clear persisted state after sending
+            saveWebviewState();
+            return;
+        }
+
+        if (queueEnabled && text && !pendingToolCall) {
+            addToQueue(text);
+        } else {
+            vscode.postMessage({ type: 'submit', value: text, attachments: currentAttachments });
+        }
+
+        if (chatInput) {
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+            updateInputHighlighter();
+        }
+        currentAttachments = [];
+        updateChipsDisplay();
+        updateSendButtonState();
+        // Clear persisted state after sending
+        saveWebviewState();
+    }
+
+    function handleAttach() { vscode.postMessage({ type: 'addAttachment' }); }
+
+    function toggleModeDropdown(e) {
+        e.stopPropagation();
+        if (dropdownOpen) closeModeDropdown();
+        else {
+            dropdownOpen = true;
+            positionModeDropdown();
+            modeDropdown.classList.remove('hidden');
+            modeDropdown.classList.add('visible');
+        }
+    }
+
+    function positionModeDropdown() {
+        if (!modeDropdown || !modeBtn) return;
+        var rect = modeBtn.getBoundingClientRect();
+        modeDropdown.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+        modeDropdown.style.left = rect.left + 'px';
+    }
+
+    function closeModeDropdown() {
+        dropdownOpen = false;
+        if (modeDropdown) {
+            modeDropdown.classList.remove('visible');
+            modeDropdown.classList.add('hidden');
+        }
+    }
+
+    function setMode(mode, notify) {
+        queueEnabled = mode === 'queue';
+        planEnabled = mode === 'plan';
+        selectedCard = mode;
+        updateModeUI();
+        updateQueueVisibility();
+        updateCardSelection();
+        updatePlanBoardVisibility();
+        if (notify) {
+            if (planEnabled) {
+                vscode.postMessage({ type: 'planSetMode', enabled: true });
+                // Plan mode uses the queue to feed tasks to Copilot — keep it enabled
+                vscode.postMessage({ type: 'toggleQueue', enabled: true });
+            } else {
+                vscode.postMessage({ type: 'planSetMode', enabled: false });
+                vscode.postMessage({ type: 'toggleQueue', enabled: queueEnabled });
+            }
+        }
+    }
+
+    function updateModeUI() {
+        var label = planEnabled ? 'Plan (Experimental)' : (queueEnabled ? 'Queue' : 'Normal');
+        if (modeLabel) modeLabel.textContent = label;
+        document.querySelectorAll('.mode-option[data-mode]').forEach(function (opt) {
+            var m = opt.getAttribute('data-mode');
+            opt.classList.toggle('selected', m === (planEnabled ? 'plan' : (queueEnabled ? 'queue' : 'normal')));
+        });
+    }
+
+    function updateQueueVisibility() {
+        if (!queueSection) return;
+        // Hide queue section if: not in queue mode OR queue is empty
+        var shouldHide = !queueEnabled || promptQueue.length === 0;
+        var wasHidden = queueSection.classList.contains('hidden');
+        queueSection.classList.toggle('hidden', shouldHide);
+        // Only collapse when showing for the FIRST time (was hidden, now visible)
+        // Don't collapse on subsequent updates to preserve user's expanded state
+        if (wasHidden && !shouldHide && promptQueue.length > 0) {
+            queueSection.classList.add('collapsed');
+        }
+    }
+
+    function handleQueueHeaderClick() {
+        if (queueSection) queueSection.classList.toggle('collapsed');
+    }
+
+    function handleExtensionMessage(event) {
+        var message = event.data;
+        console.log('[TaskSync Webview] Received message:', message.type, message);
+        switch (message.type) {
+            case 'updateQueue':
+                promptQueue = message.queue || [];
+                queueEnabled = message.enabled !== false;
+                renderQueue();
+                updateModeUI();
+                updateQueueVisibility();
+                updateCardSelection();
+                // Hide welcome section if we have current session calls
+                updateWelcomeSectionVisibility();
+                break;
+            case 'toolCallPending':
+                console.log('[TaskSync Webview] toolCallPending - showing question:', message.prompt?.substring(0, 50));
+                showPendingToolCall(message.id, message.prompt, message.isApprovalQuestion, message.choices);
+                break;
+            case 'toolCallCompleted':
+                addToolCallToCurrentSession(message.entry);
+                break;
+            case 'updateCurrentSession':
+                currentSessionCalls = message.history || [];
+                renderCurrentSession();
+                updateObservabilityUI();
+                // Hide welcome section if we have completed tool calls
+                updateWelcomeSectionVisibility();
+                // Auto-scroll to bottom after rendering
+                scrollToBottom();
+                break;
+            case 'updatePersistedHistory':
+                persistedHistory = message.history || [];
+                renderHistoryModal();
+                updateObservabilityUI();
+                break;
+            case 'openHistoryModal':
+                openHistoryModal();
+                break;
+            case 'openSettingsModal':
+                openSettingsModal();
+                break;
+            case 'updateSettings':
+                soundEnabled = message.soundEnabled !== false;
+                interactiveApprovalEnabled = message.interactiveApprovalEnabled !== false;
+                sendWithCtrlEnter = message.sendWithCtrlEnter === true;
+                webexEnabled = message.webexEnabled === true;
+                telegramEnabled = message.telegramEnabled === true;
+                autopilotEnabled = message.autopilotEnabled === true;
+                autopilotText = typeof message.autopilotText === 'string' ? message.autopilotText : '';
+                autopilotPrompts = Array.isArray(message.autopilotPrompts) ? message.autopilotPrompts : [];
+                reusablePrompts = message.reusablePrompts || [];
+                responseTimeout = normalizeResponseTimeout(message.responseTimeout);
+                sessionWarningHours = typeof message.sessionWarningHours === 'number' ? message.sessionWarningHours : 2;
+                maxConsecutiveAutoResponses = typeof message.maxConsecutiveAutoResponses === 'number' ? message.maxConsecutiveAutoResponses : 5;
+                humanLikeDelayEnabled = message.humanLikeDelayEnabled !== false;
+                humanLikeDelayMin = typeof message.humanLikeDelayMin === 'number' ? message.humanLikeDelayMin : 2;
+                humanLikeDelayMax = typeof message.humanLikeDelayMax === 'number' ? message.humanLikeDelayMax : 6;
+                debugLoggingEnabled = message.debugLoggingEnabled !== false;
+                rtkCompressionEnabled = message.rtkCompressionEnabled === true;
+                cavemanEnabled = message.cavemanEnabled !== false;
+                if (message.observabilityMetrics && typeof message.observabilityMetrics === 'object') {
+                    observabilityMetrics = {
+                        requestCount: Number(message.observabilityMetrics.requestCount) || 0,
+                        inputTokens: Number(message.observabilityMetrics.inputTokens) || 0,
+                        outputTokens: Number(message.observabilityMetrics.outputTokens) || 0,
+                        cachedTokens: Number(message.observabilityMetrics.cachedTokens) || 0,
+                        nanoAiu: Number(message.observabilityMetrics.nanoAiu) || 0,
+                        rtkSavedTokens: Number(message.observabilityMetrics.rtkSavedTokens) || 0,
+                        rtkSavingsPct: Number(message.observabilityMetrics.rtkSavingsPct) || 0,
+                        source: typeof message.observabilityMetrics.source === 'string' ? message.observabilityMetrics.source : 'unavailable',
+                        updatedAt: Number(message.observabilityMetrics.updatedAt) || 0
+                    };
+                }
+                updateSoundToggleUI();
+                updateInteractiveApprovalToggleUI();
+                updateSendWithCtrlEnterToggleUI();
+                updateDebugLoggingToggleUI();
+                updateRtkCompressionToggleUI();
+                updateCavemanToggleUI();
+                updateWebexToggleUI();
+                updateWebexStatusUI(message.webexStatus);
+                updateTelegramToggleUI();
+                updateTelegramStatusUI(message.telegramStatus);
+                updateAutopilotToggleUI();
+                renderAutopilotPromptsList();
+                updateResponseTimeoutUI();
+                updateSessionWarningHoursUI();
+                updateMaxAutoResponsesUI();
+                updateHumanDelayUI();
+                renderPromptsList();
+                updateObservabilityUI();
+                break;
+            case 'updateObservabilityMetrics':
+                if (message.metrics && typeof message.metrics === 'object') {
+                    observabilityMetrics = {
+                        requestCount: Number(message.metrics.requestCount) || 0,
+                        inputTokens: Number(message.metrics.inputTokens) || 0,
+                        outputTokens: Number(message.metrics.outputTokens) || 0,
+                        cachedTokens: Number(message.metrics.cachedTokens) || 0,
+                        nanoAiu: Number(message.metrics.nanoAiu) || 0,
+                        rtkSavedTokens: Number(message.metrics.rtkSavedTokens) || 0,
+                        rtkSavingsPct: Number(message.metrics.rtkSavingsPct) || 0,
+                        source: typeof message.metrics.source === 'string' ? message.metrics.source : 'unavailable',
+                        updatedAt: Number(message.metrics.updatedAt) || 0
+                    };
+                }
+                updateObservabilityUI();
+                break;
+            case 'slashCommandResults':
+                showSlashDropdown(message.prompts || []);
+                break;
+            case 'playNotificationSound':
+                playNotificationSound();
+                break;
+            case 'fileSearchResults':
+                showAutocomplete(message.files || []);
+                break;
+            case 'updateAttachments':
+                currentAttachments = message.attachments || [];
+                updateChipsDisplay();
+                break;
+            case 'imageSaved':
+                if (message.attachment && !currentAttachments.some(function (a) { return a.id === message.attachment.id; })) {
+                    currentAttachments.push(message.attachment);
+                    updateChipsDisplay();
+                }
+                break;
+            case 'clear':
+                promptQueue = [];
+                currentSessionCalls = [];
+                pendingToolCall = null;
+                isProcessingResponse = false;
+                renderQueue();
+                renderCurrentSession();
+                if (pendingMessage) {
+                    pendingMessage.classList.add('hidden');
+                    pendingMessage.innerHTML = '';
+                }
+                updateWelcomeSectionVisibility();
+                break;
+            case 'updateSessionTimer':
+                // Timer is displayed in the view title bar by the extension host
+                // No webview UI to update
+                break;
+            case 'triggerSendFromShortcut':
+                handleSendFromShortcut();
+                break;
+            case 'voiceStart':
+                handleVoiceStart(message.taskId, message.question);
+                break;
+            case 'voiceSpeakingDone':
+                handleVoiceSpeakingDone(message.taskId);
+                break;
+            case 'voiceStop':
+                handleVoiceStop();
+                break;
+            // ── Plan Mode messages ──
+            case 'updatePlan':
+                currentPlan = message.plan;
+                if (currentPlan && currentPlan._proposedSplit) {
+                    proposedSplit = currentPlan._proposedSplit;
+                    delete currentPlan._proposedSplit;
+                }
+                renderPlanBoard();
+                break;
+            case 'planTaskStatusChanged':
+                if (currentPlan) {
+                    updatePlanTaskStatus(message.taskId, message.status, message.note);
+                }
+                break;
+            case 'planAutoAdvancing':
+                // Flash notification that we're auto-advancing
+                showPlanAutoAdvanceNotice(message.taskId, message.nextTaskId, message.nextTaskTitle);
+                break;
+            case 'planExecutionStarted':
+                planExecuting = true;
+                updatePlanExecutionUI();
+                break;
+            case 'planExecutionPaused':
+                planExecuting = false;
+                updatePlanExecutionUI();
+                break;
+            case 'updateWorkerQueue':
+                handleWorkerQueueUpdate(message.tasks);
+                break;
+            case 'availableModels':
+                availableModels = message.models || [];
+                initWorkerModelDefault('command');
+                initWorkerModelDefault('subagent');
+                break;
+            case 'availableTools':
+                availableTools = message.tools || [];
+                ['command', 'subagent'].forEach(function(role) {
+                    var lbl = document.getElementById(role + '-tools-label');
+                    var total = availableTools.length;
+                    var sel = workerSelectedTools[role];
+                    var cnt = sel ? sel.size : total;
+                    if (lbl) lbl.textContent = cnt + '/' + total + ' tools selected';
+                    if (workerToolsExpanded[role]) renderToolsPicker(role);
+                });
+                break;
+        }
+    }
+
+    function showPendingToolCall(id, prompt, isApproval, choices) {
+        console.log('[TaskSync Webview] showPendingToolCall called with id:', id);
+        pendingToolCall = { id: id, prompt: prompt };
+        isProcessingResponse = false; // AI is now asking, not processing
+        isApprovalQuestion = isApproval === true;
+        currentChoices = choices || [];
+
+        if (welcomeSection) {
+            welcomeSection.classList.add('hidden');
+        }
+
+        // Add pending class to disable session switching UI
+        document.body.classList.add('has-pending-toolcall');
+
+        // Show AI question as plain text (hide "Working...." since AI asked a question)
+        if (pendingMessage) {
+            console.log('[TaskSync Webview] Setting pendingMessage innerHTML...');
+            pendingMessage.classList.remove('hidden');
+            pendingMessage.innerHTML = '<div class="pending-ai-question">' + formatMarkdown(prompt) + '</div>';
+            console.log('[TaskSync Webview] pendingMessage.innerHTML set, length:', pendingMessage.innerHTML.length);
+        } else {
+            console.error('[TaskSync Webview] pendingMessage element is null!');
+        }
+
+        // Re-render current session (without the pending item - it's shown separately)
+        renderCurrentSession();
+        // Render any mermaid diagrams in pending message
+        renderMermaidDiagrams();
+        // Auto-scroll to show the new pending message
+        scrollToBottom();
+
+        // Show choice buttons if we have choices, otherwise show approval modal for yes/no questions
+        // Only show if interactive approval is enabled
+        if (interactiveApprovalEnabled) {
+            if (currentChoices.length > 0) {
+                showChoicesBar();
+            } else if (isApprovalQuestion) {
+                showApprovalModal();
+            } else {
+                hideApprovalModal();
+                hideChoicesBar();
+            }
+        } else {
+            // Interactive approval disabled - just focus input for manual typing
+            hideApprovalModal();
+            hideChoicesBar();
+            if (chatInput) {
+                chatInput.focus();
+            }
+        }
+    }
+
+    function addToolCallToCurrentSession(entry) {
+        pendingToolCall = null;
+
+        // Remove pending class to re-enable session switching UI
+        document.body.classList.remove('has-pending-toolcall');
+
+        // Hide approval modal and choices bar when tool call completes
+        hideApprovalModal();
+        hideChoicesBar();
+
+        // Update or add entry to current session
+        var idx = currentSessionCalls.findIndex(function (tc) { return tc.id === entry.id; });
+        if (idx >= 0) {
+            currentSessionCalls[idx] = entry;
+        } else {
+            currentSessionCalls.unshift(entry);
+        }
+        renderCurrentSession();
+
+        // Show working indicator after user responds (AI is now processing the response)
+        isProcessingResponse = true;
+        if (pendingMessage) {
+            pendingMessage.classList.remove('hidden');
+            pendingMessage.innerHTML = '<div class="working-indicator">Processing your response</div>';
+        }
+
+        // Auto-scroll to show the working indicator
+        scrollToBottom();
+    }
+
+    function renderCurrentSession() {
+        if (!toolHistoryArea) return;
+
+        // Only show COMPLETED calls from current session (pending is shown separately as plain text)
+        var completedCalls = currentSessionCalls.filter(function (tc) { return tc.status === 'completed'; });
+
+        if (completedCalls.length === 0) {
+            toolHistoryArea.innerHTML = '';
+            return;
+        }
+
+        // Reverse to show oldest first (new items stack at bottom)
+        var sortedCalls = completedCalls.slice().reverse();
+
+        var cardsHtml = sortedCalls.map(function (tc, index) {
+            // Get first sentence for title - render inline markdown (bold/italic/code)
+            var firstSentence = tc.prompt.split(/[.!?\n]/)[0];
+            var truncatedTitle = firstSentence.length > 120 ? firstSentence.substring(0, 120) + '...' : firstSentence;
+            var queueBadge = tc.isFromQueue ? '<span class="tool-call-badge queue">Queue</span>' : '';
+            var tsHtml = formatCallTimestamp(tc.askedAt, tc.timestamp);
+
+            // Build card HTML - NO X button for current session cards
+            var isLatest = index === sortedCalls.length - 1;
+            var cardHtml = '<div class="tool-call-card' + (isLatest ? ' expanded' : '') + '" data-id="' + escapeHtml(tc.id) + '">' +
+                '<div class="tool-call-header">' +
+                '<div class="tool-call-chevron"><span class="codicon codicon-chevron-down"></span></div>' +
+                '<div class="tool-call-icon"><span class="codicon codicon-copilot"></span></div>' +
+                '<div class="tool-call-header-wrapper">' +
+                '<span class="tool-call-title">' + inlineMarkdown(truncatedTitle) + queueBadge + '</span>' +
+                (tsHtml ? '<span class="tool-call-timestamp">' + tsHtml + '</span>' : '') +
+                '</div>' +
+                '</div>' +
+                '<div class="tool-call-body">' +
+                '<div class="tool-call-ai-response">' + formatMarkdown(tc.prompt) + '</div>' +
+                '<div class="tool-call-user-section">' +
+                '<div class="tool-call-user-response">' + escapeHtml(tc.response).replace(/\n/g, '<br>') + '</div>' +
+                (tc.attachments ? renderAttachmentsHtml(tc.attachments) : '') +
+                '</div>' +
+                '</div></div>';
+            return cardHtml;
+        }).join('');
+
+        toolHistoryArea.innerHTML = cardsHtml;
+
+        // Bind events - only expand/collapse, no remove
+        toolHistoryArea.querySelectorAll('.tool-call-header').forEach(function (header) {
+            header.addEventListener('click', function (e) {
+                var card = header.closest('.tool-call-card');
+                if (card) card.classList.toggle('expanded');
+            });
+        });
+
+        // Render any mermaid diagrams
+        renderMermaidDiagrams();
+    }
+
+    function renderHistoryModal() {
+        if (!historyModalList) return;
+
+        if (persistedHistory.length === 0) {
+            historyModalList.innerHTML = '<div class="history-modal-empty">No history yet</div>';
+            if (historyModalClearAll) historyModalClearAll.classList.add('hidden');
+            return;
+        }
+
+        if (historyModalClearAll) historyModalClearAll.classList.remove('hidden');
+
+        // Helper to render tool call card
+        function renderToolCallCard(tc) {
+            var firstSentence = tc.prompt.split(/[.!?\n]/)[0];
+            var truncatedTitle = firstSentence.length > 80 ? firstSentence.substring(0, 80) + '...' : firstSentence;
+            var queueBadge = tc.isFromQueue ? '<span class="tool-call-badge queue">Queue</span>' : '';
+            var tsHtml = formatCallTimestamp(tc.askedAt, tc.timestamp);
+
+            return '<div class="tool-call-card history-card" data-id="' + escapeHtml(tc.id) + '">' +
+                '<div class="tool-call-header">' +
+                '<div class="tool-call-chevron"><span class="codicon codicon-chevron-down"></span></div>' +
+                '<div class="tool-call-icon"><span class="codicon codicon-copilot"></span></div>' +
+                '<div class="tool-call-header-wrapper">' +
+                '<span class="tool-call-title">' + inlineMarkdown(truncatedTitle) + queueBadge + '</span>' +
+                (tsHtml ? '<span class="tool-call-timestamp">' + tsHtml + '</span>' : '') +
+                '</div>' +
+                '<button class="tool-call-remove" data-id="' + escapeHtml(tc.id) + '" title="Remove"><span class="codicon codicon-close"></span></button>' +
+                '</div>' +
+                '<div class="tool-call-body">' +
+                '<div class="tool-call-ai-response">' + formatMarkdown(tc.prompt) + '</div>' +
+                '<div class="tool-call-user-section">' +
+                '<div class="tool-call-user-response">' + escapeHtml(tc.response).replace(/\n/g, '<br>') + '</div>' +
+                (tc.attachments ? renderAttachmentsHtml(tc.attachments) : '') +
+                '</div>' +
+                '</div></div>';
+        }
+
+        // Render all history items directly without grouping
+        var cardsHtml = '<div class="history-items-list">';
+        cardsHtml += persistedHistory.map(renderToolCallCard).join('');
+        cardsHtml += '</div>';
+
+        historyModalList.innerHTML = cardsHtml;
+
+        // Bind expand/collapse events
+        historyModalList.querySelectorAll('.tool-call-header').forEach(function (header) {
+            header.addEventListener('click', function (e) {
+                if (e.target.closest('.tool-call-remove')) return;
+                var card = header.closest('.tool-call-card');
+                if (card) card.classList.toggle('expanded');
+            });
+        });
+
+        // Bind remove buttons
+        historyModalList.querySelectorAll('.tool-call-remove').forEach(function (btn) {
+            btn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                var id = btn.getAttribute('data-id');
+                if (id) {
+                    vscode.postMessage({ type: 'removeHistoryItem', callId: id });
+                    persistedHistory = persistedHistory.filter(function (tc) { return tc.id !== id; });
+                    renderHistoryModal();
+                }
+            });
+        });
+    }
+
+    // Constants for security and performance limits
+    var MARKDOWN_MAX_LENGTH = 100000; // Max markdown input length to prevent ReDoS
+    var MAX_TABLE_ROWS = 100; // Max table rows to process
+
+    /**
+     * Process a buffer of table lines into HTML table markup (ReDoS-safe implementation)
+     * @param {string[]} lines - Array of table row strings
+     * @param {number} maxRows - Maximum number of rows to process
+     * @returns {string} HTML table markup or original lines joined
+     */
+    function processTableBuffer(lines, maxRows) {
+        if (lines.length < 2) return lines.join('\n');
+        if (lines.length > maxRows) return lines.join('\n'); // Skip very large tables
+
+        // Check if second line is separator (contains only |, -, :, spaces)
+        var separatorRegex = /^\|[\s\-:|]+\|$/;
+        if (!separatorRegex.test(lines[1].trim())) return lines.join('\n');
+
+        // Parse header
+        var headerCells = lines[0].split('|').filter(function (c) { return c.trim() !== ''; });
+        if (headerCells.length === 0) return lines.join('\n'); // Invalid table
+
+        var headerHtml = '<tr>' + headerCells.map(function (c) {
+            return '<th>' + c.trim() + '</th>';
+        }).join('') + '</tr>';
+
+        // Parse data rows (skip separator at index 1)
+        var bodyHtml = '';
+        for (var i = 2; i < lines.length; i++) {
+            if (!lines[i].trim()) continue;
+            var cells = lines[i].split('|').filter(function (c) { return c.trim() !== ''; });
+            bodyHtml += '<tr>' + cells.map(function (c) {
+                return '<td>' + c.trim() + '</td>';
+            }).join('') + '</tr>';
+        }
+
+        return '<table class="markdown-table"><thead>' + headerHtml + '</thead><tbody>' + bodyHtml + '</tbody></table>';
+    }
+
+    function formatMarkdown(text) {
+        if (!text) return '';
+
+        // ReDoS prevention: truncate very long inputs before regex processing
+        // This prevents exponential backtracking on crafted inputs (OWASP ReDoS mitigation)
+        if (text.length > MARKDOWN_MAX_LENGTH) {
+            text = text.substring(0, MARKDOWN_MAX_LENGTH) + '\n... (content truncated for display)';
+        }
+
+        // Normalize line endings (Windows \r\n to \n)
+        var processedText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        // Store code blocks BEFORE escaping HTML to preserve backticks
+        var codeBlocks = [];
+        var mermaidBlocks = [];
+
+        // Extract mermaid blocks first (before HTML escaping)
+        // Match ```mermaid followed by newline or just content
+        processedText = processedText.replace(/```mermaid\s*\n([\s\S]*?)```/g, function (match, code) {
+            var index = mermaidBlocks.length;
+            mermaidBlocks.push(code.trim());
+            return '%%MERMAID' + index + '%%';
+        });
+
+        // Extract other code blocks (before HTML escaping)
+        // Match ```lang or just ``` followed by optional newline
+        processedText = processedText.replace(/```(\w*)\s*\n?([\s\S]*?)```/g, function (match, lang, code) {
+            var index = codeBlocks.length;
+            codeBlocks.push({ lang: lang || '', code: code.trim() });
+            return '%%CODEBLOCK' + index + '%%';
+        });
+
+        // Now escape HTML on the remaining text
+        var html = escapeHtml(processedText);
+
+        // Headers (## Header) - must be at start of line
+        html = html.replace(/^######\s+(.+)$/gm, '<h6>$1</h6>');
+        html = html.replace(/^#####\s+(.+)$/gm, '<h5>$1</h5>');
+        html = html.replace(/^####\s+(.+)$/gm, '<h4>$1</h4>');
+        html = html.replace(/^###\s+(.+)$/gm, '<h3>$1</h3>');
+        html = html.replace(/^##\s+(.+)$/gm, '<h2>$1</h2>');
+        html = html.replace(/^#\s+(.+)$/gm, '<h1>$1</h1>');
+
+        // Horizontal rules (--- or ***)
+        html = html.replace(/^---+$/gm, '<hr>');
+        html = html.replace(/^\*\*\*+$/gm, '<hr>');
+
+        // Blockquotes (> text) - simple single-line support
+        html = html.replace(/^&gt;\s*(.*)$/gm, '<blockquote>$1</blockquote>');
+        // Merge consecutive blockquotes
+        html = html.replace(/<\/blockquote>\n<blockquote>/g, '\n');
+
+        // Unordered lists (- item or * item)
+        html = html.replace(/^[-*]\s+(.+)$/gm, '<li>$1</li>');
+        // Wrap consecutive <li> in <ul>
+        html = html.replace(/(<li>.*<\/li>\n?)+/g, function (match) {
+            return '<ul>' + match.replace(/\n/g, '') + '</ul>';
+        });
+
+        // Ordered lists (1. item)
+        html = html.replace(/^\d+\.\s+(.+)$/gm, '<oli>$1</oli>');
+        // Wrap consecutive <oli> in <ol> then convert to li
+        html = html.replace(/(<oli>.*<\/oli>\n?)+/g, function (match) {
+            return '<ol>' + match.replace(/<oli>/g, '<li>').replace(/<\/oli>/g, '</li>').replace(/\n/g, '') + '</ol>';
+        });
+
+        // Markdown tables - SAFE approach to prevent ReDoS
+        // Instead of using nested quantifiers with regex (which can cause exponential backtracking),
+        // we use a line-by-line processing approach for safety
+        var tableLines = html.split('\n');
+        var processedLines = [];
+        var tableBuffer = [];
+        var inTable = false;
+
+        for (var lineIdx = 0; lineIdx < tableLines.length; lineIdx++) {
+            var line = tableLines[lineIdx];
+            // Check if line looks like a table row (starts and ends with |)
+            var isTableRow = /^\|.+\|$/.test(line.trim());
+
+            if (isTableRow) {
+                tableBuffer.push(line);
+                inTable = true;
+            } else {
+                if (inTable && tableBuffer.length >= 2) {
+                    // Process accumulated table buffer
+                    var tableHtml = processTableBuffer(tableBuffer, MAX_TABLE_ROWS);
+                    processedLines.push(tableHtml);
+                }
+                tableBuffer = [];
+                inTable = false;
+                processedLines.push(line);
+            }
+        }
+        // Handle table at end of content
+        if (inTable && tableBuffer.length >= 2) {
+            processedLines.push(processTableBuffer(tableBuffer, MAX_TABLE_ROWS));
+        }
+        html = processedLines.join('\n');
+
+        // Inline code (`code`)
+        html = html.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+
+        // Bold (**text** or __text__)
+        html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+
+        // Italic (*text* or _text_)
+        html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+        html = html.replace(/_([^_]+)_/g, '<em>$1</em>');
+
+        // Line breaks - but collapse multiple consecutive breaks
+        // Don't add <br> after block elements
+        html = html.replace(/\n{3,}/g, '\n\n');
+        html = html.replace(/(<\/h[1-6]>|<\/ul>|<\/ol>|<\/blockquote>|<hr>)\n/g, '$1');
+        html = html.replace(/\n/g, '<br>');
+
+        // Restore code blocks
+        codeBlocks.forEach(function (block, index) {
+            var langAttr = block.lang ? ' data-lang="' + block.lang + '"' : '';
+            var escapedCode = escapeHtml(block.code);
+            var replacement = '<pre class="code-block"' + langAttr + '><code>' + escapedCode + '</code></pre>';
+            html = html.replace('%%CODEBLOCK' + index + '%%', replacement);
+        });
+
+        // Restore mermaid blocks as diagrams
+        mermaidBlocks.forEach(function (code, index) {
+            var mermaidId = 'mermaid-' + Date.now() + '-' + index + '-' + Math.random().toString(36).substr(2, 9);
+            var replacement = '<div class="mermaid-container" data-mermaid-id="' + mermaidId + '"><div class="mermaid" id="' + mermaidId + '">' + escapeHtml(code) + '</div></div>';
+            html = html.replace('%%MERMAID' + index + '%%', replacement);
+        });
+
+        // Clean up excessive <br> around block elements
+        html = html.replace(/(<br>)+(<pre|<div class="mermaid|<h[1-6]|<ul|<ol|<blockquote|<hr)/g, '$2');
+        html = html.replace(/(<\/pre>|<\/div>|<\/h[1-6]>|<\/ul>|<\/ol>|<\/blockquote>|<hr>)(<br>)+/g, '$1');
+
+        return html;
+    }
+
+    // Mermaid rendering - lazy load and render
+    var mermaidLoaded = false;
+    var mermaidLoading = false;
+
+    function loadMermaid(callback) {
+        if (mermaidLoaded) {
+            callback();
+            return;
+        }
+        if (mermaidLoading) {
+            // Wait for existing load
+            var checkInterval = setInterval(function () {
+                if (mermaidLoaded) {
+                    clearInterval(checkInterval);
+                    callback();
+                }
+            }, 50);
+            return;
+        }
+        mermaidLoading = true;
+
+        var script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js';
+        script.onload = function () {
+            window.mermaid.initialize({
+                startOnLoad: false,
+                theme: document.body.classList.contains('vscode-light') ? 'default' : 'dark',
+                securityLevel: 'loose',
+                fontFamily: 'var(--vscode-font-family)'
+            });
+            mermaidLoaded = true;
+            mermaidLoading = false;
+            callback();
+        };
+        script.onerror = function () {
+            mermaidLoading = false;
+            console.error('Failed to load mermaid.js');
+        };
+        document.head.appendChild(script);
+    }
+
+    function renderMermaidDiagrams() {
+        var containers = document.querySelectorAll('.mermaid-container:not(.rendered)');
+        if (containers.length === 0) return;
+
+        loadMermaid(function () {
+            containers.forEach(function (container) {
+                var mermaidDiv = container.querySelector('.mermaid');
+                if (!mermaidDiv) return;
+
+                var code = mermaidDiv.textContent;
+                var id = mermaidDiv.id;
+
+                try {
+                    window.mermaid.render(id + '-svg', code).then(function (result) {
+                        mermaidDiv.innerHTML = result.svg;
+                        container.classList.add('rendered');
+                    }).catch(function (err) {
+                        // Show code block as fallback on error
+                        mermaidDiv.innerHTML = '<pre class="code-block" data-lang="mermaid"><code>' + escapeHtml(code) + '</code></pre>';
+                        container.classList.add('rendered', 'error');
+                    });
+                } catch (err) {
+                    mermaidDiv.innerHTML = '<pre class="code-block" data-lang="mermaid"><code>' + escapeHtml(code) + '</code></pre>';
+                    container.classList.add('rendered', 'error');
+                }
+            });
+        });
+    }
+
+    /**
+     * Update welcome section visibility based on current session state
+     * Hide welcome when there are completed tool calls or a pending call
+     */
+    function updateWelcomeSectionVisibility() {
+        if (!welcomeSection) return;
+        var hasCompletedCalls = currentSessionCalls.some(function (tc) { return tc.status === 'completed'; });
+        var hasPendingMessage = pendingMessage && !pendingMessage.classList.contains('hidden');
+        var shouldHide = hasCompletedCalls || pendingToolCall !== null || hasPendingMessage;
+        welcomeSection.classList.toggle('hidden', shouldHide);
+    }
+
+    /**
+     * Auto-scroll chat container to bottom
+     */
+    function scrollToBottom() {
+        if (!chatContainer) return;
+        // Use requestAnimationFrame to ensure DOM is updated before scrolling
+        requestAnimationFrame(function () {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        });
+    }
+
+    function addToQueue(prompt) {
+        if (!prompt || !prompt.trim()) return;
+        var id = 'q_' + Date.now() + '_' + Math.random().toString(36).substring(2, 11);
+        // Store attachments with the queue item
+        var attachmentsToStore = currentAttachments.length > 0 ? currentAttachments.slice() : undefined;
+        promptQueue.push({ id: id, prompt: prompt.trim(), attachments: attachmentsToStore });
+        renderQueue();
+        // Expand queue section when adding items so user can see what was added
+        if (queueSection) queueSection.classList.remove('collapsed');
+        // Send to backend with attachments
+        vscode.postMessage({ type: 'addQueuePrompt', prompt: prompt.trim(), id: id, attachments: attachmentsToStore || [] });
+        // Clear attachments after adding to queue (they're now stored with the queue item)
+        currentAttachments = [];
+        updateChipsDisplay();
+    }
+
+    function removeFromQueue(id) {
+        promptQueue = promptQueue.filter(function (item) { return item.id !== id; });
+        renderQueue();
+        vscode.postMessage({ type: 'removeQueuePrompt', promptId: id });
+    }
+
+    function renderQueue() {
+        if (!queueList) return;
+        if (queueCount) queueCount.textContent = promptQueue.length;
+
+        // Update visibility based on queue state
+        updateQueueVisibility();
+
+        if (promptQueue.length === 0) {
+            queueList.innerHTML = '<div class="queue-empty">No prompts in queue</div>';
+            return;
+        }
+
+        queueList.innerHTML = promptQueue.map(function (item, index) {
+            var bulletClass = index === 0 ? 'active' : 'pending';
+            var truncatedPrompt = item.prompt.length > 80 ? item.prompt.substring(0, 80) + '...' : item.prompt;
+            // Show attachment indicator if this queue item has attachments
+            var attachmentBadge = (item.attachments && item.attachments.length > 0)
+                ? '<span class="queue-item-attachment-badge" title="' + item.attachments.length + ' attachment(s)" aria-label="' + item.attachments.length + ' attachments"><span class="codicon codicon-file-media" aria-hidden="true"></span></span>'
+                : '';
+            return '<div class="queue-item" data-id="' + escapeHtml(item.id) + '" data-index="' + index + '" tabindex="0" draggable="true" role="listitem" aria-label="Queue item ' + (index + 1) + ': ' + escapeHtml(truncatedPrompt) + '">' +
+                '<span class="bullet ' + bulletClass + '" aria-hidden="true"></span>' +
+                '<span class="text" title="' + escapeHtml(item.prompt) + '">' + (index + 1) + '. ' + escapeHtml(truncatedPrompt) + '</span>' +
+                attachmentBadge +
+                '<div class="queue-item-actions">' +
+                '<button class="edit-btn" data-id="' + escapeHtml(item.id) + '" title="Edit" aria-label="Edit queue item ' + (index + 1) + '"><span class="codicon codicon-edit" aria-hidden="true"></span></button>' +
+                '<button class="remove-btn" data-id="' + escapeHtml(item.id) + '" title="Remove" aria-label="Remove queue item ' + (index + 1) + '"><span class="codicon codicon-close" aria-hidden="true"></span></button>' +
+                '</div></div>';
+        }).join('');
+
+        queueList.querySelectorAll('.remove-btn').forEach(function (btn) {
+            btn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                var id = btn.getAttribute('data-id');
+                if (id) removeFromQueue(id);
+            });
+        });
+
+        queueList.querySelectorAll('.edit-btn').forEach(function (btn) {
+            btn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                var id = btn.getAttribute('data-id');
+                if (id) startEditPrompt(id);
+            });
+        });
+
+        bindDragAndDrop();
+        bindKeyboardNavigation();
+    }
+
+    function startEditPrompt(id) {
+        // Cancel any existing edit first
+        if (editingPromptId && editingPromptId !== id) {
+            cancelEditMode();
+        }
+
+        var item = promptQueue.find(function (p) { return p.id === id; });
+        if (!item) return;
+
+        // Save current state
+        editingPromptId = id;
+        editingOriginalPrompt = item.prompt;
+        savedInputValue = chatInput ? chatInput.value : '';
+
+        // Mark queue item as being edited
+        var queueItem = queueList.querySelector('.queue-item[data-id="' + id + '"]');
+        if (queueItem) {
+            queueItem.classList.add('editing');
+        }
+
+        // Switch to edit mode UI
+        enterEditMode(item.prompt);
+    }
+
+    function enterEditMode(promptText) {
+        // Hide normal actions, show edit actions
+        if (actionsLeft) actionsLeft.classList.add('hidden');
+        if (sendBtn) sendBtn.classList.add('hidden');
+        if (editActionsContainer) editActionsContainer.classList.remove('hidden');
+
+        // Mark input container as in edit mode
+        if (inputContainer) {
+            inputContainer.classList.add('edit-mode');
+            inputContainer.setAttribute('aria-label', 'Editing queue prompt');
+        }
+
+        // Set input value to the prompt being edited
+        if (chatInput) {
+            chatInput.value = promptText;
+            chatInput.setAttribute('aria-label', 'Edit prompt text. Press Enter to confirm, Escape to cancel.');
+            chatInput.focus();
+            // Move cursor to end
+            chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
+            autoResizeTextarea();
+        }
+    }
+
+    function exitEditMode() {
+        // Show normal actions, hide edit actions
+        if (actionsLeft) actionsLeft.classList.remove('hidden');
+        if (sendBtn) sendBtn.classList.remove('hidden');
+        if (editActionsContainer) editActionsContainer.classList.add('hidden');
+
+        // Remove edit mode class from input container
+        if (inputContainer) {
+            inputContainer.classList.remove('edit-mode');
+            inputContainer.removeAttribute('aria-label');
+        }
+
+        // Remove editing class from queue item
+        if (queueList) {
+            var editingItem = queueList.querySelector('.queue-item.editing');
+            if (editingItem) editingItem.classList.remove('editing');
+        }
+
+        // Restore original input value and accessibility
+        if (chatInput) {
+            chatInput.value = savedInputValue;
+            chatInput.setAttribute('aria-label', 'Message input');
+            autoResizeTextarea();
+        }
+
+        // Reset edit state
+        editingPromptId = null;
+        editingOriginalPrompt = null;
+        savedInputValue = '';
+    }
+
+    function confirmEditMode() {
+        if (!editingPromptId) return;
+
+        var newValue = chatInput ? chatInput.value.trim() : '';
+
+        if (!newValue) {
+            // If empty, remove the prompt
+            removeFromQueue(editingPromptId);
+        } else if (newValue !== editingOriginalPrompt) {
+            // Update the prompt
+            var item = promptQueue.find(function (p) { return p.id === editingPromptId; });
+            if (item) {
+                item.prompt = newValue;
+                vscode.postMessage({ type: 'editQueuePrompt', promptId: editingPromptId, newPrompt: newValue });
+            }
+        }
+
+        // Clear saved input - we don't want to restore old value after editing
+        savedInputValue = '';
+
+        exitEditMode();
+        renderQueue();
+    }
+
+    function cancelEditMode() {
+        exitEditMode();
+        renderQueue();
+    }
+
+    /**
+     * Handle "accept" button click in approval modal
+     * Sends "yes" as the response
+     */
+    function handleApprovalContinue() {
+        if (!pendingToolCall) return;
+
+        // Hide approval modal
+        hideApprovalModal();
+
+        // Send affirmative response
+        vscode.postMessage({ type: 'submit', value: 'yes', attachments: [] });
+        if (chatInput) {
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+            updateInputHighlighter();
+        }
+        currentAttachments = [];
+        updateChipsDisplay();
+        updateSendButtonState();
+        saveWebviewState();
+    }
+
+    /**
+     * Handle "No" button click in approval modal
+     * Dismisses modal and focuses input for custom response
+     */
+    function handleApprovalNo() {
+        // Hide approval modal but keep pending state
+        hideApprovalModal();
+
+        // Focus input for custom response
+        if (chatInput) {
+            chatInput.focus();
+            // Optionally pre-fill with "No, " to help user
+            if (!chatInput.value.trim()) {
+                chatInput.value = 'No, ';
+                chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
+            }
+            autoResizeTextarea();
+            updateInputHighlighter();
+            updateSendButtonState();
+            saveWebviewState();
+        }
+    }
+
+    /**
+     * Show approval modal
+     */
+    function showApprovalModal() {
+        if (!approvalModal) return;
+        approvalModal.classList.remove('hidden');
+        // Focus chat input instead of Yes button to prevent accidental Enter approvals
+        // User can still click Yes/No or use keyboard navigation
+        if (chatInput) {
+            chatInput.focus();
+        }
+    }
+
+    /**
+     * Hide approval modal
+     */
+    function hideApprovalModal() {
+        if (!approvalModal) return;
+        approvalModal.classList.add('hidden');
+        isApprovalQuestion = false;
+    }
+
+    /**
+     * Show choices bar with dynamic buttons based on parsed choices
+     */
+    function showChoicesBar() {
+        // Hide approval modal first
+        hideApprovalModal();
+
+        // Create or get choices bar
+        var choicesBar = document.getElementById('choices-bar');
+        if (!choicesBar) {
+            choicesBar = document.createElement('div');
+            choicesBar.className = 'choices-bar';
+            choicesBar.id = 'choices-bar';
+            choicesBar.setAttribute('role', 'toolbar');
+            choicesBar.setAttribute('aria-label', 'Quick choice options');
+
+            // Insert at top of input-wrapper
+            var inputWrapper = document.getElementById('input-wrapper');
+            if (inputWrapper) {
+                inputWrapper.insertBefore(choicesBar, inputWrapper.firstChild);
+            }
+        }
+
+        // Build choice buttons
+        var buttonsHtml = currentChoices.map(function (choice, index) {
+            var shortLabel = choice.shortLabel || choice.value;
+            var title = choice.label || choice.value;
+            return '<button class="choice-btn" data-value="' + escapeHtml(choice.value) + '" ' +
+                'data-index="' + index + '" title="' + escapeHtml(title) + '">' +
+                escapeHtml(shortLabel) + '</button>';
+        }).join('');
+
+        choicesBar.innerHTML = '<span class="choices-label">Choose:</span>' +
+            '<div class="choices-buttons">' + buttonsHtml + '</div>';
+
+        // Bind click events to choice buttons
+        choicesBar.querySelectorAll('.choice-btn').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var value = btn.getAttribute('data-value');
+                handleChoiceClick(value);
+            });
+        });
+
+        choicesBar.classList.remove('hidden');
+
+        // Don't auto-focus buttons - let user click or use keyboard
+        // Focus the chat input instead for immediate typing
+        if (chatInput) {
+            chatInput.focus();
+        }
+    }
+
+    /**
+     * Hide choices bar
+     */
+    function hideChoicesBar() {
+        var choicesBar = document.getElementById('choices-bar');
+        if (choicesBar) {
+            choicesBar.classList.add('hidden');
+        }
+        currentChoices = [];
+    }
+
+    /**
+     * Handle choice button click
+     */
+    function handleChoiceClick(value) {
+        if (!pendingToolCall) return;
+
+        // Hide choices bar
+        hideChoicesBar();
+
+        // Send the choice value as response
+        vscode.postMessage({ type: 'submit', value: value, attachments: [] });
+        if (chatInput) {
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+            updateInputHighlighter();
+        }
+        currentAttachments = [];
+        updateChipsDisplay();
+        updateSendButtonState();
+        saveWebviewState();
+    }
+
+    // ===== SETTINGS MODAL FUNCTIONS =====
+
+    function openSettingsModal() {
+        switchTab('settings');
+        vscode.postMessage({ type: 'openSettingsModal' });
+    }
+
+    function closeSettingsModal() {
+        flushAutopilotTextUpdate();
+        hideAddPromptForm();
+        hideAddAutopilotPromptForm();
+    }
+
+    function toggleSoundSetting() {
+        soundEnabled = !soundEnabled;
+        updateSoundToggleUI();
+        vscode.postMessage({ type: 'updateSoundSetting', enabled: soundEnabled });
+    }
+
+    function updateSoundToggleUI() {
+        if (!soundToggle) return;
+        soundToggle.classList.toggle('active', soundEnabled);
+        soundToggle.setAttribute('aria-checked', soundEnabled ? 'true' : 'false');
+    }
+
+    function toggleInteractiveApprovalSetting() {
+        interactiveApprovalEnabled = !interactiveApprovalEnabled;
+        updateInteractiveApprovalToggleUI();
+        vscode.postMessage({ type: 'updateInteractiveApprovalSetting', enabled: interactiveApprovalEnabled });
+    }
+
+    function updateInteractiveApprovalToggleUI() {
+        if (!interactiveApprovalToggle) return;
+        interactiveApprovalToggle.classList.toggle('active', interactiveApprovalEnabled);
+        interactiveApprovalToggle.setAttribute('aria-checked', interactiveApprovalEnabled ? 'true' : 'false');
+    }
+
+    function toggleWebexSetting() {
+        webexEnabled = !webexEnabled;
+        updateWebexToggleUI();
+        vscode.postMessage({ type: 'updateWebexSetting', enabled: webexEnabled });
+    }
+
+    function updateWebexToggleUI() {
+        if (!webexToggle) return;
+        webexToggle.classList.toggle('active', webexEnabled);
+        webexToggle.setAttribute('aria-checked', webexEnabled ? 'true' : 'false');
+    }
+
+    function updateWebexStatusUI(status) {
+        var el = document.getElementById('webex-status');
+        if (!el) return;
+        if (!status) { el.textContent = ''; return; }
+        var icon = status.status === 'connected' ? '✅' : status.status === 'disabled' ? '⏸' : '⚠️';
+        el.textContent = icon + ' ' + status.message;
+        if (status.hint) {
+            el.title = status.hint;
+        }
+        el.className = 'settings-status settings-status-' + status.status;
+    }
+
+    function toggleTelegramSetting() {
+        telegramEnabled = !telegramEnabled;
+        updateTelegramToggleUI();
+        vscode.postMessage({ type: 'updateTelegramSetting', enabled: telegramEnabled });
+    }
+
+    function updateTelegramToggleUI() {
+        if (!telegramToggle) return;
+        telegramToggle.classList.toggle('active', telegramEnabled);
+        telegramToggle.setAttribute('aria-checked', telegramEnabled ? 'true' : 'false');
+    }
+
+    function updateTelegramStatusUI(status) {
+        var el = document.getElementById('telegram-status');
+        if (!el) return;
+        if (!status) { el.textContent = ''; return; }
+        var icon = status.status === 'connected' ? '✅' : status.status === 'disabled' ? '⏸' : '⚠️';
+        el.textContent = icon + ' ' + status.message;
+        if (status.hint) {
+            el.title = status.hint;
+        }
+        el.className = 'settings-status settings-status-' + status.status;
+    }
+
+    function toggleAutopilotSetting() {
+        autopilotEnabled = !autopilotEnabled;
+        updateAutopilotToggleUI();
+        vscode.postMessage({ type: 'updateAutopilotSetting', enabled: autopilotEnabled });
+    }
+
+    function updateAutopilotToggleUI() {
+        if (autopilotToggle) {
+            autopilotToggle.classList.toggle('active', autopilotEnabled);
+            autopilotToggle.setAttribute('aria-checked', autopilotEnabled ? 'true' : 'false');
+        }
+    }
+
+    function toggleSendWithCtrlEnterSetting() {
+        sendWithCtrlEnter = !sendWithCtrlEnter;
+        updateSendWithCtrlEnterToggleUI();
+        vscode.postMessage({ type: 'updateSendWithCtrlEnterSetting', enabled: sendWithCtrlEnter });
+    }
+
+    function updateSendWithCtrlEnterToggleUI() {
+        if (!sendShortcutToggle) return;
+        sendShortcutToggle.classList.toggle('active', sendWithCtrlEnter);
+        sendShortcutToggle.setAttribute('aria-checked', sendWithCtrlEnter ? 'true' : 'false');
+    }
+
+    function toggleDebugLoggingSetting() {
+        debugLoggingEnabled = !debugLoggingEnabled;
+        updateDebugLoggingToggleUI();
+        vscode.postMessage({ type: 'updateDebugLoggingSetting', enabled: debugLoggingEnabled });
+    }
+
+    function updateDebugLoggingToggleUI() {
+        if (!debugLoggingToggle) return;
+        debugLoggingToggle.classList.toggle('active', debugLoggingEnabled);
+        debugLoggingToggle.setAttribute('aria-checked', debugLoggingEnabled ? 'true' : 'false');
+    }
+
+    function toggleRtkCompressionSetting() {
+        rtkCompressionEnabled = !rtkCompressionEnabled;
+        updateRtkCompressionToggleUI();
+        vscode.postMessage({ type: 'updateRtkCompressionSetting', enabled: rtkCompressionEnabled });
+    }
+
+    function updateRtkCompressionToggleUI() {
+        if (!rtkCompressionToggle) return;
+        rtkCompressionToggle.classList.toggle('active', rtkCompressionEnabled);
+        rtkCompressionToggle.setAttribute('aria-checked', rtkCompressionEnabled ? 'true' : 'false');
+    }
+
+    function toggleCavemanSetting() {
+        cavemanEnabled = !cavemanEnabled;
+        updateCavemanToggleUI();
+        vscode.postMessage({ type: 'updateCavemanSetting', enabled: cavemanEnabled });
+    }
+
+    function updateCavemanToggleUI() {
+        if (!cavemanToggle) return;
+        cavemanToggle.classList.toggle('active', cavemanEnabled);
+        cavemanToggle.setAttribute('aria-checked', cavemanEnabled ? 'true' : 'false');
+    }
+
+    function updateObservabilityUI() {
+        var pendingCommands = workerTasks.filter(function (t) { return t.role === 'command' && t.status !== 'done'; }).length;
+        var pendingAgents = workerTasks.filter(function (t) { return t.role === 'subagent' && t.status !== 'done'; }).length;
+        if (observabilitySessionCalls) observabilitySessionCalls.textContent = String(currentSessionCalls.length);
+        if (observabilityHistoryCount) observabilityHistoryCount.textContent = String(persistedHistory.length);
+        if (observabilityPendingCommands) observabilityPendingCommands.textContent = String(pendingCommands);
+        if (observabilityPendingAgents) observabilityPendingAgents.textContent = String(pendingAgents);
+        if (observabilityLlmRequests) observabilityLlmRequests.textContent = formatObservabilityNumber(observabilityMetrics.requestCount);
+        if (observabilityInputTokens) observabilityInputTokens.textContent = formatObservabilityCompact(observabilityMetrics.inputTokens);
+        if (observabilityOutputTokens) observabilityOutputTokens.textContent = formatObservabilityCompact(observabilityMetrics.outputTokens);
+        if (observabilityCachedTokens) observabilityCachedTokens.textContent = formatObservabilityCompact(observabilityMetrics.cachedTokens);
+        if (observabilityCredits) observabilityCredits.textContent = formatObservabilityCompact((Number(observabilityMetrics.nanoAiu) || 0) / 1000000000);
+        if (observabilityRtkSaved) observabilityRtkSaved.textContent = formatObservabilityCompact(observabilityMetrics.rtkSavedTokens);
+        if (observabilityRtkSavings) observabilityRtkSavings.textContent = formatPercent(observabilityMetrics.rtkSavingsPct);
+        if (observabilitySource) observabilitySource.textContent = observabilityMetrics.source || 'unavailable';
+    }
+
+    function formatObservabilityNumber(value) {
+        var n = Number(value);
+        if (!isFinite(n)) {
+            return '0';
+        }
+        return Math.round(n).toLocaleString();
+    }
+
+    function formatObservabilityCompact(value) {
+        var n = Number(value);
+        if (!isFinite(n)) {
+            return '0';
+        }
+
+        var sign = n < 0 ? '-' : '';
+        var abs = Math.abs(n);
+
+        if (abs >= 1000000) {
+            return sign + compactWithSuffix(abs / 1000000, 'M');
+        }
+        if (abs >= 1000) {
+            return sign + compactWithSuffix(abs / 1000, 'K');
+        }
+        return sign + Math.round(abs).toLocaleString();
+    }
+
+    function compactWithSuffix(value, suffix) {
+        var decimals = value >= 100 ? 0 : 2;
+        var rounded = value.toFixed(decimals).replace(/\.0+$/, '');
+        return rounded + suffix;
+    }
+
+    function formatPercent(value) {
+        var n = Number(value);
+        if (!isFinite(n)) {
+            return '0%';
+        }
+        var rounded = (Math.round(n * 100) / 100).toFixed(2).replace(/\.0+$/, '');
+        return rounded + '%';
+    }
+
+    function normalizeResponseTimeout(value) {
+        if (!Number.isFinite(value)) {
+            return RESPONSE_TIMEOUT_DEFAULT;
+        }
+        if (!RESPONSE_TIMEOUT_ALLOWED_VALUES.has(value)) {
+            return RESPONSE_TIMEOUT_DEFAULT;
+        }
+        return value;
+    }
+
+    function handleResponseTimeoutChange() {
+        if (!responseTimeoutSelect) return;
+        var value = parseInt(responseTimeoutSelect.value, 10);
+        console.log('[AskAway] Response timeout changed to:', value);
+        if (!isNaN(value)) {
+            responseTimeout = value;
+            vscode.postMessage({ type: 'updateResponseTimeout', value: value });
+        }
+    }
+
+    function updateResponseTimeoutUI() {
+        if (!responseTimeoutSelect) return;
+        responseTimeoutSelect.value = String(responseTimeout);
+    }
+
+    function handleSessionWarningHoursChange() {
+        if (!sessionWarningHoursSelect) return;
+        var value = parseInt(sessionWarningHoursSelect.value, 10);
+        if (!isNaN(value) && value >= 0 && value <= 8) {
+            sessionWarningHours = value;
+            vscode.postMessage({ type: 'updateSessionWarningHours', value: value });
+        }
+        sessionWarningHoursSelect.value = String(sessionWarningHours);
+    }
+
+    function updateSessionWarningHoursUI() {
+        if (!sessionWarningHoursSelect) return;
+        sessionWarningHoursSelect.value = String(sessionWarningHours);
+    }
+
+    function handleMaxAutoResponsesChange() {
+        if (!maxAutoResponsesInput) return;
+        var value = parseInt(maxAutoResponsesInput.value, 10);
+        if (!isNaN(value) && value >= 1 && value <= 50) {
+            maxConsecutiveAutoResponses = value;
+            vscode.postMessage({ type: 'updateMaxConsecutiveAutoResponses', value: value });
+        } else {
+            // Reset to valid value
+            maxAutoResponsesInput.value = maxConsecutiveAutoResponses;
+        }
+    }
+
+    function updateMaxAutoResponsesUI() {
+        if (!maxAutoResponsesInput) return;
+        maxAutoResponsesInput.value = maxConsecutiveAutoResponses;
+    }
+
+    function toggleHumanDelaySetting() {
+        humanLikeDelayEnabled = !humanLikeDelayEnabled;
+        vscode.postMessage({ type: 'updateHumanDelaySetting', enabled: humanLikeDelayEnabled });
+        updateHumanDelayUI();
+    }
+
+    function handleHumanDelayMinChange() {
+        if (!humanDelayMinInput) return;
+        var value = parseInt(humanDelayMinInput.value, 10);
+        if (!isNaN(value) && value >= 1 && value <= 30) {
+            if (value > humanLikeDelayMax) {
+                value = humanLikeDelayMax;
+            }
+            humanLikeDelayMin = value;
+            vscode.postMessage({ type: 'updateHumanDelayMin', value: value });
+        }
+        humanDelayMinInput.value = humanLikeDelayMin;
+    }
+
+    function handleHumanDelayMaxChange() {
+        if (!humanDelayMaxInput) return;
+        var value = parseInt(humanDelayMaxInput.value, 10);
+        if (!isNaN(value) && value >= 2 && value <= 60) {
+            if (value < humanLikeDelayMin) {
+                value = humanLikeDelayMin;
+            }
+            humanLikeDelayMax = value;
+            vscode.postMessage({ type: 'updateHumanDelayMax', value: value });
+        }
+        humanDelayMaxInput.value = humanLikeDelayMax;
+    }
+
+    function updateHumanDelayUI() {
+        if (humanDelayToggle) {
+            humanDelayToggle.classList.toggle('active', humanLikeDelayEnabled);
+            humanDelayToggle.setAttribute('aria-checked', humanLikeDelayEnabled ? 'true' : 'false');
+        }
+        if (humanDelayRangeContainer) {
+            humanDelayRangeContainer.style.display = humanLikeDelayEnabled ? 'flex' : 'none';
+        }
+        if (humanDelayMinInput) {
+            humanDelayMinInput.value = humanLikeDelayMin;
+        }
+        if (humanDelayMaxInput) {
+            humanDelayMaxInput.value = humanLikeDelayMax;
+        }
+    }
+
+    // ========== Autopilot Prompts Array Functions ==========
+
+    // Track which autopilot prompt is being edited (-1 = adding new, >= 0 = editing index)
+    var editingAutopilotPromptIndex = -1;
+    // Track drag state
+    var draggedAutopilotIndex = -1;
+
+    function renderAutopilotPromptsList() {
+        if (!autopilotPromptsList) return;
+
+        if (autopilotPrompts.length === 0) {
+            autopilotPromptsList.innerHTML = '<div class="empty-prompts-hint">No prompts added. Add prompts to cycle through during Autopilot.</div>';
+            return;
+        }
+
+        autopilotPromptsList.innerHTML = autopilotPrompts.map(function (prompt, index) {
+            var truncated = prompt.length > 80 ? prompt.substring(0, 80) + '...' : prompt;
+            var tooltipText = prompt.length > 300 ? prompt.substring(0, 300) + '...' : prompt;
+            tooltipText = tooltipText.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return '<div class="autopilot-prompt-item" draggable="true" data-index="' + index + '" title="' + tooltipText + '">' +
+                '<span class="autopilot-prompt-drag-handle codicon codicon-grabber"></span>' +
+                '<span class="autopilot-prompt-number">' + (index + 1) + '.</span>' +
+                '<span class="autopilot-prompt-text">' + escapeHtml(truncated) + '</span>' +
+                '<div class="autopilot-prompt-actions">' +
+                '<button class="prompt-item-btn edit" data-index="' + index + '" title="Edit"><span class="codicon codicon-edit"></span></button>' +
+                '<button class="prompt-item-btn delete" data-index="' + index + '" title="Delete"><span class="codicon codicon-trash"></span></button>' +
+                '</div></div>';
+        }).join('');
+    }
+
+    function showAddAutopilotPromptForm() {
+        if (!addAutopilotPromptForm || !autopilotPromptInput) return;
+        editingAutopilotPromptIndex = -1;
+        autopilotPromptInput.value = '';
+        addAutopilotPromptForm.classList.remove('hidden');
+        addAutopilotPromptForm.removeAttribute('data-editing-index');
+        autopilotPromptInput.focus();
+    }
+
+    function hideAddAutopilotPromptForm() {
+        if (!addAutopilotPromptForm || !autopilotPromptInput) return;
+        addAutopilotPromptForm.classList.add('hidden');
+        autopilotPromptInput.value = '';
+        editingAutopilotPromptIndex = -1;
+        addAutopilotPromptForm.removeAttribute('data-editing-index');
+    }
+
+    function saveAutopilotPrompt() {
+        if (!autopilotPromptInput) return;
+        var prompt = autopilotPromptInput.value.trim();
+        if (!prompt) return;
+
+        var editingIndex = addAutopilotPromptForm.getAttribute('data-editing-index');
+        if (editingIndex !== null) {
+            vscode.postMessage({ type: 'editAutopilotPrompt', index: parseInt(editingIndex, 10), prompt: prompt });
+        } else {
+            vscode.postMessage({ type: 'addAutopilotPrompt', prompt: prompt });
+        }
+        hideAddAutopilotPromptForm();
+    }
+
+    function handleAutopilotPromptsListClick(e) {
+        var target = e.target.closest('.prompt-item-btn');
+        if (!target) return;
+
+        var index = parseInt(target.getAttribute('data-index'), 10);
+        if (isNaN(index)) return;
+
+        if (target.classList.contains('edit')) {
+            editAutopilotPrompt(index);
+        } else if (target.classList.contains('delete')) {
+            deleteAutopilotPrompt(index);
+        }
+    }
+
+    function editAutopilotPrompt(index) {
+        if (index < 0 || index >= autopilotPrompts.length) return;
+        if (!addAutopilotPromptForm || !autopilotPromptInput) return;
+
+        var prompt = autopilotPrompts[index];
+        editingAutopilotPromptIndex = index;
+        autopilotPromptInput.value = prompt;
+        addAutopilotPromptForm.setAttribute('data-editing-index', index);
+        addAutopilotPromptForm.classList.remove('hidden');
+        autopilotPromptInput.focus();
+    }
+
+    function deleteAutopilotPrompt(index) {
+        if (index < 0 || index >= autopilotPrompts.length) return;
+        vscode.postMessage({ type: 'removeAutopilotPrompt', index: index });
+    }
+
+    function handleAutopilotDragStart(e) {
+        var item = e.target.closest('.autopilot-prompt-item');
+        if (!item) return;
+        draggedAutopilotIndex = parseInt(item.getAttribute('data-index'), 10);
+        item.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', draggedAutopilotIndex);
+    }
+
+    function handleAutopilotDragOver(e) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        var item = e.target.closest('.autopilot-prompt-item');
+        if (!item || !autopilotPromptsList) return;
+
+        autopilotPromptsList.querySelectorAll('.autopilot-prompt-item').forEach(function (el) {
+            el.classList.remove('drag-over-top', 'drag-over-bottom');
+        });
+
+        var rect = item.getBoundingClientRect();
+        var midY = rect.top + rect.height / 2;
+        if (e.clientY < midY) {
+            item.classList.add('drag-over-top');
+        } else {
+            item.classList.add('drag-over-bottom');
+        }
+    }
+
+    function handleAutopilotDragEnd(e) {
+        draggedAutopilotIndex = -1;
+        if (!autopilotPromptsList) return;
+        autopilotPromptsList.querySelectorAll('.autopilot-prompt-item').forEach(function (el) {
+            el.classList.remove('dragging', 'drag-over-top', 'drag-over-bottom');
+        });
+    }
+
+    function handleAutopilotDrop(e) {
+        e.preventDefault();
+        var item = e.target.closest('.autopilot-prompt-item');
+        if (!item || draggedAutopilotIndex < 0) return;
+
+        var toIndex = parseInt(item.getAttribute('data-index'), 10);
+        if (isNaN(toIndex) || draggedAutopilotIndex === toIndex) {
+            handleAutopilotDragEnd(e);
+            return;
+        }
+
+        var rect = item.getBoundingClientRect();
+        var midY = rect.top + rect.height / 2;
+        var insertBelow = e.clientY >= midY;
+
+        var targetIndex = toIndex;
+        if (insertBelow && toIndex < autopilotPrompts.length - 1) {
+            targetIndex = toIndex + 1;
+        }
+
+        if (draggedAutopilotIndex < targetIndex) {
+            targetIndex--;
+        }
+
+        if (draggedAutopilotIndex !== targetIndex) {
+            vscode.postMessage({ type: 'reorderAutopilotPrompts', fromIndex: draggedAutopilotIndex, toIndex: targetIndex });
+        }
+
+        handleAutopilotDragEnd(e);
+    }
+
+    // ========== End Autopilot Prompts Functions ==========
+
+    /**
+     * Handle send action triggered by VS Code command/keybinding.
+     */
+    function handleSendFromShortcut() {
+        if (!chatInput || document.activeElement !== chatInput) {
+            return;
+        }
+
+        if (isApprovalQuestion && approvalModal && !approvalModal.classList.contains('hidden')) {
+            var inputText = chatInput.value.trim();
+            if (!inputText) {
+                handleApprovalContinue();
+                return;
+            }
+        }
+
+        if (editingPromptId) {
+            confirmEditMode();
+            return;
+        }
+
+        if (slashDropdownVisible && selectedSlashIndex >= 0) {
+            selectSlashItem(selectedSlashIndex);
+            return;
+        }
+
+        if (autocompleteVisible && selectedAutocompleteIndex >= 0) {
+            selectAutocompleteItem(selectedAutocompleteIndex);
+            return;
+        }
+
+        handleSend();
+    }
+
+    /**
+     * Capture latest right-click position for context-menu copy resolution.
+     */
+    function handleContextMenu(event) {
+        if (!event || !event.target || !event.target.closest) {
+            lastContextMenuTarget = null;
+            lastContextMenuTimestamp = 0;
+            return;
+        }
+
+        lastContextMenuTarget = event.target;
+        lastContextMenuTimestamp = Date.now();
+    }
+
+    /**
+     * Override Copy when nothing is selected and context-menu target points to a message.
+     */
+    function handleCopy(event) {
+        var selection = window.getSelection ? window.getSelection() : null;
+        if (selection && selection.toString().length > 0) {
+            return;
+        }
+
+        if (!lastContextMenuTarget || (Date.now() - lastContextMenuTimestamp) > CONTEXT_MENU_COPY_MAX_AGE_MS) {
+            return;
+        }
+
+        var copyText = resolveCopyTextFromTarget(lastContextMenuTarget);
+        if (!copyText) {
+            return;
+        }
+
+        if (event) {
+            event.preventDefault();
+        }
+
+        if (event && event.clipboardData) {
+            try {
+                event.clipboardData.setData('text/plain', copyText);
+                lastContextMenuTarget = null;
+                lastContextMenuTimestamp = 0;
+                return;
+            } catch (error) {
+                // Fall through to extension host clipboard API fallback.
+            }
+        }
+
+        vscode.postMessage({ type: 'copyToClipboard', text: copyText });
+        lastContextMenuTarget = null;
+        lastContextMenuTimestamp = 0;
+    }
+
+    /**
+     * Resolve copy payload from the exact message area that was right-clicked.
+     */
+    function resolveCopyTextFromTarget(target) {
+        if (!target || !target.closest) {
+            return '';
+        }
+
+        var pendingQuestion = target.closest('.pending-ai-question');
+        if (pendingQuestion) {
+            if (pendingToolCall && typeof pendingToolCall.prompt === 'string') {
+                return pendingToolCall.prompt;
+            }
+            return (pendingQuestion.textContent || '').trim();
+        }
+
+        var toolCallEntry = resolveToolCallEntryFromTarget(target);
+        if (!toolCallEntry) {
+            return '';
+        }
+
+        if (target.closest('.tool-call-ai-response')) {
+            return typeof toolCallEntry.prompt === 'string' ? toolCallEntry.prompt : '';
+        }
+
+        if (target.closest('.tool-call-user-response')) {
+            return typeof toolCallEntry.response === 'string' ? toolCallEntry.response : '';
+        }
+
+        if (target.closest('.chips-container')) {
+            return formatAttachmentsForCopy(toolCallEntry.attachments);
+        }
+
+        return formatToolCallEntryForCopy(toolCallEntry);
+    }
+
+    function resolveToolCallEntryFromTarget(target) {
+        var card = target.closest('.tool-call-card');
+        if (!card) {
+            return null;
+        }
+        return resolveToolCallEntryFromCardId(card.getAttribute('data-id'));
+    }
+
+    function resolveToolCallEntryFromCardId(cardId) {
+        if (!cardId) {
+            return null;
+        }
+        // Check current session first
+        for (var i = 0; i < currentSessionCalls.length; i++) {
+            if (currentSessionCalls[i].id === cardId) return currentSessionCalls[i];
+        }
+        // Check persisted history
+        for (var h = 0; h < persistedHistory.length; h++) {
+            var session = persistedHistory[h];
+            if (session && session.calls) {
+                for (var j = 0; j < session.calls.length; j++) {
+                    if (session.calls[j].id === cardId) return session.calls[j];
+                }
+            }
+        }
+        return null;
+    }
+
+    function formatAttachmentsForCopy(attachments) {
+        if (!attachments || attachments.length === 0) return '';
+        return attachments.map(function (a) { return a.name || a.id || ''; }).filter(Boolean).join(', ');
+    }
+
+    function formatToolCallEntryForCopy(entry) {
+        if (!entry) return '';
+        var parts = [];
+        if (entry.prompt) parts.push('Q: ' + entry.prompt);
+        if (entry.response) parts.push('A: ' + entry.response);
+        return parts.join('\n\n');
+    }
+
+    function showAddPromptForm() {
+        if (!addPromptForm || !addPromptBtn) return;
+        addPromptForm.classList.remove('hidden');
+        addPromptBtn.classList.add('hidden');
+        var nameInput = document.getElementById('prompt-name-input');
+        var textInput = document.getElementById('prompt-text-input');
+        if (nameInput) { nameInput.value = ''; nameInput.focus(); }
+        if (textInput) textInput.value = '';
+        // Clear edit mode
+        addPromptForm.removeAttribute('data-editing-id');
+    }
+
+    function hideAddPromptForm() {
+        if (!addPromptForm || !addPromptBtn) return;
+        addPromptForm.classList.add('hidden');
+        addPromptBtn.classList.remove('hidden');
+        addPromptForm.removeAttribute('data-editing-id');
+    }
+
+    function saveNewPrompt() {
+        var nameInput = document.getElementById('prompt-name-input');
+        var textInput = document.getElementById('prompt-text-input');
+        if (!nameInput || !textInput) return;
+
+        var name = nameInput.value.trim();
+        var prompt = textInput.value.trim();
+
+        if (!name || !prompt) {
+            return;
+        }
+
+        var editingId = addPromptForm.getAttribute('data-editing-id');
+        if (editingId) {
+            // Editing existing prompt
+            vscode.postMessage({ type: 'editReusablePrompt', id: editingId, name: name, prompt: prompt });
+        } else {
+            // Adding new prompt
+            vscode.postMessage({ type: 'addReusablePrompt', name: name, prompt: prompt });
+        }
+
+        hideAddPromptForm();
+    }
+
+    function renderPromptsList() {
+        if (!promptsList) return;
+
+        if (reusablePrompts.length === 0) {
+            promptsList.innerHTML = '';
+            return;
+        }
+
+        // Compact list - show only name, full prompt on hover via title
+        promptsList.innerHTML = reusablePrompts.map(function (p) {
+            // Truncate very long prompts for tooltip to prevent massive tooltips
+            var tooltipText = p.prompt.length > 300 ? p.prompt.substring(0, 300) + '...' : p.prompt;
+            // Escape for HTML attribute
+            tooltipText = tooltipText.replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return '<div class="prompt-item compact" data-id="' + escapeHtml(p.id) + '" title="' + tooltipText + '">' +
+                '<div class="prompt-item-content">' +
+                '<span class="prompt-item-name">/' + escapeHtml(p.name) + '</span>' +
+                '</div>' +
+                '<div class="prompt-item-actions">' +
+                '<button class="prompt-item-btn edit" data-id="' + escapeHtml(p.id) + '" title="Edit"><span class="codicon codicon-edit"></span></button>' +
+                '<button class="prompt-item-btn delete" data-id="' + escapeHtml(p.id) + '" title="Delete"><span class="codicon codicon-trash"></span></button>' +
+                '</div></div>';
+        }).join('');
+
+        // Bind edit/delete events
+        promptsList.querySelectorAll('.prompt-item-btn.edit').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var id = btn.getAttribute('data-id');
+                editPrompt(id);
+            });
+        });
+
+        promptsList.querySelectorAll('.prompt-item-btn.delete').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var id = btn.getAttribute('data-id');
+                deletePrompt(id);
+            });
+        });
+    }
+
+    function editPrompt(id) {
+        var prompt = reusablePrompts.find(function (p) { return p.id === id; });
+        if (!prompt) return;
+
+        var nameInput = document.getElementById('prompt-name-input');
+        var textInput = document.getElementById('prompt-text-input');
+        if (!nameInput || !textInput) return;
+
+        // Show form with existing values
+        addPromptForm.classList.remove('hidden');
+        addPromptBtn.classList.add('hidden');
+        addPromptForm.setAttribute('data-editing-id', id);
+
+        nameInput.value = prompt.name;
+        textInput.value = prompt.prompt;
+        nameInput.focus();
+    }
+
+    function deletePrompt(id) {
+        vscode.postMessage({ type: 'removeReusablePrompt', id: id });
+    }
+
+    // ===== SLASH COMMAND FUNCTIONS =====
+
+    /**
+     * Expand /commandName patterns to their full prompt text
+     * Only expands known commands at the start of lines or after whitespace
+     */
+    function expandSlashCommands(text) {
+        if (!text || reusablePrompts.length === 0) return text;
+
+        // Use stored mappings from selectSlashItem if available
+        var mappings = chatInput && chatInput._slashPrompts ? chatInput._slashPrompts : {};
+
+        // Build a regex to match all known prompt names
+        var promptNames = reusablePrompts.map(function (p) { return p.name; });
+        if (Object.keys(mappings).length > 0) {
+            Object.keys(mappings).forEach(function (name) {
+                if (promptNames.indexOf(name) === -1) promptNames.push(name);
+            });
+        }
+
+        // Match /promptName at start or after whitespace
+        var expanded = text;
+        promptNames.forEach(function (name) {
+            // Escape special regex chars in name
+            var escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            var regex = new RegExp('(^|\\s)/' + escapedName + '(?=\\s|$)', 'g');
+            var fullPrompt = mappings[name] || (reusablePrompts.find(function (p) { return p.name === name; }) || {}).prompt || '';
+            if (fullPrompt) {
+                expanded = expanded.replace(regex, '$1' + fullPrompt);
+            }
+        });
+
+        // Clear stored mappings after expansion
+        if (chatInput) chatInput._slashPrompts = {};
+
+        return expanded.trim();
+    }
+
+    function handleSlashCommands() {
+        if (!chatInput) return;
+        var value = chatInput.value;
+        var cursorPos = chatInput.selectionStart;
+
+        // Find slash at start of input or after whitespace
+        var slashPos = -1;
+        for (var i = cursorPos - 1; i >= 0; i--) {
+            if (value[i] === '/') {
+                // Check if it's at start or after whitespace
+                if (i === 0 || /\s/.test(value[i - 1])) {
+                    slashPos = i;
+                }
+                break;
+            }
+            if (/\s/.test(value[i])) break;
+        }
+
+        if (slashPos >= 0 && reusablePrompts.length > 0) {
+            var query = value.substring(slashPos + 1, cursorPos);
+            slashStartPos = slashPos;
+            if (slashDebounceTimer) clearTimeout(slashDebounceTimer);
+            slashDebounceTimer = setTimeout(function () {
+                // Filter locally for instant results
+                var queryLower = query.toLowerCase();
+                var matchingPrompts = reusablePrompts.filter(function (p) {
+                    return p.name.toLowerCase().includes(queryLower) ||
+                        p.prompt.toLowerCase().includes(queryLower);
+                });
+                showSlashDropdown(matchingPrompts);
+            }, 50);
+        } else if (slashDropdownVisible) {
+            hideSlashDropdown();
+        }
+    }
+
+    function showSlashDropdown(results) {
+        if (!slashDropdown || !slashList || !slashEmpty) return;
+        slashResults = results;
+        selectedSlashIndex = results.length > 0 ? 0 : -1;
+
+        // Hide file autocomplete if showing slash commands
+        hideAutocomplete();
+
+        if (results.length === 0) {
+            slashList.classList.add('hidden');
+            slashEmpty.classList.remove('hidden');
+        } else {
+            slashList.classList.remove('hidden');
+            slashEmpty.classList.add('hidden');
+            renderSlashList();
+        }
+        slashDropdown.classList.remove('hidden');
+        slashDropdownVisible = true;
+    }
+
+    function hideSlashDropdown() {
+        if (slashDropdown) slashDropdown.classList.add('hidden');
+        slashDropdownVisible = false;
+        slashResults = [];
+        selectedSlashIndex = -1;
+        slashStartPos = -1;
+        if (slashDebounceTimer) { clearTimeout(slashDebounceTimer); slashDebounceTimer = null; }
+    }
+
+    function renderSlashList() {
+        if (!slashList) return;
+        slashList.innerHTML = slashResults.map(function (p, index) {
+            var truncatedPrompt = p.prompt.length > 50 ? p.prompt.substring(0, 50) + '...' : p.prompt;
+            // Prepare tooltip text - escape for HTML attribute
+            var tooltipText = p.prompt.length > 500 ? p.prompt.substring(0, 500) + '...' : p.prompt;
+            tooltipText = tooltipText.replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return '<div class="slash-item' + (index === selectedSlashIndex ? ' selected' : '') + '" data-index="' + index + '" data-tooltip="' + tooltipText + '">' +
+                '<span class="slash-item-icon"><span class="codicon codicon-symbol-keyword"></span></span>' +
+                '<div class="slash-item-content">' +
+                '<span class="slash-item-name">/' + escapeHtml(p.name) + '</span>' +
+                '<span class="slash-item-preview">' + escapeHtml(truncatedPrompt) + '</span>' +
+                '</div></div>';
+        }).join('');
+
+        slashList.querySelectorAll('.slash-item').forEach(function (item) {
+            item.addEventListener('click', function () { selectSlashItem(parseInt(item.getAttribute('data-index'), 10)); });
+            item.addEventListener('mouseenter', function () { selectedSlashIndex = parseInt(item.getAttribute('data-index'), 10); updateSlashSelection(); });
+        });
+        scrollToSelectedSlashItem();
+    }
+
+    function updateSlashSelection() {
+        if (!slashList) return;
+        slashList.querySelectorAll('.slash-item').forEach(function (item, index) {
+            item.classList.toggle('selected', index === selectedSlashIndex);
+        });
+        scrollToSelectedSlashItem();
+    }
+
+    function scrollToSelectedSlashItem() {
+        var selectedItem = slashList ? slashList.querySelector('.slash-item.selected') : null;
+        if (selectedItem) selectedItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
+    function selectSlashItem(index) {
+        if (index < 0 || index >= slashResults.length || !chatInput || slashStartPos < 0) return;
+        var prompt = slashResults[index];
+        var value = chatInput.value;
+        var cursorPos = chatInput.selectionStart;
+
+        // Create a slash tag representation - when sent, we'll expand it to full prompt
+        // For now, insert /name as text and store the mapping
+        var slashText = '/' + prompt.name + ' ';
+        chatInput.value = value.substring(0, slashStartPos) + slashText + value.substring(cursorPos);
+        var newCursorPos = slashStartPos + slashText.length;
+        chatInput.setSelectionRange(newCursorPos, newCursorPos);
+
+        // Store the prompt reference for expansion on send
+        if (!chatInput._slashPrompts) chatInput._slashPrompts = {};
+        chatInput._slashPrompts[prompt.name] = prompt.prompt;
+
+        hideSlashDropdown();
+        chatInput.focus();
+        updateSendButtonState();
+    }
+
+    // ===== NOTIFICATION SOUND FUNCTION =====
+
+    /**
+     * Unlock audio playback after first user interaction
+     * Required due to browser autoplay policy
+     */
+    function unlockAudioOnInteraction() {
+        function unlock() {
+            if (audioUnlocked) return;
+            var audio = document.getElementById('notification-sound');
+            if (audio) {
+                // Play and immediately pause to unlock
+                audio.volume = 0;
+                var playPromise = audio.play();
+                if (playPromise !== undefined) {
+                    playPromise.then(function () {
+                        audio.pause();
+                        audio.currentTime = 0;
+                        audio.volume = 0.5;
+                        audioUnlocked = true;
+                        console.log('[TaskSync] Audio unlocked successfully');
+                    }).catch(function () {
+                        // Still locked, will try again on next interaction
+                    });
+                }
+            }
+            // Remove listeners after first attempt
+            document.removeEventListener('click', unlock);
+            document.removeEventListener('keydown', unlock);
+        }
+        document.addEventListener('click', unlock, { once: true });
+        document.addEventListener('keydown', unlock, { once: true });
+    }
+
+    function playNotificationSound() {
+        console.log('[TaskSync] playNotificationSound called, audioUnlocked:', audioUnlocked);
+        // Play the preloaded audio element
+        try {
+            var audio = document.getElementById('notification-sound');
+            console.log('[TaskSync] Audio element found:', !!audio);
+            if (audio) {
+                audio.currentTime = 0; // Reset to beginning
+                audio.volume = 0.5;
+                console.log('[TaskSync] Attempting to play audio...');
+                var playPromise = audio.play();
+                if (playPromise !== undefined) {
+                    playPromise.then(function () {
+                        console.log('[TaskSync] Audio playback started successfully');
+                    }).catch(function (e) {
+                        console.log('[TaskSync] Could not play audio:', e.message);
+                        console.log('[TaskSync] Error name:', e.name);
+                        // If autoplay blocked, show visual feedback
+                        flashNotification();
+                    });
+                }
+            } else {
+                console.log('[TaskSync] No audio element found, showing visual notification');
+                flashNotification();
+            }
+        } catch (e) {
+            console.log('[TaskSync] Could not play notification sound:', e);
+            flashNotification();
+        }
+    }
+
+    function flashNotification() {
+        // Visual flash when audio fails
+        var body = document.body;
+        body.style.transition = 'background-color 0.1s ease';
+        var originalBg = body.style.backgroundColor;
+        body.style.backgroundColor = 'var(--vscode-textLink-foreground, #3794ff)';
+        setTimeout(function () {
+            body.style.backgroundColor = originalBg || '';
+        }, 150);
+    }
+
+    function bindDragAndDrop() {
+        if (!queueList) return;
+        queueList.querySelectorAll('.queue-item').forEach(function (item) {
+            item.addEventListener('dragstart', function (e) {
+                e.dataTransfer.setData('text/plain', String(parseInt(item.getAttribute('data-index'), 10)));
+                item.classList.add('dragging');
+            });
+            item.addEventListener('dragend', function () { item.classList.remove('dragging'); });
+            item.addEventListener('dragover', function (e) { e.preventDefault(); item.classList.add('drag-over'); });
+            item.addEventListener('dragleave', function () { item.classList.remove('drag-over'); });
+            item.addEventListener('drop', function (e) {
+                e.preventDefault();
+                var fromIndex = parseInt(e.dataTransfer.getData('text/plain'), 10);
+                var toIndex = parseInt(item.getAttribute('data-index'), 10);
+                item.classList.remove('drag-over');
+                if (fromIndex !== toIndex && !isNaN(fromIndex) && !isNaN(toIndex)) reorderQueue(fromIndex, toIndex);
+            });
+        });
+    }
+
+    function bindKeyboardNavigation() {
+        if (!queueList) return;
+        var items = queueList.querySelectorAll('.queue-item');
+        items.forEach(function (item, index) {
+            item.addEventListener('keydown', function (e) {
+                if (e.key === 'ArrowDown' && index < items.length - 1) { e.preventDefault(); items[index + 1].focus(); }
+                else if (e.key === 'ArrowUp' && index > 0) { e.preventDefault(); items[index - 1].focus(); }
+                else if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); var id = item.getAttribute('data-id'); if (id) removeFromQueue(id); }
+            });
+        });
+    }
+
+    function reorderQueue(fromIndex, toIndex) {
+        var removed = promptQueue.splice(fromIndex, 1)[0];
+        promptQueue.splice(toIndex, 0, removed);
+        renderQueue();
+        vscode.postMessage({ type: 'reorderQueue', fromIndex: fromIndex, toIndex: toIndex });
+    }
+
+    function handleAutocomplete() {
+        if (!chatInput) return;
+        var value = chatInput.value;
+        var cursorPos = chatInput.selectionStart;
+        var hashPos = -1;
+        for (var i = cursorPos - 1; i >= 0; i--) {
+            if (value[i] === '#') { hashPos = i; break; }
+            if (value[i] === ' ' || value[i] === '\n') break;
+        }
+        if (hashPos >= 0) {
+            var query = value.substring(hashPos + 1, cursorPos);
+            autocompleteStartPos = hashPos;
+            if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+            searchDebounceTimer = setTimeout(function () {
+                vscode.postMessage({ type: 'searchFiles', query: query });
+            }, 150);
+        } else if (autocompleteVisible) {
+            hideAutocomplete();
+        }
+    }
+
+    function showAutocomplete(results) {
+        if (!autocompleteDropdown || !autocompleteList || !autocompleteEmpty) return;
+        autocompleteResults = results;
+        selectedAutocompleteIndex = results.length > 0 ? 0 : -1;
+        if (results.length === 0) {
+            autocompleteList.classList.add('hidden');
+            autocompleteEmpty.classList.remove('hidden');
+        } else {
+            autocompleteList.classList.remove('hidden');
+            autocompleteEmpty.classList.add('hidden');
+            renderAutocompleteList();
+        }
+        autocompleteDropdown.classList.remove('hidden');
+        autocompleteVisible = true;
+    }
+
+    function hideAutocomplete() {
+        if (autocompleteDropdown) autocompleteDropdown.classList.add('hidden');
+        autocompleteVisible = false;
+        autocompleteResults = [];
+        selectedAutocompleteIndex = -1;
+        autocompleteStartPos = -1;
+        if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
+    }
+
+    function renderAutocompleteList() {
+        if (!autocompleteList) return;
+        autocompleteList.innerHTML = autocompleteResults.map(function (file, index) {
+            return '<div class="autocomplete-item' + (index === selectedAutocompleteIndex ? ' selected' : '') + '" data-index="' + index + '">' +
+                '<span class="autocomplete-item-icon"><span class="codicon codicon-' + file.icon + '"></span></span>' +
+                '<div class="autocomplete-item-content"><span class="autocomplete-item-name">' + escapeHtml(file.name) + '</span>' +
+                '<span class="autocomplete-item-path">' + escapeHtml(file.path) + '</span></div></div>';
+        }).join('');
+
+        autocompleteList.querySelectorAll('.autocomplete-item').forEach(function (item) {
+            item.addEventListener('click', function () { selectAutocompleteItem(parseInt(item.getAttribute('data-index'), 10)); });
+            item.addEventListener('mouseenter', function () { selectedAutocompleteIndex = parseInt(item.getAttribute('data-index'), 10); updateAutocompleteSelection(); });
+        });
+        scrollToSelectedItem();
+    }
+
+    function updateAutocompleteSelection() {
+        if (!autocompleteList) return;
+        autocompleteList.querySelectorAll('.autocomplete-item').forEach(function (item, index) {
+            item.classList.toggle('selected', index === selectedAutocompleteIndex);
+        });
+        scrollToSelectedItem();
+    }
+
+    function scrollToSelectedItem() {
+        var selectedItem = autocompleteList ? autocompleteList.querySelector('.autocomplete-item.selected') : null;
+        if (selectedItem) selectedItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
+    function selectAutocompleteItem(index) {
+        if (index < 0 || index >= autocompleteResults.length || !chatInput || autocompleteStartPos < 0) return;
+        var file = autocompleteResults[index];
+        var value = chatInput.value;
+        var cursorPos = chatInput.selectionStart;
+
+        // Check if this is a context item (#terminal, #problems)
+        if (file.isContext && file.uri && file.uri.startsWith('context://')) {
+            // Remove the #query from input - chip will be added
+            chatInput.value = value.substring(0, autocompleteStartPos) + value.substring(cursorPos);
+            var newCursorPos = autocompleteStartPos;
+            chatInput.setSelectionRange(newCursorPos, newCursorPos);
+
+            // Send context reference request to backend
+            vscode.postMessage({
+                type: 'selectContextReference',
+                contextType: file.name, // 'terminal' or 'problems'
+                options: undefined
+            });
+
+            hideAutocomplete();
+            chatInput.focus();
+            autoResizeTextarea();
+            updateInputHighlighter();
+            saveWebviewState();
+            updateSendButtonState();
+            return;
+        }
+
+        // Regular file/folder reference
+        var referenceText = '#' + file.name + ' ';
+        chatInput.value = value.substring(0, autocompleteStartPos) + referenceText + value.substring(cursorPos);
+        var newCursorPos = autocompleteStartPos + referenceText.length;
+        chatInput.setSelectionRange(newCursorPos, newCursorPos);
+        vscode.postMessage({ type: 'addFileReference', file: file });
+        hideAutocomplete();
+        chatInput.focus();
+    }
+
+    function syncAttachmentsWithText() {
+        var text = chatInput ? chatInput.value : '';
+        var toRemove = [];
+        currentAttachments.forEach(function (att) {
+            // Skip temporary attachments (like pasted images)
+            if (att.isTemporary) return;
+            // Skip context attachments (#terminal, #problems) - they use context:// URI
+            if (att.uri && att.uri.startsWith('context://')) return;
+            // Only sync file references that have isTextReference flag
+            if (!att.isTextReference) return;
+            // Check if the #filename reference still exists in text
+            if (text.indexOf('#' + att.name) === -1) toRemove.push(att.id);
+        });
+        if (toRemove.length > 0) {
+            toRemove.forEach(function (id) { vscode.postMessage({ type: 'removeAttachment', attachmentId: id }); });
+            currentAttachments = currentAttachments.filter(function (a) { return toRemove.indexOf(a.id) === -1; });
+            updateChipsDisplay();
+        }
+    }
+
+    function handlePaste(event) {
+        if (!event.clipboardData) return;
+        var items = event.clipboardData.items;
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].type.indexOf('image/') === 0) {
+                event.preventDefault();
+                var file = items[i].getAsFile();
+                if (file) processImageFile(file);
+                return;
+            }
+        }
+    }
+
+    function processImageFile(file) {
+        var reader = new FileReader();
+        reader.onload = function (e) {
+            if (e.target && e.target.result) vscode.postMessage({ type: 'saveImage', data: e.target.result, mimeType: file.type });
+        };
+        reader.readAsDataURL(file);
+    }
+
+    function updateChipsDisplay() {
+        if (!chipsContainer) return;
+        if (currentAttachments.length === 0) {
+            chipsContainer.classList.add('hidden');
+            chipsContainer.innerHTML = '';
+        } else {
+            chipsContainer.classList.remove('hidden');
+            chipsContainer.innerHTML = currentAttachments.map(function (att) {
+                var isImage = att.isTemporary || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(att.name);
+                var iconClass = att.isFolder ? 'folder' : (isImage ? 'file-media' : 'file');
+                var displayName = att.isTemporary ? 'Pasted Image' : att.name;
+                return '<div class="chip" data-id="' + att.id + '" title="' + escapeHtml(att.uri || att.name) + '">' +
+                    '<span class="chip-icon"><span class="codicon codicon-' + iconClass + '"></span></span>' +
+                    '<span class="chip-text">' + escapeHtml(displayName) + '</span>' +
+                    '<button class="chip-remove" data-remove="' + att.id + '" title="Remove"><span class="codicon codicon-close"></span></button></div>';
+            }).join('');
+
+            chipsContainer.querySelectorAll('.chip-remove').forEach(function (btn) {
+                btn.addEventListener('click', function (e) {
+                    e.stopPropagation();
+                    var attId = btn.getAttribute('data-remove');
+                    if (attId) removeAttachment(attId);
+                });
+            });
+        }
+        // Persist attachments so they survive sidebar tab switches
+        saveWebviewState();
+    }
+
+    function removeAttachment(attachmentId) {
+        vscode.postMessage({ type: 'removeAttachment', attachmentId: attachmentId });
+        currentAttachments = currentAttachments.filter(function (a) { return a.id !== attachmentId; });
+        updateChipsDisplay();
+        // saveWebviewState() is called in updateChipsDisplay
+    }
+
+    function escapeHtml(str) {
+        if (!str) return '';
+        var div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    /** Strip markdown syntax for use in plain-text contexts (e.g. card titles). */
+    function stripMarkdown(text) {
+        if (!text) { return ''; }
+        return text
+            .replace(/\*\*(.+?)\*\*/g, '$1')   // bold
+            .replace(/\*(.+?)\*/g, '$1')         // italic
+            .replace(/^#{1,6}\s+/gm, '')          // headings
+            .replace(/`(.+?)`/g, '$1')            // inline code
+            .replace(/\[(.+?)\]\(.+?\)/g, '$1')  // links
+            .trim();
+    }
+
+    /** Render only inline markdown (bold, italic, code) — safe for use inside <span> elements. */
+    function inlineMarkdown(text) {
+        if (!text) { return ''; }
+        var html = escapeHtml(text);
+        html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+        html = html.replace(/`(.+?)`/g, '<code>$1</code>');
+        return html;
+    }
+
+    /** Format ask/reply timestamps for tool call cards.
+     *  askedAt: when the question was shown (ms epoch)
+     *  answeredAt: when the user replied (ms epoch, = tc.timestamp)
+     *  Returns e.g. "14:32 → 14:35" or just "14:32" if no answer yet.
+     */
+    function formatCallTimestamp(askedAt, answeredAt) {
+        var t = askedAt || answeredAt;
+        if (!t) { return ''; }
+        function fmt(ms) {
+            var d = new Date(ms);
+            return d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+        }
+        var asked = fmt(t);
+        if (!answeredAt || !askedAt || answeredAt === askedAt) { return asked; }
+        return asked + ' → ' + fmt(answeredAt);
+    }
+
+    function renderAttachmentsHtml(attachments) {
+        if (!attachments || attachments.length === 0) return '';
+        var items = attachments.map(function (att) {
+            var iconClass = 'file';
+            if (att.isFolder) iconClass = 'folder';
+            else if (att.name && (att.name.endsWith('.png') || att.name.endsWith('.jpg') || att.name.endsWith('.jpeg'))) iconClass = 'file-media';
+            else if ((att.uri || '').indexOf('context://terminal') !== -1) iconClass = 'terminal';
+            else if ((att.uri || '').indexOf('context://problems') !== -1) iconClass = 'error';
+
+            return '<div class="chip" style="margin-top:0;" title="' + escapeHtml(att.name) + '">' +
+                '<span class="chip-icon"><span class="codicon codicon-' + iconClass + '"></span></span>' +
+                '<span class="chip-text">' + escapeHtml(att.name) + '</span>' +
+                '</div>';
+        }).join('');
+
+        return '<div class="chips-container" style="padding: 6px 0 0 0; border: none;">' + items + '</div>';
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // ═══  Voice Mode Functions  ═══════════════════════════════
+    // ══════════════════════════════════════════════════════════
+
+    var voiceRecording = false; // true while mic is actively recording
+
+    /**
+     * Entry point: extension sends voiceStart → show overlay with waveform animation
+     * TTS is handled by the extension host (macOS `say` command) — not in the webview.
+     */
+    async function handleVoiceStart(taskId, question) {
+        voiceMode = true;
+        voiceTaskId = taskId;
+        voiceTranscript = '';
+        voiceInterimTranscript = '';
+        voiceRecording = false;
+
+        showVoiceOverlay(question);
+
+        // Show speaking animation while extension host speaks via macOS
+        updateVoiceStatus('speaking', 'Speaking…');
+        startSpeakingAnimation();
+        // The extension host will send 'voiceSpeakingDone' when TTS finishes
+    }
+
+    /**
+     * Extension host finished speaking → show input area for user's response
+     */
+    function handleVoiceSpeakingDone(taskId) {
+        if (!voiceMode || voiceTaskId !== taskId) return;
+
+        stopVoiceAnimation();
+        updateVoiceStatus('listening', 'Your turn — speak (Fn+Fn) or type below');
+
+        // Hide skip button, show input area
+        var skipBtn = document.getElementById('voice-skip-btn');
+        if (skipBtn) skipBtn.classList.add('hidden');
+
+        showVoiceInputArea();
+
+        // Focus the text input immediately
+        var textInput = document.getElementById('voice-text-input');
+        if (textInput) {
+            textInput.focus();
+        }
+    }
+
+    /**
+     * Cleanup: stop everything and hide overlay
+     */
+    function handleVoiceStop() {
+        if (!voiceMode) return;
+        cleanupVoiceResources();
+        hideVoiceOverlay();
+        voiceMode = false;
+        voiceTaskId = null;
+        voiceRecording = false;
+    }
+
+    // ── Voice Overlay UI ──────────────────────────────────────
+
+    function showVoiceOverlay(question) {
+        var overlay = document.getElementById('voice-overlay');
+        var questionEl = document.getElementById('voice-question');
+        var transcriptEl = document.getElementById('voice-transcript');
+        var inputArea = document.getElementById('voice-input-area');
+        var recordBtn = document.getElementById('voice-record-btn');
+        var textInput = document.getElementById('voice-text-input');
+        var skipBtn = document.getElementById('voice-skip-btn');
+
+        if (questionEl) questionEl.textContent = question;
+        if (transcriptEl) transcriptEl.textContent = '';
+        if (inputArea) inputArea.classList.add('hidden');
+        if (recordBtn) recordBtn.classList.add('hidden');
+        if (textInput) textInput.value = '';
+        if (skipBtn) skipBtn.classList.remove('hidden'); // Show skip during speaking
+        if (overlay) overlay.classList.remove('hidden');
+    }
+
+    function hideVoiceOverlay() {
+        var overlay = document.getElementById('voice-overlay');
+        if (overlay) overlay.classList.add('hidden');
+    }
+
+    function showVoiceInputArea() {
+        var inputArea = document.getElementById('voice-input-area');
+        var textInput = document.getElementById('voice-text-input');
+
+        // Don't show record button — mic access doesn't work in VS Code webview
+        if (inputArea) inputArea.classList.remove('hidden');
+        if (textInput) textInput.focus();
+    }
+
+    function updateVoiceStatus(phase, text) {
+        var statusEl = document.getElementById('voice-status');
+        if (!statusEl) return;
+        statusEl.textContent = text || phase;
+        statusEl.className = 'voice-status voice-status-' + phase;
+    }
+
+    function updateTranscriptDisplay() {
+        var el = document.getElementById('voice-transcript');
+        if (!el) return;
+        var full = voiceTranscript + (voiceInterimTranscript ? ' ' + voiceInterimTranscript : '');
+        el.textContent = full.trim() || '';
+    }
+
+    function sendVoiceResponse(text) {
+        if (!voiceTaskId) return;
+        vscode.postMessage({
+            type: 'voiceResponse',
+            taskId: voiceTaskId,
+            transcription: text
+        });
+        handleVoiceStop();
+    }
+
+    function sendVoiceError(errorMsg) {
+        if (!voiceTaskId) return;
+        vscode.postMessage({
+            type: 'voiceError',
+            taskId: voiceTaskId,
+            error: errorMsg
+        });
+        handleVoiceStop();
+    }
+
+    // ── Record Button Logic ───────────────────────────────────
+
+    async function toggleRecording() {
+        if (voiceRecording) {
+            stopRecording();
+        } else {
+            await startRecording();
+        }
+    }
+
+    async function startRecording() {
+        var recordBtn = document.getElementById('voice-record-btn');
+
+        // Try SpeechRecognition first (works in some environments)
+        var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            try {
+                voiceRecognition = new SpeechRecognition();
+                voiceRecognition.continuous = true;
+                voiceRecognition.interimResults = true;
+                voiceRecognition.lang = 'en-US';
+
+                voiceRecognition.onresult = function(event) {
+                    var interim = '';
+                    var finalText = '';
+                    for (var i = event.resultIndex; i < event.results.length; i++) {
+                        var transcript = event.results[i][0].transcript;
+                        if (event.results[i].isFinal) {
+                            finalText += transcript;
+                        } else {
+                            interim += transcript;
+                        }
+                    }
+                    if (finalText) {
+                        voiceTranscript += (voiceTranscript ? ' ' : '') + finalText.trim();
+                    }
+                    voiceInterimTranscript = interim;
+                    updateTranscriptDisplay();
+                    // Also populate the text input with transcript
+                    var textInput = document.getElementById('voice-text-input');
+                    if (textInput) {
+                        textInput.value = (voiceTranscript + ' ' + voiceInterimTranscript).trim();
+                    }
+                };
+
+                voiceRecognition.onerror = function(event) {
+                    console.warn('[Voice] STT error:', event.error);
+                    if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+                        stopRecording();
+                        updateVoiceStatus('typing', 'Mic access denied. Type your response or use dictation (Fn Fn)');
+                    }
+                };
+
+                voiceRecognition.onend = function() {
+                    if (voiceRecording) {
+                        // Recognition ended but we're still "recording" — try to restart
+                        try { voiceRecognition.start(); } catch (e) { stopRecording(); }
+                    }
+                };
+
+                voiceRecognition.start();
+                voiceRecording = true;
+                if (recordBtn) recordBtn.classList.add('recording');
+                updateVoiceStatus('listening', 'Listening… tap mic to stop');
+
+                // Try to get mic waveform (even if STT handles the transcription separately)
+                startMicWaveformAnimation();
+                return;
+            } catch (e) {
+                console.warn('[Voice] SpeechRecognition failed to start:', e);
+                voiceRecognition = null;
+            }
+        }
+
+        // Fallback: try getUserMedia for audio recording + waveform only
+        // (no transcription — user sees waveform and types/uses dictation)
+        try {
+            voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            voiceRecording = true;
+            if (recordBtn) recordBtn.classList.add('recording');
+            updateVoiceStatus('listening', 'Recording… (no auto-transcription — type what you said below)');
+            startMicWaveformAnimation();
+        } catch (e) {
+            console.warn('[Voice] getUserMedia failed:', e.message);
+            updateVoiceStatus('typing', 'Mic not available. Type your response or use dictation (Fn Fn)');
+        }
+    }
+
+    function stopRecording() {
+        voiceRecording = false;
+        var recordBtn = document.getElementById('voice-record-btn');
+        if (recordBtn) recordBtn.classList.remove('recording');
+
+        if (voiceRecognition) {
+            try { voiceRecognition.stop(); } catch (e) { /* ignore */ }
+            voiceRecognition = null;
+        }
+
+        stopVoiceAnimation();
+
+        if (voiceStream) {
+            voiceStream.getTracks().forEach(function(t) { t.stop(); });
+            voiceStream = null;
+        }
+        if (voiceAudioContext) {
+            try { voiceAudioContext.close(); } catch (e) { /* ignore */ }
+            voiceAudioContext = null;
+        }
+        voiceAnalyser = null;
+
+        // If we got some transcript, put it in the text input
+        var textInput = document.getElementById('voice-text-input');
+        if (textInput && voiceTranscript.trim()) {
+            textInput.value = voiceTranscript.trim();
+        }
+
+        updateVoiceStatus('ready', 'Review and send, or tap mic to record again');
+    }
+
+    // ── TTS (Text-to-Speech) ──────────────────────────────────
+
+    function speakText(text) {
+        return new Promise(function(resolve) {
+            if (!window.speechSynthesis) {
+                console.warn('[Voice] SpeechSynthesis not available');
+                resolve();
+                return;
+            }
+
+            // Cancel any ongoing speech
+            window.speechSynthesis.cancel();
+
+            var utterance = new SpeechSynthesisUtterance(text);
+            utterance.rate = 1.05;
+            utterance.pitch = 1.0;
+            utterance.volume = 1.0;
+
+            // Try to pick a good voice
+            var voices = window.speechSynthesis.getVoices();
+            if (voices.length > 0) {
+                var preferred = voices.find(function(v) {
+                    return v.lang.startsWith('en') && v.name.toLowerCase().includes('natural');
+                }) || voices.find(function(v) {
+                    return v.lang.startsWith('en') && !v.name.toLowerCase().includes('google');
+                }) || voices.find(function(v) {
+                    return v.lang.startsWith('en');
+                });
+                if (preferred) utterance.voice = preferred;
+            }
+
+            utterance.onend = function() { resolve(); };
+            utterance.onerror = function(e) {
+                console.warn('[Voice] TTS error:', e.error);
+                resolve();
+            };
+
+            window.speechSynthesis.speak(utterance);
+        });
+    }
+
+    // ── Waveform Animation ────────────────────────────────────
+
+    /**
+     * Synthetic "speaking" animation — smooth sine wave bars (no mic needed)
+     */
+    function startSpeakingAnimation() {
+        var canvas = document.getElementById('voice-waveform');
+        if (!canvas) return;
+        var ctx = canvas.getContext('2d');
+        var width = canvas.width;
+        var height = canvas.height;
+        var phase = 0;
+
+        function draw() {
+            if (!voiceMode) return;
+            voiceAnimationFrame = requestAnimationFrame(draw);
+            ctx.clearRect(0, 0, width, height);
+
+            phase += 0.06;
+            var barCount = 32;
+            var gap = 3;
+            var barWidth = (width - (barCount - 1) * gap) / barCount;
+            var centerY = height / 2;
+
+            for (var i = 0; i < barCount; i++) {
+                var v1 = Math.sin(phase + i * 0.25) * 0.5 + 0.5;
+                var v2 = Math.sin(phase * 1.3 + i * 0.18) * 0.3 + 0.5;
+                var v3 = Math.sin(phase * 0.7 + i * 0.35) * 0.2 + 0.5;
+                var value = (v1 + v2 + v3) / 3;
+                var barHeight = Math.max(3, value * centerY * 0.75);
+
+                var alpha = 0.35 + value * 0.65;
+                ctx.fillStyle = 'hsla(210, 85%, 62%, ' + alpha + ')';
+                var x = i * (barWidth + gap);
+                var radius = barWidth / 2;
+                roundedRect(ctx, x, centerY - barHeight, barWidth, barHeight * 2, radius);
+            }
+        }
+        draw();
+    }
+
+    /**
+     * Real mic-driven waveform animation
+     */
+    async function startMicWaveformAnimation() {
+        var canvas = document.getElementById('voice-waveform');
+        if (!canvas) return;
+
+        try {
+            // If we already have a stream from recording, reuse it
+            if (!voiceStream) {
+                voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            }
+            voiceAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            var source = voiceAudioContext.createMediaStreamSource(voiceStream);
+            voiceAnalyser = voiceAudioContext.createAnalyser();
+            voiceAnalyser.fftSize = 128;
+            voiceAnalyser.smoothingTimeConstant = 0.75;
+            source.connect(voiceAnalyser);
+
+            stopVoiceAnimation();
+
+            var ctx = canvas.getContext('2d');
+            var width = canvas.width;
+            var height = canvas.height;
+            var bufferLength = voiceAnalyser.frequencyBinCount;
+            var dataArray = new Uint8Array(bufferLength);
+
+            function draw() {
+                if (!voiceMode || !voiceAnalyser) return;
+                voiceAnimationFrame = requestAnimationFrame(draw);
+
+                voiceAnalyser.getByteFrequencyData(dataArray);
+                ctx.clearRect(0, 0, width, height);
+
+                var barCount = 32;
+                var gap = 3;
+                var barWidth = (width - (barCount - 1) * gap) / barCount;
+                var centerY = height / 2;
+
+                for (var i = 0; i < barCount; i++) {
+                    var dataIndex = Math.floor(i * bufferLength / barCount);
+                    var value = dataArray[dataIndex] / 255;
+                    var barHeight = Math.max(3, value * centerY * 0.85);
+
+                    var hue = 210 + value * 40;
+                    var alpha = 0.4 + value * 0.6;
+                    ctx.fillStyle = 'hsla(' + hue + ', 85%, 60%, ' + alpha + ')';
+
+                    var x = i * (barWidth + gap);
+                    var radius = barWidth / 2;
+                    roundedRect(ctx, x, centerY - barHeight, barWidth, barHeight * 2, radius);
+                }
+            }
+            draw();
+        } catch (err) {
+            console.log('[Voice] Mic waveform not available:', err.message);
+            // Show a small idle animation instead
+            startSpeakingAnimation();
+        }
+    }
+
+    /**
+     * Helper: draw a rounded rectangle (used for waveform bars)
+     */
+    function roundedRect(ctx, x, y, w, h, r) {
+        if (h < 0) { y += h; h = -h; }
+        r = Math.min(r, w / 2, h / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + w - r, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        ctx.lineTo(x + r, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+        ctx.lineTo(x, y + r);
+        ctx.quadraticCurveTo(x, y, x + r, y);
+        ctx.closePath();
+        ctx.fill();
+    }
+
+    function stopVoiceAnimation() {
+        if (voiceAnimationFrame) {
+            cancelAnimationFrame(voiceAnimationFrame);
+            voiceAnimationFrame = null;
+        }
+    }
+
+    function cleanupVoiceResources() {
+        if (voiceRecognition) {
+            try { voiceRecognition.abort(); } catch (e) { /* ignore */ }
+            voiceRecognition = null;
+        }
+        stopVoiceAnimation();
+
+        if (window.speechSynthesis) {
+            window.speechSynthesis.cancel();
+        }
+
+        if (voiceStream) {
+            voiceStream.getTracks().forEach(function(t) { t.stop(); });
+            voiceStream = null;
+        }
+        if (voiceAudioContext) {
+            try { voiceAudioContext.close(); } catch (e) { /* ignore */ }
+            voiceAudioContext = null;
+        }
+        voiceAnalyser = null;
+        voiceTranscript = '';
+        voiceInterimTranscript = '';
+        voiceRecording = false;
+
+        var canvas = document.getElementById('voice-waveform');
+        if (canvas) {
+            var ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+    }
+
+    /**
+     * Wire up voice overlay button events — called from init()
+     */
+    function initVoiceControls() {
+        var sendBtn = document.getElementById('voice-send-btn');
+        var cancelBtn = document.getElementById('voice-cancel-btn');
+        var recordBtn = document.getElementById('voice-record-btn');
+        var micBtn = document.getElementById('mic-btn');
+        var textInput = document.getElementById('voice-text-input');
+        var skipBtn = document.getElementById('voice-skip-btn');
+
+        if (sendBtn) {
+            sendBtn.addEventListener('click', function() {
+                var input = document.getElementById('voice-text-input');
+                var text = (input && input.value.trim()) || voiceTranscript.trim();
+                if (text) {
+                    sendVoiceResponse(text);
+                }
+            });
+        }
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', function() {
+                sendVoiceError('User cancelled voice input');
+            });
+        }
+        if (recordBtn) {
+            recordBtn.addEventListener('click', function() {
+                toggleRecording();
+            });
+        }
+        if (micBtn) {
+            micBtn.addEventListener('click', function() {
+                vscode.postMessage({ type: 'micButtonClicked' });
+            });
+        }
+        if (skipBtn) {
+            skipBtn.addEventListener('click', function() {
+                // Interrupt TTS and skip to input
+                vscode.postMessage({ type: 'voiceInterrupt' });
+            });
+        }
+        if (textInput) {
+            textInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    var text = textInput.value.trim();
+                    if (text) {
+                        sendVoiceResponse(text);
+                    }
+                }
+            });
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // ── Plan Board Functions (sidebar: just Open Board button) ──
+    // ══════════════════════════════════════════════════════════
+
+    function updatePlanBoardVisibility() {
+        var board = document.getElementById('plan-board');
+        if (!board) return;
+        board.classList.toggle('hidden', !planEnabled);
+    }
+
+    function renderPlanBoard() {
+        // No-op in sidebar — board is rendered in editor tab
+    }
+
+    function updatePlanTaskStatus(taskId, status, note) {
+        // Handled by PlanEditorProvider in editor tab
+    }
+
+    function findPlanTaskById(tasks, id) {
+        for (var i = 0; i < tasks.length; i++) {
+            if (tasks[i].id === id) return tasks[i];
+            if (tasks[i].subtasks && tasks[i].subtasks.length > 0) {
+                var found = findPlanTaskById(tasks[i].subtasks, id);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+
+    function updatePlanExecutionUI() {
+        // Handled by PlanEditorProvider in editor tab
+    }
+
+    function showPlanAutoAdvanceNotice(fromTaskId, nextTaskId, nextTaskTitle) {
+        console.log('[AskAway Plan] Auto-advancing from', fromTaskId, 'to', nextTaskId, ':', nextTaskTitle);
+    }
+
+    function editPlanTask(task) {
+        // Handled by PlanEditorProvider in editor tab
+    }
+
+    function showReviewRejectDialog(task) {
+        // Handled by PlanEditorProvider in editor tab
+    }
+
+    function showSplitPreview(taskId, subtasks) {
+        // Handled by PlanEditorProvider in editor tab
+        proposedSplit = null;
+    }
+
+    function initPlanBoard() {
+        // Wire "Open Board" button to open the editor tab via VS Code command
+        var openBoardBtn = document.getElementById('plan-open-board-btn');
+        if (openBoardBtn) {
+            openBoardBtn.addEventListener('click', function() {
+                vscode.postMessage({ type: 'openPlanBoard' });
+            });
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // ── Worker Tabs (Commands + Sub-Agents) ──
+    // ══════════════════════════════════════════════════════════
+
+    // Per-panel autopilot state (independent from global autopilotEnabled)
+    var workerAutopilotEnabled = { command: false, subagent: false };
+    // Per-panel selected model id — set when user picks via native model picker or on models load
+    var workerSelectedModelId = { command: '', subagent: '' };
+    // Per-panel tool selection: null = all tools, Set<string> = selected subset
+    var workerSelectedTools = { command: null, subagent: null };
+    // Track which tool groups are expanded
+    var workerToolsExpanded = { command: false, subagent: false };
+    // Track which tool groups within a panel are expanded: { command: Set<groupName>, subagent: Set<groupName> }
+    var workerGroupsExpanded = { command: new Set(), subagent: new Set() };
+
+    function initWorkerTabs() {
+        // Tab switching
+        var tabs = document.querySelectorAll('.widget-tab');
+        tabs.forEach(function(tab) {
+            tab.addEventListener('click', function() {
+                switchTab(tab.getAttribute('data-tab'));
+            });
+        });
+
+        ['command', 'subagent'].forEach(function(role) {
+            // Run/Autopilot button
+            var runBtn = document.getElementById(role + '-autopilot-btn');
+            if (runBtn) runBtn.addEventListener('click', function() { workerAutopilot(role); });
+
+            // Submit manual
+            var submitBtn = document.getElementById(role + '-submit-btn');
+            if (submitBtn) submitBtn.addEventListener('click', function() { workerSubmit(role); });
+
+            // Per-panel autopilot toggle
+            var autoToggle = document.getElementById(role + '-autopilot-toggle');
+            if (autoToggle) {
+                autoToggle.addEventListener('click', function() { toggleWorkerAutopilot(role); });
+                autoToggle.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleWorkerAutopilot(role); }
+                });
+            }
+
+            // Model select + effort change → update formed label
+            var modelSel = document.getElementById(role + '-model-select');
+            if (modelSel) modelSel.addEventListener('change', function() { updateFormedModelLabel(role); });
+            var effortSel = document.getElementById(role + '-effort-select');
+            if (effortSel) effortSel.addEventListener('change', function() { updateFormedModelLabel(role); });
+
+            // Tools panel header toggle
+            var toolsBtn = document.getElementById(role + '-tools-header-btn');
+            if (toolsBtn) toolsBtn.addEventListener('click', function() { toggleToolsPanel(role); });
+        });
+
+        // Task card click → select it
+        document.addEventListener('click', function(e) {
+            var card = e.target.closest('.worker-task-card');
+            if (!card) return;
+            var role = card.getAttribute('data-role');
+            var id = card.getAttribute('data-id');
+            if (role && id) selectWorkerTask(role, id);
+        });
+
+        // Request models from extension
+        vscode.postMessage({ type: 'requestModels' });
+        updateWorkerManualControlsVisibility('command');
+        updateWorkerManualControlsVisibility('subagent');
+    }
+
+    function switchTab(tab) {
+        currentTab = tab;
+        document.querySelectorAll('.widget-tab').forEach(function(btn) {
+            btn.classList.toggle('active', btn.getAttribute('data-tab') === tab);
+        });
+        document.querySelectorAll('.tab-panel').forEach(function(panel) {
+            panel.classList.toggle('active', panel.id === 'panel-' + tab);
+        });
+        if (tab === 'subagents') {
+            populateModelSelect('subagent-model-select');
+            updateFormedModelLabel('subagent');
+            if (workerToolsExpanded.subagent) renderToolsPicker('subagent');
+        } else if (tab === 'commands') {
+            populateModelSelect('command-model-select');
+            updateFormedModelLabel('command');
+            if (workerToolsExpanded.command) renderToolsPicker('command');
+        } else if (tab === 'settings') {
+            vscode.postMessage({ type: 'openSettingsModal' });
+            updateObservabilityUI();
+        }
+    }
+
+    function updateTabBadges() {
+        var cmdCount = workerTasks.filter(function(t) { return t.role === 'command' && t.status !== 'done'; }).length;
+        var agentCount = workerTasks.filter(function(t) { return t.role === 'subagent' && t.status !== 'done'; }).length;
+
+        var cmdBadge = document.getElementById('tab-badge-commands');
+        var agentBadge = document.getElementById('tab-badge-subagents');
+
+        if (cmdBadge) {
+            cmdBadge.textContent = cmdCount;
+            cmdBadge.classList.toggle('hidden', cmdCount === 0);
+        }
+        if (agentBadge) {
+            agentBadge.textContent = agentCount;
+            agentBadge.classList.toggle('hidden', agentCount === 0);
+        }
+    }
+
+    /** Set default model for a role from the first available model (deduplicated by backend) */
+    function initWorkerModelDefault(role) {
+        if (!workerSelectedModelId[role] && availableModels.length > 0) {
+            workerSelectedModelId[role] = availableModels[0].id;
+        }
+        populateModelSelect(role + '-model-select');
+        updateFormedModelLabel(role);
+    }
+
+    /** Populate model select with clean deduplicated names */
+    function populateModelSelect(selectId) {
+        var sel = document.getElementById(selectId);
+        if (!sel) return;
+        var role = selectId.replace('-model-select', '');
+        var prev = workerSelectedModelId[role] || sel.value;
+        sel.innerHTML = '';
+        if (availableModels.length === 0) {
+            sel.innerHTML = '<option value="">No models available</option>';
+            return;
+        }
+        availableModels.forEach(function(m) {
+            var opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = m.name;
+            sel.appendChild(opt);
+        });
+        if (prev && Array.from(sel.options).some(function(o) { return o.value === prev; })) {
+            sel.value = prev;
+            workerSelectedModelId[role] = prev;
+        } else if (availableModels.length > 0) {
+            sel.value = availableModels[0].id;
+            workerSelectedModelId[role] = availableModels[0].id;
+        }
+        updateFormedModelLabel(role);
+    }
+
+    /** Build and display "ModelName · Med" label */
+    function updateFormedModelLabel(role) {
+        var modelSel = document.getElementById(role + '-model-select');
+        var effortSel = document.getElementById(role + '-effort-select');
+        var label = document.getElementById(role + '-formed-model');
+        if (!label) return;
+
+        var modelName = modelSel && modelSel.selectedOptions[0] ? modelSel.selectedOptions[0].textContent.trim() : '';
+        if (modelSel) workerSelectedModelId[role] = modelSel.value;
+        var effort = effortSel ? effortSel.value : 'medium';
+        var effortDisplay = { low: 'Low ⚡', medium: 'Med', high: 'High 🔥' }[effort] || effort;
+
+        label.textContent = modelName ? modelName + ' · ' + effortDisplay : '—';
+    }
+
+    // ── Tool picker ──────────────────────────────────────────
+
+    /** Toggle the tools panel header open/closed */
+    function toggleToolsPanel(role) {
+        workerToolsExpanded[role] = !workerToolsExpanded[role];
+        var body = document.getElementById(role + '-tools-body');
+        var chevron = document.getElementById(role + '-tools-chevron');
+        var btn = document.getElementById(role + '-tools-header-btn');
+        if (body) body.classList.toggle('hidden', !workerToolsExpanded[role]);
+        if (btn) btn.setAttribute('aria-expanded', workerToolsExpanded[role] ? 'true' : 'false');
+        if (chevron) {
+            chevron.classList.toggle('codicon-chevron-right', !workerToolsExpanded[role]);
+            chevron.classList.toggle('codicon-chevron-down', workerToolsExpanded[role]);
+        }
+        if (workerToolsExpanded[role]) renderToolsPicker(role);
+    }
+
+    /**
+     * Build a two-level grouping that mirrors Copilot's structure:
+     * - Top level: Built-In + installed MCP/server groups
+     * - Built-In second level: tool keys (agent, browser, edit, execute, read, search, todo, vscode, web)
+     * - External/MCP groups: tools directly (no extra "Tools" subgroup)
+     */
+    function groupTools(tools) {
+        var genericTags = new Set(['vscode', 'copilot', 'tool', 'tools', 'built-in', 'builtin', 'mcp']);
+        var builtInToolOrder = ['agent', 'browser', 'edit', 'execute', 'read', 'search', 'todo', 'vscode', 'web', 'memory'];
+
+        function getNameKey(tool) {
+            var n = String(tool.name || '').toLowerCase();
+            return n.split(/[._:/-]/)[0] || n;
+        }
+
+        function isBuiltInTool(tool, tags) {
+            if (tags.indexOf('built-in') >= 0 || tags.indexOf('builtin') >= 0) {
+                return true;
+            }
+            var key = getNameKey(tool);
+            return builtInToolOrder.indexOf(key) >= 0;
+        }
+
+        function inferBuiltInToolKey(tool, tags) {
+            var preferred = ['agent', 'browser', 'edit', 'execute', 'read', 'search', 'todo', 'vscode', 'web', 'memory'];
+            for (var i = 0; i < preferred.length; i++) {
+                if (tags.indexOf(preferred[i]) >= 0) {
+                    return preferred[i];
+                }
+            }
+
+            // Stable fallback using built-in tool names.
+            var n = (tool.name || '').toLowerCase();
+            var first = n.split(/[._:/-]/)[0];
+            if (builtInToolOrder.indexOf(first) >= 0) return first;
+            if (n.indexOf('todo') >= 0) return 'todo';
+            if (n.indexOf('browser') >= 0) return 'browser';
+            if (n.indexOf('web') >= 0) return 'web';
+            if (n.indexOf('edit') >= 0) return 'edit';
+            if (n.indexOf('execute') >= 0 || n.indexOf('terminal') >= 0 || n.indexOf('command') >= 0) return 'execute';
+            if (n.indexOf('read') >= 0) return 'read';
+            if (n.indexOf('search') >= 0 || n.indexOf('codesearch') >= 0) return 'search';
+            if (n.indexOf('agent') >= 0) return 'agent';
+            if (n.indexOf('vscode') >= 0) return 'vscode';
+            return 'vscode';
+        }
+
+        function inferTopGroup(tool, tags) {
+            if (isBuiltInTool(tool, tags)) {
+                return 'Built-In';
+            }
+
+            // MCP/server group resolution (best-effort from tags)
+            // Prefer explicit prefixed tags first.
+            for (var i = 0; i < tags.length; i++) {
+                var t = tags[i];
+                if (t.indexOf('mcp:') === 0) return t.slice(4);
+                if (t.indexOf('server:') === 0) return t.slice(7);
+                if (t.indexOf('provider:') === 0) return t.slice(9);
+            }
+
+            // Name fallback for MCP/provider tools: owner_tool or owner.tool
+            var nm = tool.name || '';
+            if (nm.indexOf('_') > 0) return nm.split('_')[0];
+            if (nm.indexOf('.') > 0) return nm.split('.')[0];
+
+            // Last resort: a stable non-generic tag (but avoid capability tags causing noisy groups)
+            for (var j = 0; j < tags.length; j++) {
+                if (!genericTags.has(tags[j])) {
+                    return tags[j];
+                }
+            }
+
+            return 'VS Code';
+        }
+
+        var result = {}; // { top: { type, subgroups, tools } }
+        tools.forEach(function(tool) {
+            var tags = Array.isArray(tool.tags) ? tool.tags.map(function(t) { return String(t).toLowerCase(); }) : [];
+            var top = inferTopGroup(tool, tags);
+            if (!result[top]) {
+                result[top] = {
+                    type: top === 'Built-In' ? 'built-in' : 'external',
+                    subgroups: {},
+                    tools: []
+                };
+            }
+
+            if (top === 'Built-In') {
+                // Copilot Built-In list is tool rows, so subgroup key should track tool key.
+                var key = getNameKey(tool);
+                var sub = builtInToolOrder.indexOf(key) >= 0 ? key : inferBuiltInToolKey(tool, tags);
+                if (!result[top].subgroups[sub]) result[top].subgroups[sub] = [];
+                result[top].subgroups[sub].push(tool);
+            } else {
+                result[top].tools.push(tool);
+            }
+        });
+
+        return result;
+    }
+
+    /** Render the grouped per-panel tool picker */
+    function renderToolsPicker(role) {
+        var body = document.getElementById(role + '-tools-body');
+        var headerLabel = document.getElementById(role + '-tools-label');
+        if (!body) return;
+
+        var totalTools = availableTools.length;
+        var selectedSet = workerSelectedTools[role];
+        var selectedCount = selectedSet ? selectedSet.size : totalTools;
+        if (headerLabel) {
+            headerLabel.textContent = selectedCount + '/' + totalTools + ' tools selected';
+        }
+
+        if (totalTools === 0) {
+            body.innerHTML = '<div class="worker-tools-empty">No tools registered. Enable MCP servers or VS Code tools first.</div>';
+            return;
+        }
+
+        var grouped = groupTools(availableTools);
+        var html = '<div class="tools-picker">';
+        var topGroupNames = Object.keys(grouped).sort(function(a, b) {
+            if (a === 'Built-In') return -1;
+            if (b === 'Built-In') return 1;
+            return a.localeCompare(b);
+        });
+
+        topGroupNames.forEach(function(topGroupName) {
+            var group = grouped[topGroupName];
+            var subgroups = group.subgroups;
+            var topTools = group.type === 'built-in'
+                ? Object.keys(subgroups).reduce(function(acc, k) { return acc.concat(subgroups[k]); }, [])
+                : group.tools;
+
+            var topAll = topTools.every(function(t) { return !selectedSet || selectedSet.has(t.name); });
+            var topSome = !topAll && topTools.some(function(t) { return !selectedSet || selectedSet.has(t.name); });
+            var topState = topAll ? 'all' : (topSome ? 'some' : 'none');
+
+            var topKey = topGroupName;
+            var topExpanded = workerGroupsExpanded[role].has(topKey);
+            var et = escapeHtml(topGroupName);
+
+            html += '<div class="tools-group tools-top-group">';
+            html += '<div class="tools-group-header" data-role="' + role + '" data-group="' + escapeHtml(topKey) + '">';
+            html += '<span class="tools-group-check ' + topState + '" data-role="' + role + '" data-group="' + escapeHtml(topKey) + '"></span>';
+            html += '<span class="tools-group-name">' + et + '</span>';
+            html += '<span class="tools-group-count">' + topTools.length + '</span>';
+            html += '<span class="codicon ' + (topExpanded ? 'codicon-chevron-down' : 'codicon-chevron-right') + ' tools-group-chevron"></span>';
+            html += '</div>';
+            html += '<div class="tools-group-items tools-top-items' + (topExpanded ? '' : ' hidden') + '">';
+
+            if (group.type === 'built-in') {
+                var order = ['agent', 'browser', 'edit', 'execute', 'read', 'search', 'todo', 'vscode', 'web', 'memory'];
+                var subgroupNames = Object.keys(subgroups).sort(function(a, b) {
+                    var ai = order.indexOf(a);
+                    var bi = order.indexOf(b);
+                    if (ai === -1 && bi === -1) return a.localeCompare(b);
+                    if (ai === -1) return 1;
+                    if (bi === -1) return -1;
+                    return ai - bi;
+                });
+
+                subgroupNames.forEach(function(subName) {
+                    var subList = subgroups[subName];
+                    var subKey = topGroupName + '::' + subName;
+                    var subAll = subList.every(function(t) { return !selectedSet || selectedSet.has(t.name); });
+                    var subSome = !subAll && subList.some(function(t) { return !selectedSet || selectedSet.has(t.name); });
+                    var subState = subAll ? 'all' : (subSome ? 'some' : 'none');
+                    var subExpanded = workerGroupsExpanded[role].has(subKey);
+
+                    html += '<div class="tools-group tools-sub-group">';
+                    html += '<div class="tools-group-header tools-sub-header" data-role="' + role + '" data-group="' + escapeHtml(subKey) + '">';
+                    html += '<span class="tools-group-check ' + subState + '" data-role="' + role + '" data-group="' + escapeHtml(subKey) + '"></span>';
+                    html += '<span class="tools-group-name">' + escapeHtml(subName) + '</span>';
+                    html += '<span class="tools-group-count">' + subList.length + '</span>';
+                    html += '<span class="codicon ' + (subExpanded ? 'codicon-chevron-down' : 'codicon-chevron-right') + ' tools-group-chevron"></span>';
+                    html += '</div>';
+                    html += '<div class="tools-group-items' + (subExpanded ? '' : ' hidden') + '">';
+
+                    subList.forEach(function(t) {
+                        var checked = !selectedSet || selectedSet.has(t.name);
+                        html += '<div class="tools-item">';
+                        html += '<input type="checkbox" class="tools-item-check" data-role="' + role + '" data-name="' + escapeHtml(t.name) + '" ' + (checked ? 'checked' : '') + '>';
+                        html += '<div class="tools-item-info"><span class="tools-item-name">' + escapeHtml(t.name) + '</span>';
+                        if (t.description) html += '<span class="tools-item-desc">' + escapeHtml(t.description.slice(0, 90)) + '</span>';
+                        html += '</div></div>';
+                    });
+
+                    html += '</div></div>';
+                });
+            } else {
+                // Copilot-like shape for non-built-ins: top group -> tools directly.
+                topTools.forEach(function(t) {
+                    var checked = !selectedSet || selectedSet.has(t.name);
+                    html += '<div class="tools-item tools-item-external">';
+                    html += '<input type="checkbox" class="tools-item-check" data-role="' + role + '" data-name="' + escapeHtml(t.name) + '" ' + (checked ? 'checked' : '') + '>';
+                    html += '<div class="tools-item-info"><span class="tools-item-name">' + escapeHtml(t.name) + '</span>';
+                    if (t.description) html += '<span class="tools-item-desc">' + escapeHtml(t.description.slice(0, 90)) + '</span>';
+                    html += '</div></div>';
+                });
+            }
+
+            html += '</div></div>';
+        });
+        html += '</div>';
+        body.innerHTML = html;
+
+        body.querySelectorAll('.tools-group-header').forEach(function(header) {
+            header.addEventListener('click', function(e) {
+                if (e.target.classList.contains('tools-group-check')) return;
+                var r = header.getAttribute('data-role');
+                var g = header.getAttribute('data-group');
+                if (workerGroupsExpanded[r].has(g)) { workerGroupsExpanded[r].delete(g); } else { workerGroupsExpanded[r].add(g); }
+                renderToolsPicker(r);
+            });
+        });
+        body.querySelectorAll('.tools-group-check').forEach(function(span) {
+            span.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var r = span.getAttribute('data-role');
+                var g = span.getAttribute('data-group');
+                var grouped2 = groupTools(availableTools);
+                var gl = [];
+                if (grouped2[g]) {
+                    if (grouped2[g].type === 'built-in') {
+                        Object.keys(grouped2[g].subgroups).forEach(function(sk) {
+                            gl = gl.concat(grouped2[g].subgroups[sk]);
+                        });
+                    } else {
+                        gl = grouped2[g].tools.slice();
+                    }
+                } else if (g.indexOf('::') > -1) {
+                    var parts = g.split('::');
+                    var top = parts[0];
+                    var sub = parts.slice(1).join('::');
+                    if (grouped2[top] && grouped2[top].type === 'built-in' && grouped2[top].subgroups[sub]) {
+                        gl = grouped2[top].subgroups[sub];
+                    }
+                }
+                if (!workerSelectedTools[r]) workerSelectedTools[r] = new Set(availableTools.map(function(t) { return t.name; }));
+                var allSel = gl.every(function(t) { return workerSelectedTools[r].has(t.name); });
+                gl.forEach(function(t) { if (allSel) { workerSelectedTools[r].delete(t.name); } else { workerSelectedTools[r].add(t.name); } });
+                if (workerSelectedTools[r].size === availableTools.length) workerSelectedTools[r] = null;
+                renderToolsPicker(r);
+            });
+        });
+        body.querySelectorAll('.tools-item-check').forEach(function(chk) {
+            chk.addEventListener('change', function() {
+                var r = chk.getAttribute('data-role');
+                var n = chk.getAttribute('data-name');
+                if (!workerSelectedTools[r]) workerSelectedTools[r] = new Set(availableTools.map(function(t) { return t.name; }));
+                if (chk.checked) { workerSelectedTools[r].add(n); } else { workerSelectedTools[r].delete(n); }
+                if (workerSelectedTools[r].size === availableTools.length) workerSelectedTools[r] = null;
+                renderToolsPicker(r);
+            });
+        });
+    }
+
+    /** Toggle per-panel autopilot on/off */
+    function toggleWorkerAutopilot(role) {
+        workerAutopilotEnabled[role] = !workerAutopilotEnabled[role];
+        var toggle = document.getElementById(role + '-autopilot-toggle');
+        if (toggle) {
+            toggle.classList.toggle('active', workerAutopilotEnabled[role]);
+            toggle.setAttribute('aria-checked', workerAutopilotEnabled[role] ? 'true' : 'false');
+        }
+        updateWorkerManualControlsVisibility(role);
+        // If turning ON and there's a pending task, run it automatically
+        if (workerAutopilotEnabled[role]) {
+            var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+            if (pending) {
+                selectWorkerTask(role, pending.id);
+                workerAutopilot(role);
+            }
+        }
+    }
+
+    /** Hide/show manual input+submit per panel based on autopilot state */
+    function updateWorkerManualControlsVisibility(role) {
+        var hideManual = workerAutopilotEnabled[role];
+        var input = document.getElementById(role + '-response-input');
+        var submitBtn = document.getElementById(role + '-submit-btn');
+        if (input) input.style.display = hideManual ? 'none' : '';
+        if (submitBtn) submitBtn.style.display = hideManual ? 'none' : '';
+    }
+
+    /** Run worker task with selected model/effort */
+    function workerAutopilot(role) {
+        var id = activeWorkerTaskId[role];
+        if (!id) {
+            var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+            if (pending) { selectWorkerTask(role, pending.id); id = pending.id; }
+        }
+        if (!id) return;
+
+        var modelSel = document.getElementById(role + '-model-select');
+        var modelId = modelSel ? modelSel.value : (workerSelectedModelId[role] || '');
+        if (!modelId && availableModels.length > 0) modelId = availableModels[0].id;
+        if (!modelId) return;
+
+        var opts = getWorkerRunOptions(role);
+        vscode.postMessage({
+            type: 'workerRunAutopilot',
+            taskId: id,
+            modelId: modelId,
+            agentName: opts.agentName,
+            thinkingEffort: opts.thinkingEffort
+        });
+    }
+
+    function getWorkerRunOptions(role) {
+        var agentSel = document.getElementById(role + '-agent-select');
+        var effortSel = document.getElementById(role + '-effort-select');
+        return {
+            agentName: agentSel ? agentSel.value : 'default',
+            thinkingEffort: effortSel ? effortSel.value : 'medium'
+        };
+    }
+
+    // ── Tool count display (config opens native VS Code dialog) ──────────────────────────────────────────
+
+    function updateToolsCount(role) {
+        // kept for any legacy call sites — no-op now that count is in renderToolsPicker header
+    }
+
+    // groupTools is defined above with two-level hierarchy; keep single source of truth.
+
+    // ── Queue / task rendering ───────────────────────────────
+
+    function renderWorkerQueue(role) {
+        var listId = role === 'command' ? 'command-task-list' : 'subagent-task-list';
+        var list = document.getElementById(listId);
+        if (!list) return;
+
+        var tasks = workerTasks.filter(function(t) { return t.role === role; });
+        if (tasks.length === 0) {
+            list.innerHTML = '<div class="worker-empty">No pending ' + (role === 'command' ? 'commands' : 'agent tasks') + '</div>';
+            return;
+        }
+
+        list.innerHTML = tasks.map(function(t) {
+            var summary = t.task.length > 120 ? t.task.slice(0, 120) + '…' : t.task;
+            var isActive = activeWorkerTaskId[role] === t.id;
+            var statusLabel = t.status === 'running' ? 'Running…' : t.status === 'done' ? '✓ Done' : 'Pending';
+            return '<div class="worker-task-card' + (isActive ? ' active-task' : '') + '" data-id="' + t.id + '" data-role="' + role + '">' +
+                '<div class="worker-task-card-header">' +
+                '<span class="worker-task-role">' + (role === 'command' ? 'CMD' : 'AGENT') + '</span>' +
+                '<span class="worker-task-status ' + t.status + '">' + statusLabel + '</span>' +
+                '</div>' +
+                '<div class="worker-task-summary">' + escapeHtml(summary) + '</div>' +
+                '</div>';
+        }).join('');
+    }
+
+    function selectWorkerTask(role, id) {
+        activeWorkerTaskId[role] = id;
+        var task = workerTasks.find(function(t) { return t.id === id; });
+        if (!task) return;
+
+        var displayId = role === 'command' ? 'command-task-display' : 'subagent-task-display';
+        var textId = role === 'command' ? 'command-task-text' : 'subagent-task-text';
+        var display = document.getElementById(displayId);
+        var textEl = document.getElementById(textId);
+
+        if (display) display.classList.remove('hidden');
+        if (textEl) textEl.textContent = task.task;
+
+        renderWorkerQueue(role);
+    }
+
+    function workerSubmit(role) {
+        var id = activeWorkerTaskId[role];
+        if (!id) {
+            var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+            if (pending) { selectWorkerTask(role, pending.id); id = pending.id; }
+        }
+        if (!id) return;
+
+        var inputId = role === 'command' ? 'command-response-input' : 'subagent-response-input';
+        var input = document.getElementById(inputId);
+        var result = input ? input.value.trim() : '';
+        if (!result) return;
+
+        vscode.postMessage({ type: 'workerResolveManual', taskId: id, result: result });
+        if (input) input.value = '';
+        activeWorkerTaskId[role] = null;
+
+        var displayId = role === 'command' ? 'command-task-display' : 'subagent-task-display';
+        var display = document.getElementById(displayId);
+        if (display) display.classList.add('hidden');
+    }
+
+    function handleWorkerQueueUpdate(tasks) {
+        workerTasks = tasks || [];
+        renderWorkerQueue('command');
+        renderWorkerQueue('subagent');
+        updateTabBadges();
+        updateObservabilityUI();
+
+        ['command', 'subagent'].forEach(function(role) {
+            if (!activeWorkerTaskId[role]) {
+                var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+                if (pending) selectWorkerTask(role, pending.id);
+            }
+            // If autopilot is on and a new pending task arrives, run it
+            if (workerAutopilotEnabled[role]) {
+                var pending = workerTasks.find(function(t) { return t.role === role && t.status === 'pending'; });
+                if (pending) {
+                    selectWorkerTask(role, pending.id);
+                    workerAutopilot(role);
+                }
+            }
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════
+
+    // Expose message handler for remote server (Socket.io bridge)
+    window.dispatchVSCodeMessage = function(message) {
+        handleExtensionMessage({ data: message });
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+}());
