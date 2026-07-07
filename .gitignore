@@ -39,3 +39,5 @@ tasksync-opencode/node_modules/
 tasksync-plugin/.env
 tasksync-plugin/dist/
 tasksync-plugin/node_modules/
+
+AGENT_AUDIT.md

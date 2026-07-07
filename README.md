@@ -5,8 +5,8 @@
 <h1 align="center">AskAway</h1>
 
 <p align="center">
-  <strong>A fork of <a href="https://github.com/4regab/TaskSync">TaskSync</a> adding Webex, Telegram, and Remote Mobile/Web access.</strong><br/>
-  <sub>All credit for the core extension goes to <a href="https://github.com/4regab">@4regab</a> and the TaskSync project.</sub>
+  <strong>Copilot AI credit observability and optimization for VS Code agent workflows.</strong><br/>
+  <sub>See where GitHub Copilot credits are spent, catch expensive tool patterns live, and give agents cheaper ways to work.</sub>
 </p>
 
 <p align="center">
@@ -17,194 +17,271 @@
 </p>
 
 <p align="center">
-  <a href="#-telegram-integration">🤖 Telegram</a> •
-  <a href="#-webex-integration">💬 Webex</a> •
-  <a href="#-remote-mobile--web-access">📱 Remote Access</a> •
-  <a href="#-installation">⚡ Install</a> •
-  <a href="#-features">✨ Features</a> •
-  <a href="#-faq">❓ FAQ</a>
+  <a href="#why-askaway-now">Why now</a> -
+  <a href="#metrics-dashboard">Metrics</a> -
+  <a href="#live-turn-trace">This Turn</a> -
+  <a href="#optimization-tools">Tools</a> -
+  <a href="#rtk-integration">RTK</a> -
+  <a href="#installation">Install</a>
 </p>
 
 ---
 
-> **This is a fork of [4regab/TaskSync](https://github.com/4regab/TaskSync).** The core extension — sidebar UI, smart queue, autopilot, MCP server, tool call history — is built by [@4regab](https://github.com/4regab). This fork adds Webex, Telegram, and Remote Mobile/Web integrations on top. See the [upstream repo](https://github.com/4regab/TaskSync) for the original project and community discussions.
+## Why AskAway Now
 
----
+GitHub Copilot moved from the older premium-request model to token-based AI credit billing. Under the newer pricing model, agent work is not just "one request" anymore: input tokens, output tokens, cached tokens, model choice, tool output, compaction, retries, and long-running calls can all change the bill.
 
-## The Problem
+That changes the value of AskAway.
 
-AI coding agents (Copilot, Cursor, Kiro) frequently pause to ask for approval or clarification. **You have to sit at your desk watching the screen.** If you step away, the agent blocks — wasting time and premium API requests.
+The original AskAway/TaskSync flow focused on the `ask_user` tool: route agent questions to Telegram, Webex, or a remote browser so an agent does not pause while you are away. That still exists, but it is no longer the main cost-optimization lever. With token-based pricing, the bigger wins come from seeing exactly where credits are consumed and helping the agent choose cheaper behavior before the turn runs away.
 
-## What This Fork Adds
+AskAway now focuses on live Copilot observability and credit optimization:
 
-[TaskSync](https://github.com/4regab/TaskSync) already solves the human-in-the-loop problem with a great sidebar UI. **AskAway** extends it by routing agent questions to wherever you are — a Webex space, a Telegram bot, or a browser on your network. Reply from anywhere, and the agent continues seamlessly.
+| Area | What AskAway helps you see |
+|------|-----------------------------|
+| This turn | Live requests, tool calls, token use, AI credits, cache use, and risk flags while the agent is still working |
+| This month | Monthly/billing-cycle usage across requests, models, tools, input, output, cached tokens, and credits |
+| Per-model observability | Which models are consuming credits, so you can tune model choice intentionally |
+| Per-tool observability | Which tools produce large outputs, run too long, or repeatedly feed expensive context back into the next request |
+| Optimization tools | Purpose-built `gradle`, `code_nav`, and `turn_budget` tools that reduce noisy output and keep agents cost-aware |
+| RTK integration | If `rtk` is installed, AskAway shows the token savings benefits directly in the same dashboard |
 
----
+## Metrics Dashboard
 
-## ✨ Features
+AskAway adds a dedicated **Metrics** tab to the VS Code side panel. It reads Copilot debug logs locally and turns them into live usage telemetry. No separate cloud service is required.
 
-### From [TaskSync](https://github.com/4regab/TaskSync) (upstream)
+### How to enable metrics
 
-| Feature | Description |
-|---------|-------------|
-| **Smart Queue** | Batch multiple agent questions and respond when ready |
-| **Autopilot** | Let agents work autonomously with customizable auto-responses |
-| **🔌 MCP Server** | Works with Kiro, Cursor, Gemini CLI, and any MCP client |
-| **📎 Attachments** | Image paste support — agent sees your screenshots |
-| **#️⃣ Context** | File/folder references with `#` autocomplete, `#terminal`, `#problems` |
-| **📜 History** | Full tool call history with session tracking |
-| **/ Commands** | Reusable prompt templates via `/slash` commands |
+1. Install AskAway from the VS Code Marketplace or from source.
+2. Open the AskAway activity bar panel.
+3. Open the **Metrics** tab.
+4. Keep **Debug Logging** enabled in AskAway settings so local Copilot request and tool-call logs can be read.
+5. Optional: set `askaway.turnBudgetAiu` to a non-zero value if you want agents to see a soft per-turn credit budget through the `turn_budget` tool.
+6. Optional: install `rtk` and enable AskAway's RTK compression toggle to show RTK savings in the dashboard.
 
-### Added in this fork
+### How to read metrics
 
-| Feature | Description |
-|---------|-------------|
-| **🤖 Telegram** | Push notifications + inline keyboard buttons — the main addition |
-| **💬 Webex** | Rich Adaptive Cards in your Webex space with OAuth auto-refresh |
-| **📱 Remote Access** | Full UI on your phone/tablet via local web server |
-| **🧠 Context-enriched prompts** | Questions sent to Telegram/Webex include full context so you can answer without seeing the VS Code chat |
+The dashboard has two main views:
 
----
+| View | Purpose |
+|------|---------|
+| **This Turn** | Live optimization view for the current user prompt. Use this while the agent is working. |
+| **This Month** | Billing-cycle view. Most Copilot plans reset monthly, so this is the practical view for watching spend over time. |
 
-## ⚡ Installation
+The metrics show:
 
-**From Marketplace:**
+| Metric | Meaning |
+|--------|---------|
+| Requests | Individual Copilot model calls in the current turn or month |
+| Credits | AI credit usage reported by Copilot logs |
+| Input tokens | Tokens sent into the model. Cache misses here are expensive because the same context may be billed again |
+| Output tokens | Tokens generated by the model. These are often more expensive than input tokens and should be watched closely |
+| Cached tokens | Tokens served from provider-side cache where available |
+| Hit percentage | Cached tokens divided by input tokens. Low hit percentage is a cache-miss warning |
+| Tool calls | Tool execution count, duration, status, and approximate output tokens |
+| Per-model table | Usage split by model so you can compare model choices |
+
+## Live Turn Trace
+
+The most important view is **This Turn**. It gives a live trace of the current agent turn, including model requests and tool calls as they happen.
+
+![AskAway This Turn trace](resources/This%20Turn.jpg)
+
+Use this view to answer the practical question: "Where did this turn spend credits?"
+
+AskAway highlights red flags that usually explain expensive turns:
+
+| Red flag | Why it matters | What to do |
+|----------|----------------|------------|
+| Cache miss | Input tokens are billed again when provider cache reuse is low | Keep stable prompt prefixes, avoid unnecessary model switching, and reduce context churn |
+| High output tokens | Output tokens can cost more than input tokens | Ask the agent for concise summaries, smaller diffs, or structured results |
+| Tool runs longer than 4 minutes | Cache lifetimes are commonly around 5 minutes; long calls can let useful prefix cache expire | Prefer async/status tools, paginated logs, and polling patterns that keep calls short |
+| Tool emits more than 1K tokens | Tool output often becomes input to the next model call, recursively increasing cost | Use narrower tools, pagination, search filters, or task-specific summaries |
+| Many compaction or retry calls | Compaction and retries can still be billed model calls | Shorten sessions, reduce context size, and stop once the turn has enough information |
+| Model churn | Each model has separate cache behavior and pricing | Pick the cheapest model that is strong enough for the current step and avoid switching mid-turn without a reason |
+
+The turn trace is designed for active optimization. It lets you see live request IDs, model names, tokens, credits consumed, cache use, and tool output size before the agent finishes.
+
+## This Month
+
+**This Month** is the billing-cycle view. Since Copilot usage is typically managed monthly, AskAway groups total requests, credits, token counts, cache behavior, per-model usage, and per-tool usage by month.
+
+Use it to answer:
+
+| Question | Where to look |
+|----------|---------------|
+| Which model is costing the most? | Per-model usage table |
+| Are output tokens dominating spend? | Monthly input/output/cached totals |
+| Are tools creating too much recursive context? | Per-tool output token table |
+| Are long-running commands hurting cache reuse? | Tool duration columns and cache-risk flags |
+| Did an optimization help? | Compare current month trends before and after changing workflow |
+
+Monthly totals are best effort from local Copilot logs and AskAway's persisted local mirrors. If historical Copilot debug logs were rotated before AskAway saw them, older exact usage cannot always be recovered.
+
+## Optimization Tools
+
+AskAway ships cost-aware tools that give agents better options than dumping huge terminal output into the model.
+
+### `gradle`
+
+Gradle builds and tests are one of the costliest agent operations because raw build logs can be huge and Gradle tasks can run for a long time. The `gradle` tool is optimized for that workflow.
+
+It provides:
+
+| Capability | Benefit |
+|------------|---------|
+| `start`, `status`, `wait`, `logs`, `stop` actions | Agents do not need to keep one huge terminal call open forever |
+| Build IDs | Long builds can be checked incrementally |
+| Paginated logs | Agents can request only the relevant slice instead of dumping the full log |
+| Task-filtered logs | Failure output can be scoped to the failing task |
+| Test failure extraction | JUnit XML failures are surfaced directly, including assertion messages and locations |
+| Auto-optimization | Gradle daemon, parallel build, build cache, and configuration cache are applied by default where possible |
+| 4-minute wait cap | Prevents a single blocking wait from drifting past useful cache windows |
+
+### `code_nav`
+
+`code_nav` exposes VS Code language-server features to the agent. Instead of reading many files or grepping blindly, an agent can ask the language server for precise navigation.
+
+It supports:
+
+| Operation | What it uses |
+|-----------|--------------|
+| Definition | VS Code go-to-definition provider |
+| References | VS Code references provider |
+| Implementation | VS Code implementation provider |
+| Type definition | VS Code type-definition provider |
+| Hover | VS Code hover provider |
+| Document symbols | VS Code document symbol provider |
+| Workspace symbols | VS Code workspace symbol provider |
+| Diagnostics | VS Code diagnostics |
+
+Because it is based on installed VS Code language servers, adding a language is flexible: install the right language extension, and `code_nav` can use that language server's capabilities.
+
+### `turn_budget`
+
+`turn_budget` is an opt-in soft limit for costly turns. Set `askaway.turnBudgetAiu` to the number of AI credits you want the current turn to treat as its budget. The tool reports:
+
+```json
+{
+  "spentAiu": 12.4,
+  "requestCount": 5,
+  "softLimitAiu": 20,
+  "remainingAiu": 7.6,
+  "usedPct": 62,
+  "exceeded": false,
+  "note": "on track"
+}
+```
+
+The budget is advisory. It does not block Copilot. It gives the agent a live cost signal so it can stop exploring, summarize sooner, choose cheaper tools, or avoid expensive follow-up calls.
+
+![AskAway turn budget signal](resources/Turn%20budget.jpg)
+
+## RTK Integration
+
+If `rtk` is installed, AskAway can show RTK benefits in the same Metrics dashboard.
+
+RTK helps compress noisy command output before it becomes model input. AskAway displays command count, estimated saved tokens, and savings percentage alongside the rest of the observability data. This makes it easier to compare workflow changes: for example, raw terminal output versus RTK-compressed terminal output versus purpose-built tools like `gradle` and `code_nav`.
+
+If `rtk` is not installed, AskAway gracefully disables the RTK toggle and continues showing Copilot metrics.
+
+## Legacy Remote Ask User Features
+
+AskAway still includes the original human-in-the-loop features from TaskSync and earlier AskAway releases:
+
+| Feature | Status |
+|---------|--------|
+| `ask_user` | Still available for agent questions and review loops |
+| Telegram | Still available for answering agent questions from mobile |
+| Webex | Still available for answering from a Webex space |
+| Remote web/mobile UI | Still available for browser-based access to the AskAway panel |
+| Queue and autopilot | Still available for prompt batching and automatic responses |
+| MCP server | Still available for external MCP-compatible clients |
+
+These features are useful for remote control and unattended workflows. They are just no longer the main cost story under token-based Copilot pricing.
+
+## Installation
+
+### From Marketplace
+
 Install [AskAway](https://marketplace.visualstudio.com/items?itemName=intuitiv.askaway) from the VS Code Marketplace.
 
-**From source:**
+### From source
+
 ```bash
 cd tasksync-chat
-npm install && npm run build
+npm install
+npm run build
 npx vsce package
 code --install-extension askaway-*.vsix
 ```
 
-**Recommended settings** for agent mode:
+Recommended setting for longer agent sessions:
+
 ```json
 "chat.agent.maxRequests": 999
 ```
 
-> Enable **"Auto Approve"** in VS Code settings for uninterrupted agent operation. Keep sessions to 1-2 hours max to avoid hallucinations.
+Optional cost controls:
 
----
-
-## 🤖 Telegram Integration
-
-The primary addition — receive AI agent questions and respond from **Telegram** with instant push notifications.
-
-**How it works:**
-1. Agent calls `ask_user` → question sent to your Telegram chat with **full context** (what the agent is working on, what it's already done, and what it needs from you)
-2. Reply to the bot → answer flows back to VS Code
-3. Tap inline keyboard buttons for choice-based questions
-
-**Why context matters:** In VS Code, you have the full Copilot chat visible. On Telegram, you don't. AskAway enriches every question with enough context that you can give a meaningful answer just from the Telegram message — no need to switch back to your computer.
-
-**Highlights:**
-- 📲 Instant push notifications on your phone
-- 🧠 Context-enriched questions — answer without seeing VS Code
-- 🔘 Inline keyboard buttons for multiple-choice questions
-- 📁 File change tracking in each message
-- ⏳ Status updates when answered
-
-<details>
-<summary><strong>Setup Instructions (2 minutes)</strong></summary>
-
-1. Create a bot via [@BotFather](https://t.me/BotFather) — copy the token
-2. Open VS Code Settings → search `askaway.telegram`
-3. Enable `askaway.telegram.enabled`
-4. Paste bot token in `askaway.telegram.botToken`
-5. Run `AskAway: Get Telegram Chat ID` — send any message to your bot for auto-detection
-
-</details>
-
----
-
-## 💬 Webex Integration
-
-Receive AI agent questions and respond directly from a **Webex space** — desktop, mobile, or web.
-
-**How it works:**
-1. Agent calls `ask_user` → question posted as a rich **Adaptive Card** in your Webex room with full context
-2. Reply in the thread → answer flows back to the agent in VS Code
-3. Smart backoff polling: fast initially (2s), slows to 5min when idle
-
-**Highlights:**
-- 🃏 Rich Adaptive Cards with markdown, code blocks, and choice buttons
-- 🧠 Context-enriched questions — same as Telegram
-- 🔄 OAuth auto-refresh — tokens renew automatically
-- 📁 File change tracking — see which files the agent modified
-- ⏳ Live status — cards update from "⏳ Awaiting" → "✅ Answered"
-- 🔒 Token file support for CI/automation
-
-<details>
-<summary><strong>Setup Instructions</strong></summary>
-
-1. Open VS Code Settings → search `askaway.webex`
-2. Enable `askaway.webex.enabled`
-3. Set `askaway.webex.roomId` (get from Webex API: `GET /rooms`)
-4. Choose an auth method:
-   - **Simple:** Paste token in `askaway.webex.accessToken`
-   - **Token file:** Point `askaway.webex.tokenFilePath` to `{ "access_token": "..." }`
-   - **OAuth (recommended):** Set `clientId`, `clientSecret`, `refreshToken` for auto-renewal
-
-</details>
-
----
-
-## 📱 Remote Mobile & Web Access
-
-Also included: a local web server that serves the full AskAway UI to your phone, tablet, or any browser on your network.
-
-| | |
-|---|---|
-| 🛋️ Work from your couch while AI agents run on your computer | 📱 Full mobile-responsive UI |
-| 🔒 Works when your computer screen is locked | ⚡ Real-time WebSocket sync |
-
-**Quick Start:**
-1. Click the broadcast icon in the AskAway panel (or run `AskAway: Start Remote Server`)
-2. Open the URL on your phone (e.g., `http://192.168.1.5:3000`)
-3. Enter the 4-digit PIN shown in VS Code
-4. Answer agent questions from anywhere!
-
-**Highlights:** PWA installable • Session isolation per VS Code window • See [full docs](tasksync-chat/docs/REMOTE_ACCESS.md)
-
----
-
-## 🔌 MCP Server
-
-AskAway includes a built-in MCP (Model Context Protocol) server so external AI tools can use it too.
-
-**Supported clients:** Kiro, Cursor, Gemini CLI, and any MCP-compatible tool.
-
-Auto-starts when it detects external client configs, or enable manually:
 ```json
-"askaway.mcpEnabled": true
+{
+  "askaway.turnBudgetAiu": 25,
+  "askaway.mcpEnabled": true
+}
 ```
 
-Run `AskAway: Show MCP Config` to get the JSON snippet for your preferred client.
+## Remote Integrations
 
----
+### Telegram
 
-## ❓ FAQ
+1. Create a bot with [@BotFather](https://t.me/BotFather).
+2. Enable `askaway.telegram.enabled`.
+3. Set `askaway.telegram.botToken`.
+4. Run `AskAway: Get Telegram Chat ID` and send any message to your bot.
 
-**Q: Can I use both TaskSync and AskAway at the same time?**
-No. Both extensions register the same `ask_user` tool, so only one can be active. Disable one before enabling the other. AskAway includes all TaskSync features plus the messaging integrations, so you don't lose anything by switching.
+### Webex
 
-**Q: Will this fall behind the main TaskSync extension?**
-This fork is kept fairly up-to-date with upstream [TaskSync](https://github.com/4regab/TaskSync). Merges are done regularly to bring in new features and fixes from the original project. The fork-specific code (Telegram, Webex, Remote Access) is isolated in separate modules to minimize merge conflicts.
+1. Enable `askaway.webex.enabled`.
+2. Set `askaway.webex.roomId`.
+3. Configure one auth method: `askaway.webex.accessToken`, `askaway.webex.tokenFilePath`, or OAuth settings.
 
-**Q: Why are questions on Telegram/Webex more detailed than in VS Code?**
-By design. In VS Code you can see the full Copilot chat history for context. On Telegram or Webex, you're reading a standalone message on your phone. AskAway enriches the prompt sent to messaging services with additional context — what the agent is working on, progress so far, and what it needs — so you can give a meaningful answer without switching back to your computer.
+### Remote browser UI
+
+1. Run `AskAway: Start Remote Server` or enable `askaway.remoteEnabled`.
+2. Open the local network URL shown by VS Code.
+3. Enter the PIN shown in the AskAway panel.
+
+## What Is Coming Next
+
+More cost-optimization tools are coming soon. The current direction is simple: give agents cheaper, narrower, more structured ways to inspect code, run builds, read logs, and understand when enough context has already been gathered.
+
+## FAQ
+
+### Is AskAway only for saving Copilot credits?
+
+No. It still includes queueing, remote questions, Telegram, Webex, remote browser access, prompt history, MCP support, and the original `ask_user` workflow. The newer README leads with cost observability because token-based Copilot pricing makes it the most important current problem.
+
+### Does AskAway change GitHub Copilot pricing?
+
+No. AskAway reads local Copilot usage telemetry and helps you optimize behavior. Billing is still controlled by GitHub Copilot.
+
+### Are metrics exact?
+
+AskAway uses Copilot's local debug-log usage fields where available. Current-turn metrics are intended to be live and actionable. Monthly metrics are best effort from local logs and persisted local mirrors; older requests that disappeared from rotated Copilot logs before AskAway captured them may not be recoverable.
+
+### Can I use TaskSync and AskAway together?
+
+Usually no. Both can register the same `ask_user` tool, so only one should be active at a time. AskAway includes the TaskSync-style workflow plus the newer metrics and optimization features.
 
 ---
 
 > [!WARNING]
-> **GitHub Security Notice:**  
+> **GitHub Security Notice:**
 > GitHub prohibits excessive automated bulk activity that places undue burden on their infrastructure.
 > Review [GitHub Acceptable Use Policies](https://docs.github.com/site-policy/acceptable-use-policies/github-acceptable-use-policies#4-spam-and-inauthentic-activity-on-github) and [Copilot Terms](https://docs.github.com/site-policy/github-terms/github-terms-for-additional-products-and-features#github-copilot).
-> **Use responsibly and at your own risk.**
+> Use responsibly and at your own risk.
 
 ## License
 
-MIT — See [LICENSE](LICENSE) for details.
-
+MIT - See [LICENSE](LICENSE) for details.
