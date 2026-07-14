@@ -177,6 +177,23 @@ The budget is advisory. It does not block Copilot. It gives the agent a live cos
 
 ![AskAway turn budget signal](resources/Turn%20budget.jpg)
 
+## Cowork Offload
+
+AskAway can offload heavy brainstorming to a **free** external model (for example Microsoft Copilot cowork) without spending Copilot credits on the export itself, then bring back a patch.
+
+The `/export-to-cowork` command and two local scripts are installed automatically at user level, so they work in **every** workspace:
+
+| Step | Command | Cost |
+|------|---------|------|
+| 1. Export | `/export-to-cowork` in chat → writes `.askaway/cowork-manifest.json` | Cheap — the command enumerates relevant files by **search only** and never reads full file contents |
+| 2. Bundle | `node ~/.askaway/cowork/bundle.mjs` → writes `.askaway/cowork-bundle.md` | Free — pure local Node, no model calls |
+| 3. Brainstorm | Upload the bundle to a free model and ask for a reasoning writeup + a unified diff patch | Free |
+| 4. Apply | Save the patch under `.askaway/cowork-inbox/` and run `node ~/.askaway/cowork/apply.mjs` | Free — validates and `git apply`s the patch, prints any reasoning notes |
+
+The manifest records the task, context, a list of relevant files (with reasons), optional globs, and memory files. The bundle script expands it into one self-contained file with `=== path ===` headers plus the memory files verbatim. The apply script accepts `--check` for a dry run. Generated artifacts under `.askaway/` are gitignored.
+
+Because the thinking happens in the free model and the local steps have no model cost, the only metered work is the tiny, search-only manifest write.
+
 ## RTK Integration
 
 If `rtk` is installed, AskAway can show RTK benefits in the same Metrics dashboard.

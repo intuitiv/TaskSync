@@ -44,6 +44,11 @@
     let debugLoggingEnabled = true;
     let rtkCompressionEnabled = false;
     let rtkInstalled = true;
+    let autoCompactionDisabled = false;
+    let extendedCacheTtl = false;
+    let extendedCacheTtlMessages = false;
+    let cacheKeepWarmEnabled = false;
+    let cacheKeepWarmProbes = 1;
     let toolScopeMode = 'month'; // 'month' | 'turn' — toggles the tool-call table scope
     let obsView = 'turn'; // 'turn' | 'month' — drives the whole Observability panel
     let observabilityMetrics = {
@@ -56,13 +61,16 @@
         workspace: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
         overall: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
         perModel: [],
+        overallCompaction: { count: 0, nanoAiu: 0 },
         turnRequests: [],
         turnEvents: [],
+        turnSubagents: [],
         rtkCommandCount: 0,
         rtkSavedTokens: 0,
         rtkSavingsPct: 0,
         gradle: { runs: 0, optimizedRuns: 0, tasksAvoided: 0, configCacheReuses: 0, savedTokens: 0 },
         toolCalls: { totalCalls: 0, totalOutputTokens: 0, byTool: [], turn: { totalCalls: 0, totalOutputTokens: 0, byTool: [] } },
+        lastRequestTs: 0,
         source: 'unavailable',
         updatedAt: 0
     };
@@ -135,7 +143,9 @@
     // Settings modal elements
     let settingsModal, settingsModalOverlay, settingsModalClose;
     let soundToggle, interactiveApprovalToggle, sendShortcutToggle, webexToggle, telegramToggle, autopilotEditBtn, autopilotToggle, autopilotTextInput, promptsList, addPromptBtn, addPromptForm;
-    let debugLoggingToggle, rtkCompressionToggle;
+    let debugLoggingToggle, rtkCompressionToggle, autoCompactionToggle;
+    let extendedCacheTtlToggle, cacheKeepWarmToggle, cacheKeepWarmProbesInput;
+    let extendedCacheTtlMessagesToggle;
     let autopilotPromptsList, autopilotAddBtn, addAutopilotPromptForm, autopilotPromptInput, saveAutopilotPromptBtn, cancelAutopilotPromptBtn;
     let responseTimeoutSelect, sessionWarningHoursSelect, maxAutoResponsesInput;
     let turnBudgetInput;
@@ -489,9 +499,51 @@
             '</div>';
         modalContent.appendChild(rtkSection);
 
-        // Observability moved to its own "Metrics" tab — see createObservabilityTab().
+        // Disable Auto Compaction — inverts Copilot's summarizeAgentConversationHistory.enabled.
+        // Checked = auto-compaction OFF (conversation history is not auto-summarized when the
+        // context window fills). Sits in the Optimization group next to RTK.
+        var autoCompactionSection = document.createElement('div');
+        autoCompactionSection.className = 'settings-section';
+        autoCompactionSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-fold"></span> Disable Auto Compaction' +
+            '<span class="settings-info-icon" title="When enabled, VS Code Copilot will NOT auto-compact (summarize) agent conversation history once the context window fills. Turns off github.copilot.chat.summarizeAgentConversationHistory.enabled.">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '<div class="toggle-switch" id="auto-compaction-toggle" role="switch" aria-checked="false" aria-label="Disable Copilot auto compaction" tabindex="0"></div>' +
+            '</div>';
+        modalContent.appendChild(autoCompactionSection);
 
-        // Interactive approval section - toggle interactive Yes/No + choices UI
+        // Extended prompt-cache TTL — Anthropic 1-hour cache instead of the default ~5 min.
+        // Directly buys more time before a cache goes cold (e.g. while composing a reply).
+        var extendedTtlSection = document.createElement('div');
+        extendedTtlSection.className = 'settings-section';
+        extendedTtlSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-clock"></span> Extended prompt cache (1 hour)' +
+            '<span class="settings-info-icon" title="Enables Anthropic 1-hour prompt-cache TTL instead of the default ~5 minutes, so your cached context stays warm far longer (cache hits stay cheap). Sets github.copilot.chat.anthropic.promptCaching.extendedTtl (+ extendedTtlMessages). Requires a Claude model / plan that supports extended caching.">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '<div class="toggle-switch" id="extended-cache-ttl-toggle" role="switch" aria-checked="false" aria-label="Extended prompt cache TTL" tabindex="0"></div>' +
+            '</div>' +
+            '<div class="settings-subrow"><label for="extended-cache-ttl-messages-toggle" title="Also apply the 1-hour TTL to the conversation MESSAGES (the bulk of the tokens), not just the tool definitions. Sets github.copilot.chat.anthropic.promptCaching.extendedTtlMessages. Only takes effect when the Extended prompt cache toggle above is also ON (Copilot applies 1h to messages only when both flags are set).">Also extend messages (bulk)</label>' +
+            '<div class="toggle-switch" id="extended-cache-ttl-messages-toggle" role="switch" aria-checked="false" aria-label="Extend messages TTL" tabindex="0"></div></div>';
+        modalContent.appendChild(extendedTtlSection);
+
+        // Keep cache warm during long sub-agent calls — native Copilot keep-alive probes.
+        var keepWarmSection = document.createElement('div');
+        keepWarmSection.className = 'settings-section';
+        keepWarmSection.innerHTML = '<div class="settings-section-header">' +
+            '<div class="settings-section-title">' +
+            '<span class="codicon codicon-pulse"></span> Keep cache warm (sub-agent probes)' +
+            '<span class="settings-info-icon" title="Sends lightweight keep-alive probe requests (billed at the cheap cached-input rate) to preserve the prompt cache while a long sub-agent tool call runs. Sets github.copilot.chat.agent.longToolCallCachePreservation.enabled. Note: Copilot only probes during execution_subagent calls, not during ask_user waits.">' +
+            '<span class="codicon codicon-info"></span></span>' +
+            '</div>' +
+            '<div class="toggle-switch" id="cache-keep-warm-toggle" role="switch" aria-checked="false" aria-label="Keep cache warm" tabindex="0"></div>' +
+            '</div>' +
+            '<div class="settings-subrow"><label for="cache-keep-warm-probes">Max probes</label>' +
+            '<input type="number" id="cache-keep-warm-probes" min="0" max="10" step="1" class="settings-number-input" /></div>';
+        modalContent.appendChild(keepWarmSection);
         var approvalSection = document.createElement('div');
         approvalSection.className = 'settings-section';
         approvalSection.innerHTML = '<div class="settings-section-header">' +
@@ -710,6 +762,11 @@
         addPromptForm = document.getElementById('add-prompt-form');
         debugLoggingToggle = document.getElementById('debug-logging-toggle');
         rtkCompressionToggle = document.getElementById('rtk-compression-toggle');
+        autoCompactionToggle = document.getElementById('auto-compaction-toggle');
+        extendedCacheTtlToggle = document.getElementById('extended-cache-ttl-toggle');
+        extendedCacheTtlMessagesToggle = document.getElementById('extended-cache-ttl-messages-toggle');
+        cacheKeepWarmToggle = document.getElementById('cache-keep-warm-toggle');
+        cacheKeepWarmProbesInput = document.getElementById('cache-keep-warm-probes');
     }
 
     // Build the Observability ("Metrics") tab: the credits table, RTK/Gradle savings,
@@ -748,6 +805,10 @@
             // ── This turn: individual requests (growing) + this turn's tool calls ──
             '<div id="obs-turn-view">' +
             '<div class="obs-turn-summary" id="obs-turn-summary">No requests yet this turn</div>' +
+            '<div class="obs-cache-row">' +
+            '<div class="obs-cache-age" id="obs-cache-age" title="Time since the last model request. The prompt prefix cache stays warm for ~5 min; past that a new message likely incurs a cache MISS (more expensive). A long-running tool ages this clock too.">Prompt cache age: \u2013</div>' +
+            '<button type="button" class="obs-cache-ping-btn" id="obs-cache-ping-btn" title="Keep-warm ping: fills the CURRENT chat input and submits it in the SAME agent/mode (identical system prompt \u2192 cache HIT at the cheap cached rate), refreshing the ~5-min TTL. Use it while the agent is idle and this chat is the active one. For automatic keep-warm, enable the native settings below (Keep cache warm + Extended prompt cache).">\u26a1 Ping</button>' +
+            '</div>' +
             '<div class="observability-model-note">Timeline this turn \u2014 LLM requests in columns \u00b7 expand a tool row for input/output \u00b7 ask me to investigate any <b>ID</b></div>' +
             '<table class="observability-table observability-model-table obs-timeline-table">' +
             '<thead><tr><th>ID</th><th>Model / Tool</th><th>Credits</th><th>Input</th><th>Output</th><th>Cached</th><th title="cached / input">Hit%</th></tr></thead>' +
@@ -767,6 +828,7 @@
             '<tbody><tr>' +
             '<td id="obs-all-reqs">0</td><td id="obs-all-credits">0</td><td id="obs-all-input">0</td><td id="obs-all-output">0</td><td id="obs-all-cached">0</td><td id="obs-all-hit">\u2013</td><td id="obs-all-miss">0</td>' +
             '</tr></tbody></table>' +
+            '<div class="observability-scope-note" id="obs-all-compaction">Compaction: 0 requests</div>' +
             '<div class="observability-model-note">Per-model \u2014 this month</div>' +
             '<table class="observability-table observability-model-table">' +
             '<thead><tr><th>Model</th><th>Reqs</th><th>Credits</th><th>Input</th><th>Output</th><th>Cached</th></tr></thead>' +
@@ -914,6 +976,41 @@
                     e.preventDefault();
                     toggleRtkCompressionSetting();
                 }
+            });
+        }
+        if (autoCompactionToggle) {
+            autoCompactionToggle.addEventListener('click', toggleAutoCompactionSetting);
+            autoCompactionToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggleAutoCompactionSetting();
+                }
+            });
+        }
+        if (extendedCacheTtlToggle) {
+            extendedCacheTtlToggle.addEventListener('click', toggleExtendedCacheTtl);
+            extendedCacheTtlToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExtendedCacheTtl(); }
+            });
+        }
+        if (extendedCacheTtlMessagesToggle) {
+            extendedCacheTtlMessagesToggle.addEventListener('click', toggleExtendedCacheTtlMessages);
+            extendedCacheTtlMessagesToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExtendedCacheTtlMessages(); }
+            });
+        }
+        if (cacheKeepWarmToggle) {
+            cacheKeepWarmToggle.addEventListener('click', toggleCacheKeepWarm);
+            cacheKeepWarmToggle.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleCacheKeepWarm(); }
+            });
+        }
+        if (cacheKeepWarmProbesInput) {
+            cacheKeepWarmProbesInput.addEventListener('change', function () {
+                var v = Math.max(0, Math.min(10, Math.round(Number(cacheKeepWarmProbesInput.value) || 0)));
+                cacheKeepWarmProbes = v;
+                cacheKeepWarmProbesInput.value = String(v);
+                vscode.postMessage({ type: 'updateCacheKeepWarmProbes', value: v });
             });
         }
         if (webexToggle) {
@@ -1414,6 +1511,12 @@
                 debugLoggingEnabled = message.debugLoggingEnabled !== false;
                 rtkCompressionEnabled = message.rtkCompressionEnabled === true;
                 rtkInstalled = message.rtkInstalled !== false;
+                autoCompactionDisabled = message.autoCompactionDisabled === true;
+                extendedCacheTtl = message.extendedCacheTtl === true;
+                extendedCacheTtlMessages = message.extendedCacheTtlMessages === true;
+                cacheKeepWarmEnabled = message.cacheKeepWarmEnabled === true;
+                cacheKeepWarmProbes = Number(message.cacheKeepWarmProbes);
+                if (!isFinite(cacheKeepWarmProbes)) { cacheKeepWarmProbes = 1; }
                 if (message.observabilityMetrics && typeof message.observabilityMetrics === 'object') {
                     observabilityMetrics = {
                         requestCount: Number(message.observabilityMetrics.requestCount) || 0,
@@ -1433,6 +1536,8 @@
                 updateSendWithCtrlEnterToggleUI();
                 updateDebugLoggingToggleUI();
                 updateRtkCompressionToggleUI();
+                updateAutoCompactionToggleUI();
+                updateCacheSettingsUI();
                 updateWebexToggleUI();
                 updateWebexStatusUI(message.webexStatus);
                 updateTelegramToggleUI();
@@ -1469,6 +1574,10 @@
                         lastRequest: sanitizeScope(message.metrics.lastRequest),
                         workspace: sanitizeScope(message.metrics.workspace),
                         overall: sanitizeScope(message.metrics.overall),
+                        overallCompaction: (function (c) {
+                            c = c || {};
+                            return { count: Number(c.count) || 0, nanoAiu: Number(c.nanoAiu) || 0 };
+                        })(message.metrics.overallCompaction),
                         perModel: Array.isArray(message.metrics.perModel) ? message.metrics.perModel.map(function (m) {
                             var sc = sanitizeScope(m);
                             sc.model = typeof m.model === 'string' ? m.model : 'unknown';
@@ -1482,7 +1591,9 @@
                                 inputTokens: Number(r.inputTokens) || 0,
                                 outputTokens: Number(r.outputTokens) || 0,
                                 cachedTokens: Number(r.cachedTokens) || 0,
-                                cacheHitPct: Number(r.cacheHitPct) || 0
+                                cacheHitPct: Number(r.cacheHitPct) || 0,
+                                kindTag: typeof r.kindTag === 'string' ? r.kindTag : 'normal',
+                                subagent: (typeof r.subagent === 'string' && r.subagent) ? r.subagent : null
                             };
                         }) : [],
                         turnEvents: Array.isArray(message.metrics.turnEvents) ? message.metrics.turnEvents.map(function (event) {
@@ -1497,7 +1608,9 @@
                                     outputTokens: Number(event.outputTokens) || 0,
                                     group: typeof event.group === 'string' ? event.group : 'default',
                                     inputPreview: typeof event.inputPreview === 'string' ? event.inputPreview : '',
-                                    outputPreview: typeof event.outputPreview === 'string' ? event.outputPreview : ''
+                                    outputPreview: typeof event.outputPreview === 'string' ? event.outputPreview : '',
+                                    subagent: (typeof event.subagent === 'string' && event.subagent) ? event.subagent : null,
+                                    subagentId: (typeof event.subagentId === 'string' && event.subagentId) ? event.subagentId : null
                                 };
                             }
                             return {
@@ -1509,6 +1622,9 @@
                                 outputTokens: Number(event && event.outputTokens) || 0,
                                 cachedTokens: Number(event && event.cachedTokens) || 0,
                                 cacheHitPct: Number(event && event.cacheHitPct) || 0,
+                                kindTag: (event && typeof event.kindTag === 'string') ? event.kindTag : 'normal',
+                                subagent: (event && typeof event.subagent === 'string' && event.subagent) ? event.subagent : null,
+                                subagentId: (event && typeof event.subagentId === 'string' && event.subagentId) ? event.subagentId : null,
                                 firstOfTurn: !!(event && event.firstOfTurn),
                                 split: (event && event.split && typeof event.split === 'object') ? {
                                     systemTokens: Number(event.split.systemTokens) || 0,
@@ -1521,13 +1637,60 @@
                                     skillsCount: Number(event.split.skillsCount) || 0,
                                     toolsCount: Number(event.split.toolsCount) || 0,
                                     messageCount: Number(event.split.messageCount) || 0,
-                                    cachedTokens: Number(event.split.cachedTokens) || 0
+                                    cachedTokens: Number(event.split.cachedTokens) || 0,
+                                    composition: (event.split.composition && typeof event.split.composition === 'object') ? {
+                                        totalTokens: Number(event.split.composition.totalTokens) || 0,
+                                        baseTokens: Number(event.split.composition.baseTokens) || 0,
+                                        segments: Array.isArray(event.split.composition.segments) ? event.split.composition.segments.map(function (s) {
+                                            return {
+                                                label: typeof s.label === 'string' ? s.label : '',
+                                                kind: typeof s.kind === 'string' ? s.kind : 'attachment',
+                                                path: (typeof s.path === 'string' && s.path) ? s.path : null,
+                                                workspaceFolder: (typeof s.workspaceFolder === 'string' && s.workspaceFolder) ? s.workspaceFolder : null,
+                                                tokens: Number(s.tokens) || 0,
+                                                children: Array.isArray(s.children) ? s.children.map(function (c) {
+                                                    return {
+                                                        label: typeof c.label === 'string' ? c.label : '',
+                                                        path: (typeof c.path === 'string' && c.path) ? c.path : null,
+                                                        tokens: Number(c.tokens) || 0
+                                                    };
+                                                }) : null
+                                            };
+                                        }) : []
+                                    } : null,
+                                    contributors: (event.split.contributors && typeof event.split.contributors === 'object') ? {
+                                        totalInputTokens: Number(event.split.contributors.totalInputTokens) || 0,
+                                        cachedTokens: Number(event.split.contributors.cachedTokens) || 0,
+                                        accountedTokens: Number(event.split.contributors.accountedTokens) || 0,
+                                        items: Array.isArray(event.split.contributors.items) ? event.split.contributors.items.map(function (it) {
+                                            return {
+                                                label: typeof it.label === 'string' ? it.label : '',
+                                                kind: typeof it.kind === 'string' ? it.kind : 'dialogue',
+                                                tokens: Number(it.tokens) || 0,
+                                                path: (typeof it.path === 'string' && it.path) ? it.path : null,
+                                                count: Number(it.count) || 0
+                                            };
+                                        }) : [],
+                                        files: Array.isArray(event.split.contributors.files) ? event.split.contributors.files.filter(function (f) { return typeof f === 'string'; }) : [],
+                                        memoryFiles: Array.isArray(event.split.contributors.memoryFiles) ? event.split.contributors.memoryFiles.filter(function (f) { return typeof f === 'string'; }) : []
+                                    } : null
                                 } : null
+                            };
+                        }) : [],
+                        turnSubagents: Array.isArray(message.metrics.turnSubagents) ? message.metrics.turnSubagents.map(function (s) {
+                            return {
+                                subagentId: typeof s.subagentId === 'string' ? s.subagentId : '',
+                                label: typeof s.label === 'string' ? s.label : 'sub-agent',
+                                done: !!s.done,
+                                durMs: Number(s.durMs) || 0,
+                                outputTokens: Number(s.outputTokens) || 0,
+                                status: typeof s.status === 'string' ? s.status : 'running'
                             };
                         }) : [],
                         rtkCommandCount: Number(message.metrics.rtkCommandCount) || 0,
                         rtkSavedTokens: Number(message.metrics.rtkSavedTokens) || 0,
                         rtkSavingsPct: Number(message.metrics.rtkSavingsPct) || 0,
+                        lastRequestTs: Number(message.metrics.lastRequestTs) || 0,
                         gradle: (function (g) {
                             g = g || {};
                             return {
@@ -2600,6 +2763,54 @@
         debugLoggingToggle.setAttribute('aria-checked', debugLoggingEnabled ? 'true' : 'false');
     }
 
+    function toggleAutoCompactionSetting() {
+        autoCompactionDisabled = !autoCompactionDisabled;
+        updateAutoCompactionToggleUI();
+        vscode.postMessage({ type: 'updateAutoCompactionDisabled', disabled: autoCompactionDisabled });
+    }
+
+    function updateAutoCompactionToggleUI() {
+        if (!autoCompactionToggle) return;
+        autoCompactionToggle.classList.toggle('active', autoCompactionDisabled);
+        autoCompactionToggle.setAttribute('aria-checked', autoCompactionDisabled ? 'true' : 'false');
+    }
+
+    function toggleExtendedCacheTtl() {
+        extendedCacheTtl = !extendedCacheTtl;
+        updateCacheSettingsUI();
+        vscode.postMessage({ type: 'updateExtendedCacheTtl', enabled: extendedCacheTtl });
+    }
+
+    function toggleExtendedCacheTtlMessages() {
+        extendedCacheTtlMessages = !extendedCacheTtlMessages;
+        updateCacheSettingsUI();
+        vscode.postMessage({ type: 'updateExtendedCacheTtlMessages', enabled: extendedCacheTtlMessages });
+    }
+
+    function toggleCacheKeepWarm() {
+        cacheKeepWarmEnabled = !cacheKeepWarmEnabled;
+        updateCacheSettingsUI();
+        vscode.postMessage({ type: 'updateCacheKeepWarm', enabled: cacheKeepWarmEnabled });
+    }
+
+    function updateCacheSettingsUI() {
+        if (extendedCacheTtlToggle) {
+            extendedCacheTtlToggle.classList.toggle('active', extendedCacheTtl);
+            extendedCacheTtlToggle.setAttribute('aria-checked', extendedCacheTtl ? 'true' : 'false');
+        }
+        if (extendedCacheTtlMessagesToggle) {
+            extendedCacheTtlMessagesToggle.classList.toggle('active', extendedCacheTtlMessages);
+            extendedCacheTtlMessagesToggle.setAttribute('aria-checked', extendedCacheTtlMessages ? 'true' : 'false');
+        }
+        if (cacheKeepWarmToggle) {
+            cacheKeepWarmToggle.classList.toggle('active', cacheKeepWarmEnabled);
+            cacheKeepWarmToggle.setAttribute('aria-checked', cacheKeepWarmEnabled ? 'true' : 'false');
+        }
+        if (cacheKeepWarmProbesInput && document.activeElement !== cacheKeepWarmProbesInput) {
+            cacheKeepWarmProbesInput.value = String(cacheKeepWarmProbes);
+        }
+    }
+
     function toggleRtkCompressionSetting() {
         if (!rtkInstalled) { return; }
         rtkCompressionEnabled = !rtkCompressionEnabled;
@@ -2619,6 +2830,34 @@
                 titleEl.innerHTML = '<span class="codicon codicon-server-process"></span> RTK Command Compression' +
                     (rtkInstalled ? '' : ' <span class="obs-na" style="font-size:10px">(rtk not installed)</span>');
             }
+        }
+    }
+
+    function renderCacheAge() {
+        var el = document.getElementById('obs-cache-age');
+        if (!el) { return; }
+        var ts = Number(observabilityMetrics.lastRequestTs) || 0;
+        if (!ts) { el.textContent = 'Prompt cache age: \u2013'; el.className = 'obs-cache-age'; return; }
+        var secs = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+        var capped = Math.min(secs, 300); // never display beyond the 5:00 cache TTL
+        var mm = Math.floor(capped / 60), ss = capped % 60;
+        var clock = mm + ':' + (ss < 10 ? '0' : '') + ss;
+        var state, cls;
+        if (secs < 285) { state = 'warm \u2014 a new message should hit cache'; cls = 'obs-cache-age obs-cache-warm'; }
+        else if (secs < 300) { state = 'cooling \u2014 send within 15s to keep the cache hit'; cls = 'obs-cache-age obs-cache-cooling'; }
+        else { state = 'likely COLD \u2014 next message may be a cache MISS (pricier)'; cls = 'obs-cache-age obs-cache-cold'; }
+        el.className = cls;
+        el.innerHTML = 'Prompt cache age: <b>' + clock + '</b> / 5:00 \u00b7 ' + state;
+        // Sound alert once per request-cycle when the cache is about to expire (~4:45), so the
+        // user can hit Ping in time. Re-arms whenever a new request resets the clock (ts changes).
+        if (soundEnabled && secs >= 285 && secs < 300) {
+            if (window._obsCacheWarnedTs !== ts) {
+                window._obsCacheWarnedTs = ts;
+                try { playNotificationSound(); } catch (e) { /* ignore */ }
+            }
+        } else if (secs < 285 && window._obsCacheWarnedTs === ts) {
+            // clock reset below the threshold for this cycle — allow a future re-arm
+            window._obsCacheWarnedTs = null;
         }
     }
 
@@ -2723,11 +2962,84 @@
                 '<div class="obs-split-title">' + kind + ' \u2014 ' + tok(total) + ' tok total input</div>' +
                 bar +
                 '<div class="obs-split-lines">' +
-                line('obs-split-sys', 'System prompt', tok(sysT) + ' tok', (Number(split.skillsCount) || 0) + ' skills') +
+                line('obs-split-sys', 'System prompt', tok(sysT) + ' tok', 'exact') +
                 line('obs-split-tools', 'Tool definitions', tok(toolsT) + ' tok', (Number(split.toolsCount) || 0) + ' tools') +
-                line('obs-split-hist', 'Conversation history', tok(convT) + ' tok', msgs + ' msgs') +
-                line('obs-split-user', 'Latest message', tok(userT) + ' tok', '') +
-                '</div></div>';
+                line('obs-split-hist', 'Conversation history', tok(convT) + ' tok', msgs + ' msgs \u00b7 derived') +
+                line('obs-split-user', 'Latest message', tok(userT) + ' tok', 'exact') +
+                '</div>' +
+                '<div class="obs-split-note">Conversation = total \u2212 system \u2212 tools (cached history + this step\u2019s tool responses). Per-tool response sizes are the \u2191 output tokens on the tool rows above.</div>' +
+                renderRequestContributors(split.contributors) +
+                renderPromptComposition(split.composition) +
+                '</div>';
+        }
+
+        // Full-request breakdown: everything that literally contributed to THIS request's input —
+        // system prompt, tool defs, user memory, each attached file, context framing, tool results
+        // and dialogue. Parsed from the request's own inputMessages, so it is exact (not a guess).
+        function renderRequestContributors(c) {
+            if (!c || !Array.isArray(c.items) || !c.items.length) { return ''; }
+            var total = Number(c.totalInputTokens) || 0;
+            var accounted = Number(c.accountedTokens) || 0;
+            var cached = Number(c.cachedTokens) || 0;
+            var hitPct = total > 0 ? Math.round(cached / total * 100) : 0;
+            function row(it) {
+                var t = Number(it.tokens) || 0;
+                var pct = total > 0 ? Math.round(t / total * 100) : 0;
+                var nameHtml = (it.kind === 'attachment' && it.path)
+                    ? '<a href="#" class="obs-comp-file" data-path="' + escapeHtml(String(it.path)) + '" title="' + escapeHtml(String(it.path)) + '">' + escapeHtml(String(it.label)) + '</a>'
+                    : '<span class="obs-comp-block">' + escapeHtml(String(it.label)) + '</span>';
+                return '<div class="obs-comp-row obs-comp-' + escapeHtml(String(it.kind)) + '">' +
+                    '<span class="obs-comp-tok">' + tok(t) + '</span>' +
+                    '<span class="obs-comp-name">' + nameHtml + ' <span class="obs-comp-pct">' + pct + '%</span></span></div>';
+            }
+            var rows = '';
+            for (var i = 0; i < c.items.length; i++) { rows += row(c.items[i]); }
+            var missing = total - accounted;
+            if (missing > 50) { rows += '<div class="obs-comp-row obs-comp-base"><span class="obs-comp-tok">' + tok(missing) + '</span><span class="obs-comp-name"><span class="obs-comp-block">Unattributed (Copilot base framing + provider-tokenizer variance)</span></span></div>'; }
+            return '<div class="obs-comp">' +
+                '<div class="obs-comp-header">Full request \u2014 ' + tok(total) + ' tok input \u00b7 ' + hitPct + '% cached</div>' +
+                '<div class="obs-comp-list">' + rows + '</div></div>';
+        }
+
+        // Reverse-engineered "what files make up the system prompt" breakdown.
+        // Flat + always visible (shown on the request row's initial expansion, no extra clicks),
+        // left-aligned so long file paths read from the left with no horizontal scroll.
+        function renderPromptComposition(comp) {
+            if (!comp || !Array.isArray(comp.segments) || !comp.segments.length) { return ''; }
+            var totalC = Number(comp.totalTokens) || 0;
+            var baseC = Number(comp.baseTokens) || 0;
+            var fileN = comp.segments.filter(function (s) { return s.kind === 'attachment' || s.kind === 'instruction'; }).length;
+            function fileLink(pathStr, labelStr) {
+                var name = escapeHtml(String(labelStr || ''));
+                return (pathStr)
+                    ? '<a href="#" class="obs-comp-file" data-path="' + escapeHtml(String(pathStr)) + '" title="' + escapeHtml(String(pathStr)) + '">' + name + '</a>'
+                    : '<span class="obs-comp-block">' + name + '</span>';
+            }
+            function row(cls, tokVal, nameHtml) {
+                return '<div class="obs-comp-row ' + cls + '">' +
+                    '<span class="obs-comp-tok">' + tok(Number(tokVal) || 0) + '</span>' +
+                    '<span class="obs-comp-name">' + nameHtml + '</span></div>';
+            }
+            var rows = '';
+            for (var i = 0; i < comp.segments.length; i++) {
+                var s = comp.segments[i];
+                var ws = s.workspaceFolder ? '<span class="obs-comp-ws">' + escapeHtml(String(s.workspaceFolder)) + '</span>' : '';
+                rows += row('obs-comp-' + escapeHtml(String(s.kind)), s.tokens, fileLink(s.path, s.label) + ws);
+                // Itemized catalog children (skills/agents) shown inline — no nested expansion.
+                var kids = Array.isArray(s.children) ? s.children : null;
+                if (kids && kids.length && (s.kind === 'skills' || s.kind === 'agents')) {
+                    for (var j = 0; j < kids.length; j++) {
+                        var c = kids[j];
+                        rows += row('obs-comp-child', c.tokens, fileLink(c.path, c.label));
+                    }
+                }
+            }
+            // Copilot's own base instructions + framing (closed) — accounted by size only.
+            rows += row('obs-comp-base', baseC, '<span class="obs-comp-block">Copilot base + framing (injected)</span>');
+            return '<div class="obs-comp">' +
+                '<div class="obs-comp-header">System prompt composition \u2014 ' + fileN + ' file' + (fileN === 1 ? '' : 's') +
+                ' \u00b7 ' + tok(totalC) + ' tok</div>' +
+                '<div class="obs-comp-list">' + rows + '</div></div>';
         }
 
         // ── This turn: chronological timeline — LLM rows in columns, tool rows expandable ──
@@ -2754,61 +3066,154 @@
             if (!events.length) {
                 eventTbody.innerHTML = '<tr><td colspan="7" class="obs-na">No events yet</td></tr>';
             } else {
-                var eventRows = '';
+                // Build one HTML <tr> (+ optional detail row) for a single tool event.
+                var buildToolRow = function (ev, k) {
+                    var eid = 't:' + String(ev.id || '') + ':' + k;
+                    var openAttr = openIds[eid] ? ' open' : '';
+                    var statusOk = !(ev.status && ev.status !== 'ok' && ev.status !== 'success');
+                    var timeCls = statusOk ? 'obs-tl-time' : 'obs-tl-time obs-cache-risk';
+                    // Flag heavy tool INPUT (>1K) and heavy tool OUTPUT (>4K). A large tool output
+                    // is the bigger cost driver: it is appended to the conversation history and
+                    // re-sent (billed) on every subsequent request until compaction.
+                    var inHeavy = (Number(ev.inputTokens) || 0) > 1000;
+                    var outHeavy = (Number(ev.outputTokens) || 0) > 4000;
+                    var toolHeavy = inHeavy || outHeavy;
+                    var isSubagent = String(ev.tool || '') === 'runSubagent';
+                    var toolRowCls = 'obs-event-tool' + (toolHeavy ? ' obs-row-flag' : '') + (isSubagent ? ' obs-row-subagent' : '');
+                    var subagentBadge = isSubagent ? '<span class="obs-kind-tag obs-tag-subagent" title="Sub-agent invocation \u2014 its nested model calls are billed as regular requests">sub-agent</span> ' : '';
+                    return '<tr class="' + toolRowCls + '"><td colspan="7" class="obs-tool-cell">' +
+                        '<details class="obs-tl-item obs-tl-tool" data-eid="' + eid + '"' + openAttr + '>' +
+                        '<summary class="obs-tl-head">' +
+                        '<span class="obs-tl-kind">tool</span>' +
+                        '<span class="obs-tl-name">' + subagentBadge + '<span class="obs-req-id">' + escapeHtml(String(ev.id || '?')) + '</span> ' + escapeHtml(String(ev.tool || 'unknown')) + '</span>' +
+                        '<span class="obs-tl-metric" title="input tokens">\u2193' + tok(ev.inputTokens) + '</span>' +
+                        '<span class="obs-tl-metric' + (outHeavy ? ' obs-cache-risk' : '') + '" title="output tokens \u2014 large tool output is re-billed in history until compaction">\u2191' + tok(ev.outputTokens) + '</span>' +
+                        '<span class="' + timeCls + '" title="duration">' + sec(ev.durMs) + 's</span>' +
+                        '</summary>' +
+                        '<div class="obs-tl-body">' +
+                        '<div class="obs-tl-field"><span class="obs-tl-label">Input</span><pre class="obs-tl-pre">' + escapeHtml(String(ev.inputPreview || '\u2013')) + '</pre></div>' +
+                        '<div class="obs-tl-field"><span class="obs-tl-label">Output</span><pre class="obs-tl-pre">' + escapeHtml(String(ev.outputPreview || '\u2013')) + '</pre></div>' +
+                        '<div class="obs-tl-meta">status ' + escapeHtml(String(ev.status || 'ok')) + ' \u00b7 group ' + escapeHtml(String(ev.group || 'default')) + '</div>' +
+                        '</div></details>' +
+                        '</td></tr>';
+                };
+                // Build one HTML request <tr> (+ optional expandable detail row).
+                var buildRequestRow = function (ev, k) {
+                    var reid = 'r:' + String(ev.id || '') + ':' + k;
+                    var isOpen = !!openIds[reid];
+                    var inp = Number(ev.inputTokens) || 0;
+                    var pct = inp > 0 ? Math.round((Number(ev.cachedTokens) || 0) / inp * 100) : 100;
+                    var missed = (inp > 0 && pct < 50);
+                    var bigOut = (Number(ev.outputTokens) || 0) > 1000;
+                    var bigCredit = ((Number(ev.nanoAiu) || 0) / 1e9) > 100;
+                    var hitCls = missed ? ' class="obs-cache-risk"' : '';
+                    var outCls = bigOut ? ' class="obs-cache-risk"' : '';
+                    var credCls = bigCredit ? ' class="obs-cache-risk"' : '';
+                    var hasSplit = !!ev.split;
+                    var reqRowCls = 'obs-event-request' +
+                        ((missed || bigOut || bigCredit) ? ' obs-row-flag' : '') +
+                        (ev.subagent ? ' obs-row-subagent-req' : '') +
+                        (hasSplit ? ' obs-clickable' : '') +
+                        (isOpen ? ' obs-expanded' : '');
+                    var caret = hasSplit ? '<span class="obs-caret">\u25B8</span>' : '<span class="obs-caret-spacer"></span>';
+                    var subTag = ev.firstOfTurn ? '<span class="obs-sub-tag" title="This turn\u2019s initiating request \u2014 your submission">submission</span> ' : '';
+                    var kindTag = '';
+                    if (ev.kindTag === 'compaction') { kindTag = '<span class="obs-kind-tag obs-tag-compaction" title="Context compaction (summarizeConversationHistory) \u2014 billed as a request">compaction</span> '; }
+                    else if (ev.kindTag === 'retry') { kindTag = '<span class="obs-kind-tag obs-tag-retry" title="Retried request \u2014 billed again">retry</span> '; }
+                    var html = '<tr class="' + reqRowCls + '" data-eid="' + reid + '">' +
+                        '<td>' + caret + '<span class="obs-req-id">' + escapeHtml(String(ev.id || '?')) + '</span></td>' +
+                        '<td class="obs-scope">' + subTag + kindTag + escapeHtml(String(ev.model || 'unknown')) + '</td>' +
+                        '<td' + credCls + '>' + aiu(ev.nanoAiu) + '</td>' +
+                        '<td>' + tok(ev.inputTokens) + '</td>' +
+                        '<td' + outCls + '>' + tok(ev.outputTokens) + '</td>' +
+                        '<td>' + tok(ev.cachedTokens) + '</td>' +
+                        '<td' + hitCls + '>' + pct + '%</td></tr>';
+                    if (hasSplit) {
+                        html += '<tr class="obs-detail-row' + (isOpen ? ' obs-open' : '') + '" data-for="' + reid + '"' +
+                            (isOpen ? '' : ' style="display:none"') + '>' +
+                            '<td colspan="7">' + renderSplitDetail(ev.split) + '</td></tr>';
+                    }
+                    return html;
+                };
+                var buildAnyRow = function (ev, k) {
+                    return ev.kind === 'tool' ? buildToolRow(ev, k) : buildRequestRow(ev, k);
+                };
+
+                // Sub-agent summaries (authoritative totals once the parent runSubagent finishes).
+                var saSummary = {};
+                var saList = observabilityMetrics.turnSubagents || [];
+                for (var si = 0; si < saList.length; si++) { saSummary[saList[si].subagentId] = saList[si]; }
+
+                // Partition events into top-level items and per-sub-agent groups, keeping the
+                // group anchored at the position of its first event so the timeline stays ordered.
+                var renderItems = [];
+                var groups = {};
                 for (var k = 0; k < events.length; k++) {
                     var ev = events[k];
-                    if (ev.kind === 'tool') {
-                        var eid = 't:' + String(ev.id || '') + ':' + k;
-                        var openAttr = openIds[eid] ? ' open' : '';
-                        var statusOk = !(ev.status && ev.status !== 'ok' && ev.status !== 'success');
-                        var timeCls = statusOk ? 'obs-tl-time' : 'obs-tl-time obs-cache-risk';
-                        var toolHeavy = (Number(ev.inputTokens) || 0) > 1000;
-                        var toolRowCls = 'obs-event-tool' + (toolHeavy ? ' obs-row-flag' : '');
-                        eventRows += '<tr class="' + toolRowCls + '"><td colspan="7" class="obs-tool-cell">' +
-                            '<details class="obs-tl-item obs-tl-tool" data-eid="' + eid + '"' + openAttr + '>' +
-                            '<summary class="obs-tl-head">' +
-                            '<span class="obs-tl-kind">tool</span>' +
-                            '<span class="obs-tl-name"><span class="obs-req-id">' + escapeHtml(String(ev.id || '?')) + '</span> ' + escapeHtml(String(ev.tool || 'unknown')) + '</span>' +
-                            '<span class="obs-tl-metric" title="input tokens">\u2193' + tok(ev.inputTokens) + '</span>' +
-                            '<span class="obs-tl-metric" title="output tokens">\u2191' + tok(ev.outputTokens) + '</span>' +
-                            '<span class="' + timeCls + '" title="duration">' + sec(ev.durMs) + 's</span>' +
-                            '</summary>' +
-                            '<div class="obs-tl-body">' +
-                            '<div class="obs-tl-field"><span class="obs-tl-label">Input</span><pre class="obs-tl-pre">' + escapeHtml(String(ev.inputPreview || '\u2013')) + '</pre></div>' +
-                            '<div class="obs-tl-field"><span class="obs-tl-label">Output</span><pre class="obs-tl-pre">' + escapeHtml(String(ev.outputPreview || '\u2013')) + '</pre></div>' +
-                            '<div class="obs-tl-meta">status ' + escapeHtml(String(ev.status || 'ok')) + ' \u00b7 group ' + escapeHtml(String(ev.group || 'default')) + '</div>' +
-                            '</div></details>' +
-                            '</td></tr>';
-                    } else {
-                        var reid = 'r:' + String(ev.id || '') + ':' + k;
-                        var isOpen = !!openIds[reid];
-                        var inp = Number(ev.inputTokens) || 0;
-                        var pct = inp > 0 ? Math.round((Number(ev.cachedTokens) || 0) / inp * 100) : 100;
-                        var missed = (inp > 0 && pct < 50);
-                        var bigOut = (Number(ev.outputTokens) || 0) > 1000;
-                        var hitCls = missed ? ' class="obs-cache-risk"' : '';
-                        var outCls = bigOut ? ' class="obs-cache-risk"' : '';
-                        var hasSplit = !!ev.split;
-                        var reqRowCls = 'obs-event-request' +
-                            ((missed || bigOut) ? ' obs-row-flag' : '') +
-                            (hasSplit ? ' obs-clickable' : '') +
-                            (isOpen ? ' obs-expanded' : '');
-                        var caret = hasSplit ? '<span class="obs-caret">\u25B8</span>' : '<span class="obs-caret-spacer"></span>';
-                        var subTag = ev.firstOfTurn ? '<span class="obs-sub-tag" title="This turn\u2019s initiating request \u2014 your submission">submission</span> ' : '';
-                        eventRows += '<tr class="' + reqRowCls + '" data-eid="' + reid + '">' +
-                            '<td>' + caret + '<span class="obs-req-id">' + escapeHtml(String(ev.id || '?')) + '</span></td>' +
-                            '<td class="obs-scope">' + subTag + escapeHtml(String(ev.model || 'unknown')) + '</td>' +
-                            '<td>' + aiu(ev.nanoAiu) + '</td>' +
-                            '<td>' + tok(ev.inputTokens) + '</td>' +
-                            '<td' + outCls + '>' + tok(ev.outputTokens) + '</td>' +
-                            '<td>' + tok(ev.cachedTokens) + '</td>' +
-                            '<td' + hitCls + '>' + pct + '%</td></tr>';
-                        if (hasSplit) {
-                            eventRows += '<tr class="obs-detail-row' + (isOpen ? ' obs-open' : '') + '" data-for="' + reid + '"' +
-                                (isOpen ? '' : ' style="display:none"') + '>' +
-                                '<td colspan="7">' + renderSplitDetail(ev.split) + '</td></tr>';
+                    var said = ev.subagentId;
+                    if (said) {
+                        if (!groups[said]) {
+                            groups[said] = { id: said, items: [], reqCount: 0, toolCount: 0, nano: 0, inTok: 0, outTok: 0, minTs: Number(ev.ts) || 0, maxTs: Number(ev.ts) || 0, models: {} };
+                            renderItems.push({ type: 'group', id: said });
                         }
+                        var g = groups[said];
+                        g.items.push({ ev: ev, k: k });
+                        if (ev.kind === 'tool') { g.toolCount++; g.outTok += Number(ev.outputTokens) || 0; }
+                        else {
+                            g.reqCount++; g.nano += Number(ev.nanoAiu) || 0; g.inTok += Number(ev.inputTokens) || 0; g.outTok += Number(ev.outputTokens) || 0;
+                            var mdl = String(ev.model || 'unknown');
+                            g.models[mdl] = (g.models[mdl] || 0) + 1;
+                        }
+                        var ets = Number(ev.ts) || 0;
+                        if (ets && (!g.minTs || ets < g.minTs)) { g.minTs = ets; }
+                        if (ets > g.maxTs) { g.maxTs = ets; }
+                    } else {
+                        renderItems.push({ type: 'event', ev: ev, k: k });
                     }
+                }
+
+                var eventRows = '';
+                for (var ri = 0; ri < renderItems.length; ri++) {
+                    var item = renderItems[ri];
+                    if (item.type === 'event') {
+                        eventRows += buildAnyRow(item.ev, item.k);
+                        continue;
+                    }
+                    // Sub-agent group: one collapsible wrapper aggregating all nested LLM + tool calls.
+                    var grp = groups[item.id];
+                    var sum = saSummary[item.id] || null;
+                    var gLabel = (sum && sum.label) ? sum.label : 'sub-agent';
+                    var done = !!(sum && sum.done);
+                    var gid = 'sa:' + item.id;
+                    var gOpenAttr = openIds[gid] ? ' open' : '';
+                    var gDurMs = done ? Number(sum.durMs) || 0 : Math.max(0, (grp.maxTs - grp.minTs));
+                    var gOut = done ? (Number(sum.outputTokens) || grp.outTok) : grp.outTok;
+                    var statusBad = sum && sum.status && sum.status !== 'ok' && sum.status !== 'success';
+                    var stateBadge = done
+                        ? (statusBad ? '<span class="obs-kind-tag obs-tag-retry" title="Sub-agent ended with an error">failed</span>' : '<span class="obs-sub-tag" title="Sub-agent completed">done</span>')
+                        : '<span class="obs-kind-tag obs-tag-subagent obs-sa-running" title="Sub-agent still running \u2014 totals update live">running\u2026</span>';
+                    var nestedRows = '';
+                    grp.items.sort(function (a, b) { return (Number(a.ev.ts) || 0) - (Number(b.ev.ts) || 0); });
+                    for (var gi = 0; gi < grp.items.length; gi++) { nestedRows += buildAnyRow(grp.items[gi].ev, grp.items[gi].k); }
+                    // Dominant model this sub-agent ran on (helps decide if a cheaper model would do).
+                    var domModel = '', domN = -1;
+                    for (var mk in grp.models) { if (grp.models[mk] > domN) { domN = grp.models[mk]; domModel = mk; } }
+                    var modelBadge = domModel ? '<span class="obs-tl-metric" title="model this sub-agent ran on \u2014 delegate to a cheaper model to cut cost">' + escapeHtml(domModel) + '</span>' : '';
+                    eventRows += '<tr class="obs-event-tool obs-row-subagent"><td colspan="7" class="obs-tool-cell">' +
+                        '<details class="obs-tl-item obs-tl-subagent" data-eid="' + gid + '"' + gOpenAttr + '>' +
+                        '<summary class="obs-tl-head">' +
+                        '<span class="obs-tl-kind obs-tag-subagent">sub-agent</span>' +
+                        '<span class="obs-tl-name"><span class="obs-req-id">' + escapeHtml(String(item.id)) + '</span> ' + escapeHtml(String(gLabel)) + ' ' + stateBadge + '</span>' +
+                        modelBadge +
+                        '<span class="obs-tl-metric" title="nested LLM requests / tool calls">' + grp.reqCount + ' req \u00b7 ' + grp.toolCount + ' tools</span>' +
+                        '<span class="obs-tl-metric" title="credits (AIU)">' + aiu(grp.nano) + ' AIU</span>' +
+                        '<span class="obs-tl-metric" title="output tokens">\u2191' + tok(gOut) + '</span>' +
+                        '<span class="obs-tl-time" title="total wall time">' + sec(gDurMs) + 's</span>' +
+                        '</summary>' +
+                        '<div class="obs-tl-body obs-tl-subagent-body">' +
+                        '<table class="observability-table obs-timeline-table obs-subagent-nested"><tbody>' + nestedRows + '</tbody></table>' +
+                        '</div></details>' +
+                        '</td></tr>';
                 }
                 eventTbody.innerHTML = eventRows;
             }
@@ -2816,6 +3221,13 @@
             if (!eventTbody._obsClickBound) {
                 eventTbody._obsClickBound = true;
                 eventTbody.addEventListener('click', function (e) {
+                    var fileLink = e.target && e.target.closest ? e.target.closest('a.obs-comp-file') : null;
+                    if (fileLink && eventTbody.contains(fileLink)) {
+                        e.preventDefault();
+                        var fp = fileLink.getAttribute('data-path');
+                        if (fp) { vscode.postMessage({ type: 'openFile', path: fp }); }
+                        return;
+                    }
                     var row = e.target && e.target.closest ? e.target.closest('tr.obs-clickable') : null;
                     if (!row || !eventTbody.contains(row)) { return; }
                     var forId = row.getAttribute('data-eid');
@@ -2834,10 +3246,42 @@
             var n = Number(lastScope.requestCount) || 0;
             var usd = ((Number(lastScope.nanoAiu) || 0) / 1e9 / 100);
             var usdStr = '<span style="color:#f14c4c">($' + usd.toFixed(2) + ')</span>';
+            // Derive compaction / sub-agent counts from this turn's timeline events.
+            var turnEvts = observabilityMetrics.turnEvents || [];
+            var compactN = 0;
+            for (var te = 0; te < turnEvts.length; te++) {
+                var tev = turnEvts[te];
+                if (tev.kind === 'request' && tev.kindTag === 'compaction') { compactN++; }
+            }
+            var subagentN = (observabilityMetrics.turnSubagents || []).length;
+            var extra = '';
+            if (compactN) { extra += ' \u00b7 <span class="obs-tag-compaction">' + compactN + ' compaction' + (compactN === 1 ? '' : 's') + '</span>'; }
+            if (subagentN) { extra += ' \u00b7 <span class="obs-tag-subagent">' + subagentN + ' sub-agent' + (subagentN === 1 ? '' : 's') + '</span>'; }
             turnSummary.innerHTML = n
                 ? (n + ' request' + (n === 1 ? '' : 's') + ' \u00b7 ' + aiu(lastScope.nanoAiu) + ' AIU ' + usdStr + ' \u00b7 ' +
-                    tok(lastScope.inputTokens) + ' in / ' + tok(lastScope.outputTokens) + ' out \u00b7 ' + hitPct(lastScope) + ' cache hit')
+                    tok(lastScope.inputTokens) + ' in / ' + tok(lastScope.outputTokens) + ' out \u00b7 ' + hitPct(lastScope) + ' cache hit' + extra)
                 : 'No requests yet this turn';
+        }
+        // Live prompt-cache age clock: ticks up client-side from the last request ts. The Anthropic
+        // prefix cache stays warm ~5 min; once cold, the next message likely pays a cache MISS. A
+        // long-running tool also ages this (no new request logged), so it doubles as a "is the tool
+        // taking so long the cache will be cold?" signal.
+        if (!window._obsCacheAgeTimer) {
+            window._obsCacheAgeTimer = setInterval(renderCacheAge, 1000);
+        }
+        renderCacheAge();
+        var pingBtn = document.getElementById('obs-cache-ping-btn');
+        if (pingBtn && !pingBtn._bound) {
+            pingBtn._bound = true;
+            pingBtn.addEventListener('click', function () {
+                pingBtn.disabled = true;
+                pingBtn.textContent = '\u26a1 Pinging\u2026';
+                vscode.postMessage({ type: 'pingCache' });
+                // Keep the user in AskAway's own input so their in-progress text is never lost
+                // (the ping submits into the Copilot panel, not this box).
+                setTimeout(function () { try { if (chatInput) { chatInput.focus(); } } catch (e) { /* ignore */ } }, 250);
+                setTimeout(function () { pingBtn.disabled = false; pingBtn.textContent = '\u26a1 Ping'; }, 4000);
+            });
         }
         renderToolTable('obs-turn-tool-tbody', tc.turn || {});
 
@@ -2849,6 +3293,14 @@
         setCell('obs-all-cached', tok(all.cachedTokens));
         setHit('obs-all-hit', all);
         setCell('obs-all-miss', num(all.cacheMisses || 0));
+        var comp = observabilityMetrics.overallCompaction || { count: 0, nanoAiu: 0 };
+        var compEl = document.getElementById('obs-all-compaction');
+        if (compEl) {
+            var cc = Number(comp.count) || 0;
+            compEl.innerHTML = cc
+                ? 'Compaction: <span class="obs-tag-compaction">' + num(cc) + ' request' + (cc === 1 ? '' : 's') + '</span> \u00b7 ' + aiu(comp.nanoAiu) + ' AIU spent auto-summarizing context this month'
+                : 'Compaction: 0 requests this month';
+        }
         renderToolTable('obs-month-tool-tbody', tc);
 
         if (observabilityRtkLine) {

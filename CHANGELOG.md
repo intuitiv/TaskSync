@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## AskAway v2.1.0 (07-12-26)
+- **New: Cowork Offload (`/export-to-cowork`).** Offload heavy brainstorming to a free external model without spending Copilot credits on the export. The command enumerates relevant files by search only (never reading full contents) and writes `.askaway/cowork-manifest.json`; `bundle.mjs` expands it into a single upload-ready bundle; `apply.mjs` validates and `git apply`s the patch that comes back.
+- Installed automatically at user level on activation, so it works in every workspace: the command goes to the VS Code User prompts folder and the scripts to `~/.askaway/cowork/`. User edits are preserved.
+
+## AskAway v2.0.0 (07-07-26)
+- **Major version.** Focus shifts to Copilot AI credit observability and cost optimization.
+- **New: Disable Auto Compaction toggle** (Settings → Optimization). When enabled, VS Code Copilot will not auto-compact (summarize) agent conversation history once the context window fills. Toggles `github.copilot.chat.summarizeAgentConversationHistory.enabled` (off when checked).
+- Metrics dashboard (This Turn / This Month), per-model and per-tool observability, RTK savings, and the `gradle`, `code_nav`, and `turn_budget` optimization tools.
+
 ## TaskSync v2.0.14 (02-07-26)
 - refactor: rename Auto Answer to Autopilot, improve UI and settings
 - - Rename all autoAnswer references to autopilot across codebase

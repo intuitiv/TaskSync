@@ -1,5 +1,343 @@
 # AskAway Build — Agent Audit Log
 
+## 2026-07-13 IST — Removed AskAway MCP server from VS Code user mcp.json (killed duplicate tool listing); enforced one-line audit entries in agent file.
+
+## 2026-07-12 IST — Raised tool-row output flag 1K→4K (webview.js outHeavy); explained MCP dual-surface (extension LM tools + external MCP server, gradle/ask_user overlap).
+
+## 2026-07-12 IST — Added read_doc LM tool (progressive md/log/text reader: outline/section/search) in tools.ts + package.json.
+
+## 2026-07-12 IST — Fixed tool rows showing 0 in/0 out: _lookupToolIo now only INCREASES counts (Math.max vs debug) since Copilot PostToolUse now sends empty tool_response; hook probes alias response keys.
+
+## 2026-07-12 IST — Tool-output flag >1K, memory dedupe, code_nav desc, budget banner slimming
+
+1. **Tool row flag threshold → output>1000** (was output>4000). `buildToolRow` (media/webview.js) now flags `inputTokens>1000 || outputTokens>1000` + red ↑output metric. Rationale (user): tool output becomes next request's input.
+2. **Memory file bloat fixed.** `/memories/repo/tasksync-chat.md` was ~47K tokens (~188K chars) with a triplicated block; the AskAway Build agent reads it at session start → 47K into context every session. Renamed old → `tasksync-chat-archive.md`, wrote a deduplicated ~4-5K-token condensed replacement (deploy/tools/gradle/observability/hooks/settings/agent/misc). Archive kept for history, read-on-demand only.
+3. **code_nav description sharpened** (package.json modelDescription): leads with "PREFER over read_file/grep", explains document_symbols→ranged-read workflow to skip Javadoc/doc-comments on doc-heavy files, notes it returns ranges not source. Same guidance added to the SHIPPED agent string (extension.ts) AND the user's ACTIVE `~/…/prompts/askaway-build.agent.md` (which lacked `## Search & Navigation Discipline` + `## Turn Budget` — ensure* preserves user edits so it had to be edited directly).
+4. **Budget banner slimmed (cache-friendly).** `BUDGET_INJECT_SCRIPT` (extension.ts UserPromptSubmit hook) now emits ONE numbers-only line `Turn budget: N AIU · last turn X (Y%, OVER — be frugal)` (drops the OVER tail when under). The static how-to guidance moved into the agent `.agent.md` `## Turn Budget` section (cached system prompt, ~0 tokens/turn) — both shipped string and active file.
+
+tsc clean, bundle built, deployed extension.js + package.json + media/webview.js. RELOAD WINDOW (+ reload re-installs the trimmed budget hook).
+
+## 2026-07-12 IST — Tool-output flag fix + ACD2D unattributed diagnosis + code_nav forcing Q
+
+1. **FIX: heavy tool OUTPUT now flagged in This-Turn timeline.** `buildToolRow` (media/webview.js) computed `toolHeavy` from `inputTokens>1000` ONLY, so a tool with 47K output but small input (id 69942) was never flagged. Added `outHeavy = outputTokens>4000` → row `obs-row-flag` + red `obs-cache-risk` on the ↑output metric. Rationale: tool output is re-appended to history and re-billed every later request until compaction (bigger cost driver than input). webview.js only; node --check clean; cp media/webview.js → installed. RELOAD WINDOW.
+2. **ACD2D 55K "unattributed" is NOT a parser miss.** Dumped its inputMessages: tool_call_response=52,362 tok (correctly attributed), text 5,527, reasoning 1,661, tool_call args 1,504 → ~62K reconstructible. But Copilot reported inputTokens=135,601 (cached 134,547 = 99%). So ~73K of the billed prefix is NOT in the logged inputMessages — Copilot references it from server-side prefix cache and doesn't re-log it; plus o200k vs Anthropic tokenizer drift. The "Unattributed" residual = cached-prefix-not-re-logged + tokenizer variance. Inherent to cached requests; that 55K is 99% cached (0.1× billing) so cheap. Optional: relabel residual more precisely (not done — awaiting user).
+3. **code_nav edit/patch + forcing built-ins:** adding edit ops (WorkspaceEdit/applyEdit) is technically trivial, BUT forcing the model to use custom tools over built-in read_file/apply_patch is NOT reliably possible — Copilot owns those tool schemas, can't deregister/deprioritize; only hard lever is a PreToolUse DENY hook (fragile, model loops, no token upside since edits are tiny). Recommended AGAINST forcing edits (no compression benefit unlike rg_search/gradle). Offered: (a) sharpen code_nav description for nav cases, (b) prototype deny-hook to demonstrate. Awaiting user choice.
+
+## 2026-07-12 IST — Q&A: false-compaction, agents block, unattributed, code_nav preference (no code change)
+
+Investigation-only turn answering four user questions:
+1. **Request `32756` "compaction" badge is CORRECT, not a bug.** Traced id 32756 → session `f75c2d58…` li 905 → raw Copilot `debugName=summarizeConversationHistory`, model claude-opus-4.8, in=239,166, cached=0. Genuine auto-compaction at ~239K tokens. Enumerated all on-disk debugNames: only real `summarizeConversationHistory`(79)/`-simple`(3)/`retry-error-summarizeConversationHistory`(2) contain "summarize" → classifier has zero false positives. To stop it: enable Disable Auto Compaction toggle.
+2. **`<agents>` block (ts, ts, talk_to_user, …) is COPILOT-injected**, not AskAway. Copilot enumerates every `.agent.md` (user prompts folder + workspace) into the system prompt. AskAway ships only `AskAway Build`; duplicate `ts` = user has two agent files named `ts`. Composition view only attributes those tokens; can't remove them.
+3. **"Unattributed" row = residual** (`totalInput − accountedTokens`, shown when >50). Non-exact by design: o200k vs Anthropic tokenizer drift + Copilot base framing absent from `inputMessages` + any message-part shape the parser doesn't measure. A ~109K residual is large enough to likely be an unparsed part shape (worth a targeted fix if user supplies the request ID).
+4. **code_nav ignored** despite instructions because: (a) `read_file`/`run_in_terminal` are Copilot BUILT-IN tools with hard-wired preference over any extension LM tool (AskAway can't reprioritize Copilot's schema); (b) in agent/subagent contexts code_nav is a DEFERRED tool — not in the active toolset until loaded via tool search; (c) task mismatch — code_nav is read-only LSP nav, never replaces patch/edit tools, and the model judges read_file "good enough". Lever = sharper tool description + non-deferred availability, not prompt pleading.
+
+## 2026-07-12 IST — Tool row undercount ROOT CAUSE + lossless PostToolUse hook
+
+**Bug:** timeline tool row showed memory output = ~1.3K tok while the drill-down (from inputMessages) showed 48K. **Root cause (confirmed):** the tool row derives output from Copilot's debug-log `tool_call` `attrs.result`, which Copilot TRUNCATES to ~5K chars for log size (the 185KB memory read logged as 5,011 chars = 1,316 tok). The debug log is lossy. **Fix (user's approach — a hook):** verified in the Copilot bundle that the PostToolUse hook payload is `{tool_name, tool_input, tool_response, tool_use_id}` and `tool_response = A9i(n) = n.content.filter(text).map(value).join(' ')` — FULL, untruncated. New `ensureToolIoHookInstalled()` (extension.ts) installs a PostToolUse hook (`~/.askaway/hooks/tool-io-gate.sh` + `tool-io.js`, registered in `~/.copilot/hooks/tool-io.json` + `~/.claude/settings.json`) that appends real sizes to `~/.askaway/tool-io.jsonl` `{ts,tool,id,inChars,outChars,inTok,outTok}` (bounded 4000 rows; tokens = chars/4 estimate, no tokenizer in hook). webviewProvider `_loadToolIoIndex()` (cached by size+mtime) + `_lookupToolIo(tool,ts,debugOutChars,debugInChars)` matches the nearest-in-time hook row (≤30s) for the same tool and overrides the tool event's in/out tokens when the hook output is materially larger (truncation); outputPreview gets a "full output ≈ N tok" note. Only affects NEW tool calls after reload (hook install). Exact per-tool tokens still come from inputMessages in the request drill-down. tsc + node --check clean; deployed. RELOAD WINDOW.
+
+## 2026-07-12 IST — Metrics: per-tool itemization of tool-output contribution
+
+**Ask:** show the exact per-tool weight inside a request's "Tool results" line so major cost drivers are identifiable. **Done:** `_analyzeRequestContributors` now maps each `tool_call` id→name and attributes every `tool_call_response` to its tool, emitting one contributor row per tool (descending) — `Tool output: <tool> (<N> calls)` with exact token count. Replaces the single aggregate "Tool results" line. **Finding (real request, 179K input / 59K tool output):** `memory` = 49,700 tok across 3 calls, and a SINGLE `memory view` of `/memories/repo/tasksync-chat.md` = 184,928 chars = **48,436 tok** (82% of all tool output). read_file 4,007 / run_in_terminal 3,209 / grep 750 / list_dir 490 / rest <700 — none problematic. Culprit = the oversized, duplicated repo memory file being read into context. Compiles + deployed (extension.js + media). RELOAD WINDOW.
+
+## 2026-07-12 IST — Metrics: fix mislabeled tool-output attribution + clipped request IDs
+
+**Reported by user:** (1) request IDs "missing" in This-Turn timeline; (2) a request's drill-down showed "Conversation (user + assistant) = 105K" while the latest message was only 51K, and the input jumped 37K→123K between consecutive requests despite tool calls emitting only ~3-4K visible tokens — "are we showing tool output as wrong?"
+
+**Root cause (confirmed by inspecting real `attrs.inputMessages`):** Copilot's messages array tags tool traffic with NO `content` field — `tool_call`→`arguments`, `tool_call_response`(role:user)→`response` (array of `{type:text,text}`), `reasoning`→`content`, `text`→`content`. `_analyzeRequestContributors` read only `p.content`, so every tool_call/tool_call_response was dropped, and their (dominant) tokens were swept into the `dialogue` RESIDUAL (`conversationTotal − identified`) and mislabeled "Conversation (user + assistant)". VERIFIED on a real 179,034-tok request: genuine dialogue = only **3,586 tok**, tool OUTPUTS = **58,854**, tool-call args = 13,416, reasoning = 2,613, memory = 2,927, context = 4,431. So yes — tool outputs were shown as conversation. The 37K→123K jump is the full conversation prefix (mostly tool outputs) being re-sent each request, not just the small new tool result.
+
+**Fix (`webviewProvider.ts` + `media/`):** parse each message part by its real shape into measured buckets — Tool results (from `response`), Tool calls/arguments (from `arguments`), Assistant reasoning (from `reasoning.content`); dialogue is now MEASURED (`text parts − memory − attachments − context`), not a residual. New `RequestContributor.kind` values `toolCall`/`reasoning` (webview renders `obs-comp-<kind>` generically). Exact reconciliation is intentionally gone (it was an artifact of dialogue=residual; Claude bills with Anthropic's tokenizer while we estimate with o200k), so the leftover is honestly labeled "Unattributed (Copilot base framing + provider-tokenizer variance)". For the "missing IDs": the timeline ID column was 12% wide with `overflow:hidden`, clipping the caret + 5-char ID in the narrow sidebar → widened to 16% (model 28→24%), `td:nth-child(1)` set `overflow:visible; white-space:nowrap`. tsc + `node --check` clean; built + deployed extension.js/webview.js/main.css. User must RELOAD WINDOW.
+
+## 2026-07-12 IST — v2.1.0 release (README + CHANGELOG + VSIX)
+
+**Delivered:** documented the cowork loop and cut a new version. Added a "Cowork Offload" section to the root `README.md` (4-step table: `/export-to-cowork` → `node ~/.askaway/cowork/bundle.mjs` → free brainstorm → `node ~/.askaway/cowork/apply.mjs`, emphasizing search-only export + zero model cost on local steps). Added CHANGELOG entry `AskAway v2.1.0 (07-12-26)`. Bumped `package.json` + `package-lock.json` (both version fields) 2.0.0 → 2.1.0. Built + deployed to installed dev folder. Packaged `tasksync-chat/askaway-2.1.0.vsix` (26 files, 3.88 MB, SHA-256 `bad0487678322a1bafb85c7747da775dce4fef15f0d5d2321057df739f840190`) via Node v22.22.3 PATH (Node 16 fails vsce on undici). Cowork assets ship inside extension.js (base64 in coworkAssets.ts) so no extra VSIX files needed.
+
+## 2026-07-12 IST — cowork loop baked into extension (user-level self-install)
+
+**Delivered:** made the cowork export/import loop a first-class, user-level extension feature (previously workspace-only files). New `ensureCoworkInstalled(context)` in `extension.ts` (called in activate right after `ensureAskAwayBuildAgentInstalled`) writes, on every activation and preserving user edits (write only when missing or byte-identical): the `/export-to-cowork` prompt command → VS Code User prompts folder (`<user>/prompts/export-to-cowork.prompt.md`), and `bundle.mjs`/`apply.mjs` → `~/.askaway/cowork/` (chmod 755). Assets embedded as base64 in generated `src/cowork/coworkAssets.ts` (regenerated from the real `cowork/*.mjs` + `.github/prompts/*.prompt.md` sources via a node one-liner — avoids manual escaping of the scripts' template literals/`${}`; decode = `Buffer.from(b64,'base64')`). Command's next-step text + bundle.mjs hint now reference the global path `~/.askaway/cowork/…` so it works from any workspace (scripts use `process.cwd()` as root). Verified: tsc --noEmit clean, esbuild + deploy OK, all 3 embedded assets decode byte-identical to sources. Reload window to trigger install.
+
+**Regen command (when editing the scripts/prompt):** re-run the node base64 generator that writes `tasksync-chat/src/cowork/coworkAssets.ts` from the three source files, then build/deploy.
+
+## 2026-07-12 IST — cowork export/import loop (offline brainstorming offload)
+
+**Delivered:** a token-cheap "compact/export" flow to offload brainstorming to the free Microsoft Copilot cowork, then bring back a patch. Three pieces, all new, no extension code touched:
+- `.github/prompts/export-to-cowork.prompt.md` — `/export-to-cowork` slash command. HARD RULE baked in: enumerate relevant files via search only (`file_search`/`grep`/`code_nav`), **never read full contents** (the token trap the user flagged). Writes exactly one file `.askaway/cowork-manifest.json` = `{version,topic,task,context[],expectedOutput,files:[{path,reason}],globs[],memories[]}`. Supports new-topic and existing-conversation modes.
+- `cowork/bundle.mjs` — FREE local Node (no deps). Reads manifest, expands globs (tiny built-in `**`/`*` matcher, ignores node_modules/.git/dist/etc), concatenates every file with `=== path ===` headers, appends memory files verbatim, prepends task/context/expectedOutput → `.askaway/cowork-bundle.md`. Per-file truncation cap (`--max-bytes`, default 400k). Prints size + approx tokens.
+- `cowork/apply.mjs` — RETURN LEG. Reads `.askaway/cowork-inbox/`: `*.patch`/`*.diff` → `git apply --check` then apply (`--3way` fallback); `*.md`/`*.txt` → printed as reasoning. `--check` dry-run, single-file, `--dir` override.
+- `cowork/README.md` (the loop) + `cowork/cowork-manifest.example.json`. `.gitignore` entries for generated artifacts.
+
+**Verified end-to-end:** bundle produced 4 files (2 explicit + 2 via `cowork/*.mjs` glob) + 1 memory, 198KB; apply validated + actually applied a synthetic new-file patch, printed a reasoning note; smoke artifacts cleaned up. Scripts chmod +x.
+
+**Design note to user:** their plan was sound; the only real trap (enumerate-by-search-not-read) is enforced in the command. SharePoint/Graph grounding is correctly phase 2; MVP = local bundle file (optionally pipe through toolbox publisher for a URL).
+
+## 2026-07-11 IST — extendedTtlMessages toggle + full-request contributor breakdown
+
+**Delivered:** (1) Exposed `github.copilot.chat.anthropic.promptCaching.extendedTtlMessages` as its own Settings→Optimization sub-toggle ("Also extend messages (bulk)") under the Extended prompt cache section, decoupled from the extendedTtl toggle (which no longer auto-sets it via companionKey). New message `updateExtendedCacheTtlMessages` + broadcast field + webview state/listener/sync. Tooltip notes it only takes effect when the main Extended TTL toggle is also on (Copilot applies 1h to messages only when both flags are set). (2) Full-request contributor breakdown: a new "Full request — N tok · X% cached" block (above the system-prompt composition, on request-row expansion) that itemizes everything literally in the request — system prompt, tool defs, user memory (+ which `.md` memory files), each attached file (linkable), context/environment framing, tool results, and dialogue. Parsed from the request's own `inputMessages` (the complete messages array, not a guess) via new `_analyzeRequestContributors`, cached, attached to `TurnInputSplit.contributors`, sanitized + rendered in webview.
+
+**Why:** answers "which files/memories actually contributed, and why does input sometimes double." The system-prompt composition only covers ~5K tokens; the 190K+ bulk is the conversation (dialogue + tool outputs) plus cache state — now visible per request. Verified the breakdown reconciles exactly to the model-reported input on a real request (diff 0: sys 5281 + tools 12750 + memory 2927 + context 2125 + dialogue 191583 = 214666).
+
+**Probe exploration (no code):** Re-confirmed an extension cannot mimic Copilot's native keep-alive probe (`startBuildPromptKeepAlive` reuses private `lastFetchOptions`, is sub-agent-gated, and conversation content is redacted). Anthropic's `max_tokens:0` pre-warm is API-only, not exposed through `vscode.lm`. The only manual option is the existing Ping button (`chat.open` partial-query + submit on the same agent → cache-read hit, but adds a visible turn). Cleaner fix remains Extended TTL, now with both flags exposed.
+
+**Verify:** `node --check media/webview.js` OK, `tsc --noEmit` clean, standalone simulation reconciled diff 0. Deployed extension.js + media/webview.js + main.css + package.json. RELOAD WINDOW required. Known issue: the repo-memory helper file `/memories/repo/tasksync-chat.md` picked up some duplicate bullets from a memory-tool glitch this turn (no data loss / no code impact) — to be de-duplicated separately.
+
+
+## 2026-07-11 IST — Anthropic caching research + system-prompt composition accuracy fix
+
+**Research (no code):** Explored Anthropic prompt caching end-to-end (official docs + prior Copilot-bundle decompilation) and answered the user's questions: caching is incremental prefix caching (not whole-input hit/miss) billed in three slices (read 0.1× / write 1.25× 5-min or 2× 1-hour / fresh 1×); up to 4 breakpoints cache sections independently in a tools→system→messages hierarchy; a shared static prefix CAN be reused across conversations within the same workspace/TTL. Explained `extendedTtl` (tools only) vs `extendedTtlMessages` (messages, needs both flags). Concluded the user's enable→ping→disable idea is net-negative as empirically measured — the *enable* flip changes the tools `cache_control` breakpoint and forces a one-time full-prefix rewrite (verified `cachedTokens=0`), and a same-prefix "ping" isn't reproducible from an extension. Recommendation: leave BOTH extended-TTL flags on only for anticipated idle gaps; keep them off for continuous work; avoid model/agent/mode switches that churn the prefix.
+
+**Fix (shipped):** User reported the Metrics "system prompt split" looked inaccurate. Root cause: `_analyzeSystemPromptComposition` (webviewProvider.ts) only attributed `<attachment>`/`<instruction>`/`<skills>`/`<agents>`, so every other tagged section fell into an opaque "Copilot base + framing" bucket. In AskAway Build agent mode that hid the custom agent's `<modeInstructions>` (1184 tok = 22% of a 5281-tok prompt) plus all named Copilot framing sections → base showed ~68%. Added a generic outermost-tag pass with two new segment kinds (`mode`, `framing`), FRIENDLY labels, and guards against double-counting (skip already-handled tags; skip tags nested inside attachment/instruction `consumedRanges`; subtract nested skills/agents from container sections). Result on the real current sidecar: base 68% → 7.2% (378 tok truly-untagged), and parts+base reconcile exactly (4903+378=5281).
+
+**Verify:** `tsc --noEmit` clean; simulated full logic against this session's real `system_prompt_0.json`. Backend-only change (extension.js) — webview already renders arbitrary segment kinds generically, no media edit. Deployed extension.js to installed dev folder. RELOAD WINDOW required.
+
+
+## 2026-07-11 IST — Composition flat/left-align/30%-fit + event-driven cache timer
+
+**Delivered:** (1) System-prompt composition now renders FLAT and always-visible on the request row's initial expansion — removed the outer `<details>` and the per-catalog nested `<details>` for skills/agents (children shown inline). `renderPromptComposition` in media/webview.js rewritten; token shown as a narrow left prefix, file link after it. (2) Left-alignment throughout the request-detail area: split lines (`.obs-split-*`) no longer push values to the right (removed flex:1 / min-width / text-align:right), composition rows left-align with `word-break:break-all` (paths wrap instead of forcing horizontal scroll), detail/tool cells forced `text-align:left; white-space:normal`. (3) Timeline table fits ~30% width with NO horizontal scrollbar: `.obs-timeline-table{table-layout:fixed;width:100%}` + per-column % widths (ID 12/Model 28/5 numeric ~12 each) + 10px font + overflow ellipsis on cells; ID column left-aligned. (4) Event-driven cache timer: new `ensureCacheTimerHookInstalled()` in extension.ts installs `~/.askaway/hooks/cache-timer-gate.sh`+`cache-timer.js` and registers UserPromptSubmit/PostToolUse/Stop in `~/.copilot/hooks/cache-timer.json` + `~/.claude/settings.json`; the hook stamps `~/.askaway/cache-activity-ts`. webviewProvider `_effectiveCacheActivityTs()` = max(newest llm_request ts, sentinel) feeds `lastRequestTs` at both broadcast sites → the age clock resets instantly on submit and marks each model round (no 2s poll lag).
+
+**Interpretation note:** user said "use right alignment" but the repeated, explained complaint was that right-aligned text forced scroll-left — so LEFT alignment was implemented (the fix for the stated problem).
+
+**Verify:** `tsc` clean, `node --check media/webview.js` OK, deployed bundle + media + package.json to installed dev folder. RELOAD WINDOW required (new bundle + hooks install on activation).
+
+
+## 2026-07-10 IST — Cache-expiry sound + shorter probe + ping text-safety
+
+**Delivered:** (1) Cache-about-to-expire sound: `renderCacheAge` now calls `playNotificationSound()` once per request-cycle when the clock enters 4:45–5:00 (gated by soundEnabled; re-arms via `window._obsCacheWarnedTs` when a new request resets the clock) so the user knows to hit Ping. (2) Shorter probe prompt: `_handlePingCache` query trimmed to `keepalive; reply: ok`. (3) Ping text-safety: after firing, the webview refocuses AskAway's own `chat-input` so in-progress text there is never lost (the ping submits into the Copilot panel, not AskAway's box).
+
+**Turn-finished sound:** already exists — `playNotificationSound()` fires on every `ask_user` handback (the AskAway turn boundary), plays `afplay Tink.aiff` + webview audio, gated by soundEnabled.
+
+**Honest limit (text retention in the Copilot PANEL):** VS Code exposes no get/set for the chat input box, so if the user types directly in the Copilot panel, the ping's `chat.open(isPartialQuery:true)` replaces it. Recommendation: compose in AskAway's input box (preserved) rather than the panel. `tsc`/`node --check` clean, deployed. Reload window.
+
+
+## 2026-07-10 IST — Fix ping cache-miss (submit on same agent) + decode native probe
+
+**Problem:** the ⚡ Ping caused a cache MISS. Root cause: `workbench.action.chat.open({query})` opens a fresh turn on the DEFAULT agent → different system prompt → whole prefix invalid → miss.
+
+**Native probe decoded:** `startBuildPromptKeepAlive` reuses Copilot's private `lastFetchOptions` verbatim (same system+tools+history), appends "Still working", fires every 240s up to maxProbes — but only while the last tool round is an `execution_subagent` call, and it's not callable from an extension. So it can't back a manual button, but confirms the correct approach: keep the exact prefix.
+
+**Fix:** `_handlePingCache` now does `chat.open({query, isPartialQuery:true})` (fills the CURRENT input, preserving the active agent/mode) then `workbench.action.chat.submit` → the follow-up lands on the SAME agent → shared prefix is a cache HIT + tiny new user message. Tooltip updated; for automatic keep-warm, recommend the native settings (Keep cache warm sub-agent probes + Extended prompt cache 1h). `tsc`/`node --check` clean, deployed. Reload window.
+
+
+## 2026-07-10 IST — Manual "Ping" keep-warm button (expose the probe)
+
+**Request:** expose the cache keep-warm probe as a manual trigger.
+
+**Reality:** Copilot's internal `startBuildPromptKeepAlive` probe isn't callable from an extension. Reproduced its *effect* instead: a ⚡ Ping button beside the prompt-cache-age clock (This Turn) posts `{type:'pingCache'}` → `_handlePingCache()` runs `workbench.action.chat.open({query,isPartialQuery:false})` with a constrained query ("keep-warm ping … no tools … reply exactly: ok"). Same active conversation → same prefix → cache HIT within the ~5-min TTL (cheap cached rate) and TTL refreshes. Button self-disables ~4s. Caveat surfaced to user: best used when the agent is idle/awaiting your next message (not mid tool-call), and it is a real (cheap) billed turn visible in chat. `tsc`/`node --check` clean; deployed extension.js + webview.js + main.css. Reload window.
+
+
+## 2026-07-10 IST — Native prompt-cache controls (the "keep cache warm" ask, done right)
+
+**Request:** a cheap (~1 credit, cached-rate) ping/button to refresh the live conversation's prompt cache without disrupting it.
+
+**Finding (verified in the shipped Copilot bundle):** an extension CANNOT fire a same-prefix probe on demand — Copilot's internal `startBuildPromptKeepAlive` uses its private `lastFetchOptions` and only fires when the last tool round contains an `execution_subagent` call (not `ask_user` waits); and the conversation content is redacted in logs so the prefix can't be replayed via `vscode.lm.sendChatRequest` (different prefix = different cache). BUT Copilot exposes real user-settable levers: `github.copilot.chat.anthropic.promptCaching.extendedTtl` (+ `extendedTtlMessages`) = Anthropic 1-hour cache TTL vs default ~5 min; `github.copilot.chat.agent.longToolCallCachePreservation.enabled` + `.maxProbes` (default 1) = native keep-alive probes during long sub-agent calls.
+
+**Delivered:** two toggles + a Max-probes input in AskAway Settings→Optimization (mirrors the existing auto-compaction toggle wiring): Extended prompt cache (1 hour) → extendedTtl(+Messages); Keep cache warm (sub-agent probes) → longToolCallCachePreservation.enabled with maxProbes 0–10. New generic `_handleUpdateCopilotChatSetting(key,value,companionKey?)`; interface fields extendedCacheTtl/cacheKeepWarmEnabled/cacheKeepWarmProbes read in `_updateSettingsUI` + broadcast; 3 new message types + cases. Webview: sections + `updateCacheSettingsUI()` + listeners; CSS `.settings-subrow`/`.settings-number-input`. Extended TTL is the direct fix for "time running out while I type." `tsc` clean, `node --check` OK, deployed. Reload window.
+
+
+## 2026-07-10 IST — Input accountability clarity + ping-idea feasibility
+
+**Request:** account for all input-request text incl. which tool responses are sent; and a "ping" button to extend the prompt cache TTL.
+
+**Ask 1 (done):** split detail now labels System prompt + Latest message as `exact`, Tool definitions by count, Conversation history as `derived`, plus a caption: conversation = total − system − tools (cached history + this step's tool responses), and per-tool response sizes are the ↑ output tokens already shown on the timeline tool rows. Grounded in real data: Copilot **redacts per-message content** in the debug log (every history message logs as ~1 tok — roles/count only), so exact per-tool-response *input* attribution is not in the logs; tool *outputs* are logged separately and already surfaced per tool in the timeline. Deployed webview.js + main.css (no TS change).
+
+**Ask 2 (not built — infeasible as imagined):** the Anthropic prefix cache is server-side, keyed to the exact Copilot-agent prefix (system+tools+conversation) and its TTL refreshes only when that exact prefix is re-read = only a real request in that same conversation. A `vscode.lm.sendChatRequest` from the extension uses a different prefix → refreshes a different entry → no effect on the main conversation. The only refresh is a full billed turn in that conversation (even 1 char re-sends the whole cached prefix at cached-input rate — cheaper than a miss but not free; 3–4 pings can cost more than the miss avoided). AskAway's webview (ask_user) has no handle to submit into the Copilot panel's agent session. Told user; offered to prototype a "submit minimal turn into Copilot chat" button behind a config with a billed-request caveat, pending go/no-go.
+
+
+## 2026-07-10 IST — Enhance: full token accountability (itemized skills + instruction files + Copilot-injected base)
+
+**Request:** account for every token in the input request — include Copilot's injected text (by size), and list skills individually with links.
+
+**Changes:** analyzer now also attributes `<instruction><file>…</file>` custom-instruction (`.instructions.md`) files as linkable segments, and itemizes the skills/agents catalogs into per-entry children (`SystemPromptChild{label,path,tokens}`) — each skill links to its `SKILL.md`. The "Copilot base + framing (injected)" line remains and is proven to equal `total − Σ attributed`, so the parts sum exactly to the model-reported system-prompt tokens. Webview renders catalogs as nested collapsible `<details>` with child rows; new `.obs-comp-cat/children/child` CSS.
+
+**Proof:** `node --check` OK; `tsc` clean; Build complete; deployed extension.js + webview.js + main.css. Verified on real sidecar: attributed 5437 + Copilot base 4125 = 9562 = total (exact). Skills itemized 12 entries (e.g. agent-customization 291, project-setup-info-local 314, microsoft-foundry 279) + 2 `.instructions.md` files (kotlin-ktlint 88, kotlin-sonar 84). Reload window.
+
+
+## 2026-07-10 IST — Feature: System-prompt composition view (which files make up each request)
+
+**Request:** reverse-engineer the system prompt and, at runtime, show the input request as the list of files it's composed of (copilot-instructions, .github stuff, multiple projects), in order, as clickable links; collapse the raw Copilot base text to just a size.
+
+**How:** Copilot writes the assembled system message to debug sidecar `attrs.systemPromptFile` (`system_prompt_N.json`), which AskAway already read for token counts. Every included instruction file is wrapped `<attachment filePath="ABS" [workspaceFolder="WS"]>…</attachment>`; skills/agents catalogs are `<skills>`/`<agents>`. New `_analyzeSystemPromptComposition()` (webviewProvider.ts, cached in `_promptCompositionCache`) parses these into `SystemPromptComposition{totalTokens, baseTokens, segments[]}`, tokenizing each segment exactly (o200k) and treating the remainder as "Copilot base + framing" (collapsed). Attached to `TurnInputSplit.composition` in `_computeInputSplit`. Webview `renderPromptComposition()` renders a collapsible list under the per-request split detail; attachment rows are links → `{type:'openFile',path}` → `vscode.open`. Added `openFile` to the WebviewMessage union + handler; new `.obs-comp*` CSS.
+
+**Proof:** `node --check media/webview.js` OK; `tsc --noEmit` clean; esbuild Build complete; deployed extension.js + webview.js + main.css + package.json. Verified analyzer on a real sidecar: global copilot-instructions(187 tok) + dx-case-service(1029) + vibecoding(308) + CLAUDE.md(3) + AGENTS.md vibecoding(1163) + Skills catalog(12→1816) + Agents catalog(13→759), base+framing ~4297 tok. Reload window to load the new bundle.
+
+
+## 2026-07-09 IST — Fix: sub-agent header count vs empty timeline mismatch
+
+**Request:** header says "12 sub agents" but none appear in the This Turn timeline.
+
+**Cause:** `_turnSubagents` (drives the header count) was populated unconditionally — (a) for ANY child `runSubagent-*.jsonl` file that had new bytes this poll, and (b) from every `child_session_ref` line, and (c) on runSubagent tool_call completion — regardless of whether the sub-agent had any IN-WINDOW event. But the timeline only renders a group when an event carries a matching `subagentId` (which requires `ts >= _lastSubmitTs`). So a previous turn's sub-agent whose child file was merely being read this poll inflated the count with no rows to show.
+
+**Fix:** register a sub-agent header entry ONLY when it emits an in-window event. New `_ensureTurnSubagent(id,label,ts)` called from the child request/tool push blocks (already `ts>=submit` gated). `child_session_ref` now only stores `_turnSubagentLabelById` + span→id mapping (no entry). runSubagent finalize UPDATES only if the entry already exists (no phantom). Removed the per-file unconditional registration. Cleared the new label map in `_resetTurnMetrics`. Now header count == groups shown, always.
+
+**Proof:** `tsc` clean; esbuild Build complete; deployed dist. Reload window.
+
+
+## 2026-07-09 IST — Cap cache clock at 5:00 + highlight >100 AIU credits
+
+**Request:** don't let the cache timer climb past 5 min; keep reset-on-first-response behavior (fine as-is); also highlight per-request credits > 100 AIU (alongside existing >1K output / low cache-hit flags). Sub-agent model: not always cheaper — wants agent-prompt guidance by task type + credits left (will provide examples).
+
+**Done (webview.js only):**
+- `renderCacheAge()` now caps the displayed clock at `5:00` (`Math.min(secs,300)`); state/color still flips to cold at 300s but the number never shows beyond 5:00.
+- Request rows flag credits > 100 AIU: `bigCredit` adds `.obs-cache-risk` to the Credits cell and `.obs-row-flag` to the row (joins the existing bigOut / cache-miss flags).
+- No change to reset behavior (lastRequestTs = newest llm_request ts) — user confirmed that's desired.
+
+**Deferred (awaiting user input):** sub-agent model selection — the blunt `askaway.subagentModel` forces one model always, which is wrong when an intelligent model is needed for analysis. Better: guidance in the AskAway Build agent prompt mapping task-category × remaining-credits → model. Awaiting the user's task categories + model-name examples before wiring.
+
+**Proof:** `node --check` webview.js OK; deployed media/webview.js. Reload window.
+
+
+## 2026-07-09 IST — Durable (rotation-proof) month total; dropped tool-timer hook idea
+
+**Request:** don't add tool-start hooks (one timer is enough); cache timer on top is fine; monthly credits STILL incorrect.
+
+**Diagnosis:** the stateless recompute I shipped earlier is correct for current on-disk data (verified July = 51,284 AIU / 2,430 req), BUT Copilot rotates/prunes debug logs over time, so a pure stateless sum SHRINKS as old logs vanish → month total drifts downward → reads as "incorrect."
+
+**Fix:** made `_computeOverallMonth` durable-but-corruption-proof. Each debug-log file's per-month sums are memoized by size+mtime AND persisted (`observability-monthcache.json`); a file is re-summed only when it changes (whole-file re-sum → no double count, self-heals); when Copilot rotates a file away its last-known sum is KEPT (not pruned), so the month never shrinks. Aggregates over all cached files (current + rotated). Entries pruned only when they have no activity in the current/previous month (bounds growth). No byte cursors, no additive drift, no monotonic latch — the failure modes of the old shard. Deleted the stale corrupt `observability-months/_global.json` + `observability-global-offsets.json`. Dropped the per-tool start-hook idea (never built).
+
+**Proof:** `tsc` clean; esbuild Build complete; deployed dist + package.json. Recompute logic matches on-disk truth (51,284 AIU July). Reload the window being viewed — an old window on the previous build still shows its stale number. Inherent ceiling: logs Copilot deleted before AskAway ever scanned them can't be recovered to match GitHub's server-side billing exactly.
+
+
+## 2026-07-09 IST — Intercept runSubagent model via PreToolUse hook + traffic-signal cache colors
+
+**Request:** (1) intercept `runSubagent` and change its model param (like RTK does for commands) to cut cost; (2) reminder that hooks give tool-start signal; (3) recolor cache clock — green ≤4:45, amber 4:45–5:00, red after.
+
+**Done:**
+- Corrected my earlier claim: PreToolUse hooks DO fire at tool start (that's how RTK rewrites commands). The debug log only records tools on completion, but hooks are a separate, earlier signal.
+- Sub-agent model interception (opt-in): new setting `askaway.subagentModel` (application scope, default empty). Extension writes sentinel `~/.askaway/subagent-model` (on activation + config change) and installs a PreToolUse hook: `~/.askaway/hooks/subagent-model-gate.sh` (stdin→node, mirrors budget gate) + `subagent-model.js` (reads stdin payload; if `tool_name==='runSubagent'` and sentinel set, emits `hookSpecificOutput.updatedInput` with `model` overridden). Registered in `~/.copilot/hooks/subagent-model.json` (PreToolUse) + `~/.claude/settings.json` (matcher `runSubagent`). Validated injector end-to-end: rewrites model for runSubagent, no-ops for other tools / empty sentinel.
+- Cache clock thresholds: warm `<285s` (≤4:45 green) · cooling `285–300s` (amber) · cold `>300s` (red).
+
+**Honest caveats surfaced to user:** whether VS Code Copilot honors `updatedInput` for `runSubagent` from a SECOND hook file (only RTK's PreToolUse file is proven) is unverified — verify via the sub-agent model badge after enabling; if it doesn't take, merge into the RTK gate. Model string must be exact and support agentic sub-agents or they fail. Live in-flight per-tool timers are now feasible via the same PreToolUse start signal — offered as a follow-up (needs hook to persist start-times + webview correlation).
+
+**Proof:** `tsc` clean; `node --check` webview.js + injector OK; injector behavior verified; esbuild Build complete; deployed dist + webview.js + package.json. Reload window (hook installs on activation).
+
+
+## 2026-07-09 IST — Sub-agent model in group header + live prompt-cache age clock
+
+**Request:** (1) can the sub-agent use a cheaper model to cut cost? (2) live sec-by-sec timers for running tools + last request to gauge the ~5-min prompt-cache TTL; honest take on a per-row 5-min countdown.
+
+**Answers/decisions:**
+- Sub-agent model IS changeable: Copilot's `runSubagent` tool takes an optional `model` arg — the orchestrator can delegate exploration to a cheaper model. AskAway can't force it, so instead I surfaced the **dominant model each sub-agent ran on** in the group header (computed from child request events) so the user can spot expensive models doing cheap work.
+- In-flight per-tool timers are NOT possible: Copilot logs a `tool_call` only on completion (with `dur`) — no "started" event. Honest recommendation given to user: a per-row 5-min countdown would be too noisy; a single live **prompt-cache age clock** is the right call and elegantly covers long-running tools too (no new request logs while a tool runs → the clock keeps aging).
+
+**Done:** backend adds `lastRequestTs` (epoch ms of newest llm_request, tracked via `_newestRequestTs`, emitted in metrics). Webview: `renderCacheAge()` on a 1s `setInterval` (guarded singleton) renders `#obs-cache-age` counting up from lastRequestTs, warm(<3:30)/cooling(3:30–5:00)/cold(>5:00) with cache-hit/miss guidance; CSS `.obs-cache-age*`. Turn-summary sub-agent count now uses `turnSubagents.length` (the flat runSubagent row was removed in the grouping change). Sub-agent header shows dominant `model` badge.
+
+**Proof:** `tsc` clean; `node --check` webview.js OK; esbuild Build complete; deployed dist + webview.js + main.css + package.json. Reload window to activate.
+
+
+## 2026-07-09 IST — Replace fragile month shard with stateless self-healing recompute
+
+**Request:** "This month credits are corrupt again. Why is that code so fragile?"
+
+**Diagnosis:** shard `observability-months/_global.json` showed 13,689 AIU / 535 req but the true on-disk sum (main + child logs, July) = **49,098 AIU / 2,562 req** — a massive UNDER-count. Root fragility of the old design: (a) per-file byte cursors (`observability-global-offsets.json`) desync on Copilot log rotation/truncation → drift up or down; (b) additive shard only grows, and a `Math.max` monotonic latch in `_stabilizeObservabilityMetrics` **locked in** any bad value for the whole session; (c) all-or-nothing `GLOBAL_FOLD_VERSION` rebuilds that fight across multiple windows / old extension versions sharing one global shard.
+
+**Fix — stateless recompute:** `_computeOverallMonth` now sums the CURRENT on-disk debug logs directly (`_sumFileByMonth` per file), memoized in `_monthFileCache` keyed by size+mtime so a file is only re-read when it changes (bounded cost); rotated/deleted files drop from the cache. No byte cursors, no additive shard, no fold version. Removed the `overall` monotonic latch so the value self-heals in both directions. On transient read failure the last-good per-file cache is kept (no flicker). Old shard/offset methods left dead (unreferenced).
+
+**Proof:** `tsc --noEmit` clean; esbuild Build complete; deployed dist + package.json. Diagnostic confirms the recompute equals the true 49,098 AIU. Reload window → month self-corrects on the next 5s cycle.
+
+
+## 2026-07-09 IST — Group sub-agent LLM + tool calls into one collapsible timeline entry
+
+**Request:** with parallel sub-agents (e.g. 43acd, 0fefc) their requests interleave in This Turn. Wrap ALL of a sub-agent's LLM calls + nested tool calls into a single collapsible entry (like the runSubagent tool call), shown from the start and updated live (total time / output / etc.) once finished.
+
+**Root cause / linkage found:** each sub-agent = a child log `runSubagent-<label>-<childSessionId>.jsonl`; parent `main.jsonl` has `runSubagent` tool_call (`spanId=S`, authoritative `dur`+`result`) and a `child_session_ref` (`parentSpanId=S`, `attrs.childSessionId/childLogFile`). So `runSubagent.spanId` ↔ `child_session_ref.parentSpanId` → child session.
+
+**Done (backend, webviewProvider.ts):**
+- Per-instance group key `subagentId = _shortSubagentId(childSessionId)` (stable across polls → parallel sub-agents stay separate). Tagged onto child request events AND child tool events (`subagent`, `subagentId`).
+- New per-turn state `_turnSubagents` (Map<subagentId, {label,done,durMs,outputTokens,status,startedTs}>) + `_turnSpanToSubagent` (parentSpanId→subagentId), reset each turn. Registered from child files, `child_session_ref`, and finalized (done + authoritative dur/output) when the parent `runSubagent` tool_call completes.
+- The parent `runSubagent` tool_call no longer emits a flat timeline event (still folded into the turn tool aggregate) — the group header represents it. Emitted `turnSubagents` in `ObservabilityMetrics`.
+
+**Done (webview):** refactored the timeline into `buildToolRow`/`buildRequestRow`/`buildAnyRow` helpers; partition events into top-level items + per-`subagentId` groups anchored at first-event position; render each group as a collapsible `sub-agent` entry showing label, id, running…/done state (pulse while running), nested req/tool counts, aggregate AIU, output tokens, and total wall time; nested rows rendered inside via an inner timeline table (open-state preserved). CSS `.obs-tl-subagent*`, running pulse.
+
+**Proof:** `tsc --noEmit` clean; `node --check` webview.js OK; esbuild Build complete; deployed dist + webview.js + main.css + package.json. Reload window to activate.
+
+
+## 2026-07-08 IST — Show nested sub-agent requests in This Turn + fix turn-budget accuracy
+
+**Request:** (1) `runSubagent` shows only as a tool row; nested sub-agent requests are abstracted — want them individually in the This Turn table. (2) Turn budget "not being honoured" since yesterday.
+
+**Root cause (both):** sub-agent LLM calls live in child files `runSubagent-*.jsonl` (fixed yesterday for the metrics tables). But `computeTurnSpend()` (the `turn_budget` LM tool) and the `budget-inject.js` UserPromptSubmit hook still read ONLY `main.jsonl`, so during heavy sub-agent turns the budget saw near-zero spend → never flagged over-budget → "not honoured."
+
+**Done:**
+- This Turn: added `subagent?` label to `TurnRequest` (parsed from the child filename via `_parseSubagentLabel`, e.g. `runSubagent-Explore-…` → `Explore`); the scan tags each child request with it. Timeline request rows now render a purple `↳ <label>` badge + left accent (`obs-row-subagent-req`), so nested sub-agent requests appear as individual rows, clearly attributed.
+- Turn budget: `computeTurnSpend()` now enumerates the active session dir and sums `main.jsonl` + all `runSubagent-*.jsonl` for `llm_request`s at/after the parent's last `user_message` (child logs never move the boundary). Same fix applied to the `BUDGET_INJECT_SCRIPT` hook (auto-reinstalled on activation since the text changed).
+
+**Proof:** `tsc --noEmit` clean; `node --check` on webview.js AND on the extracted generated hook script (`BUDGET_JS_OK`); hook run against live sentinels emitted valid `additionalContext` JSON; esbuild `Build complete`; deployed dist + webview.js + main.css + package.json. Reload window (both workspaces) to activate; the budget hook rewrites itself on activation.
+
+
+## 2026-07-08 IST — Fix: sub-agent credits uncounted in turn & month (root cause)
+
+**Request:** in another workspace, heavy sub-agent planning cost ~900 credits but "This turn" showed ~120; "This month" also didn't move while sub-agents ran. Manual `/compact` also showed no request in "This turn".
+
+**Root cause:** Copilot logs each sub-agent (`runSubagent`) in a SEPARATE child file `runSubagent-*.jsonl` in the same session dir (linked from the parent via a `child_session_ref` line). Both observability finders only read `main.jsonl`, so every sub-agent's billed `llm_request` lines were invisible to the turn AND the month. Verified one session dir held 4 child files = 395 uncounted AIU.
+
+**Done:**
+- `_isRequestLogFile()` + `_isChildSubagentLog()` helpers. Both `_findWorkspaceCopilotDebugLogFiles` (turn/workspace) and `_findAllCopilotDebugLogFiles` (month) now include `main.jsonl` + every `runSubagent-*.jsonl` (excluding `title-*.jsonl`).
+- Child logs get a unique `sessionId` (from the child file name) so dedup keys (`sid:li:hash`) and short IDs don't collide with the parent.
+- Turn-reset guard: child logs carry their own `user_message` (the sub-agent's prompt); resetting on those would wipe the parent turn. Now only `main.jsonl` `user_message` resets "This turn".
+- Bumped `GLOBAL_FOLD_VERSION` 3→4 to rebuild the month shard and fold in historical child-file requests (within retained logs).
+- Manual `/compact` (`summarizeConversationHistory-simple`, billable, in main.jsonl) is already surfaced by the prior compaction badge change once reloaded.
+
+**Proof:** `tsc --noEmit` clean; esbuild `Build complete`; deployed dist + package.json; bundle contains `isRequestLogFile`/`runSubagent`. Reload window to activate. Sub-agent + compaction now count toward turn and month.
+
+
+## 2026-07-08 IST — Track compactions + sub-agents in Metrics (turn & month)
+
+**Request:** sub-agents and compactions were not visibly tracked in This turn / This month; track compactions and show them as requests; surface sub-agents somehow.
+
+**Done:**
+- Compaction requests (Copilot `debugName` = `summarizeConversationHistory*`) were already summed into totals but not labeled. Added `_classifyRole()` (compaction/retry/normal) and `kindTag` on `TurnRequest`; This-turn timeline now labels compaction rows (orange) and retry rows (red), and the turn summary shows an `N compaction` count.
+- Month: added `compactionCount`/`compactionNanoAiu` to `MonthBucket`, folded in `_foldReqIntoShard` (now receives `debugName`), surfaced via `overallCompaction` on `ObservabilityMetrics` and a new "Compaction: N requests · X AIU" line in the This-month view. Bumped `GLOBAL_FOLD_VERSION` 2→3 to rebuild the shard with compaction attribution.
+- Sub-agents: nested LLM calls log as `panel/editAgent` (indistinguishable from the main agent, so they already count as regular requests). Made the invocation explicit — `runSubagent` tool rows in the timeline get a purple "sub-agent" badge + left border, and the turn summary shows an `N sub-agent` count.
+
+**Proof:** `tsc --noEmit` clean; `node --check media/webview.js` OK; esbuild `Build complete`; deployed dist + media/webview.js + media/main.css + package.json to `~/.vscode/extensions/intuitiv.askaway-1.0.35`. Verified debug logs contain `summarizeConversationHistory` (billed, model+nano present) and `runSubagent` tool_calls. Reload window to see it.
+
+
+## 2026-07-08 IST — Revised Reddit post with origin story and cache-risk patterns
+
+**Request:** tighten the AskAway Reddit post: mention it started as a Webex extension for TaskSync but token-based pricing changed the value prop; include the >5 minute tool/cache invalidation pattern, Gradle tool stopping around 4 minutes, and a one-line soft turn budget; keep it crisp and avoid AI slop.
+
+**Done:** produced a shorter, modest post focused on practical token-saving patterns and community feedback.
+
+**Proof:** content delivered in chat; no source code changes required.
+
+## 2026-07-08 IST — Drafted modest Reddit post for AskAway token optimization extension
+
+**Request:** create a Reddit post to share the extension modestly, focused on helping people save tokens, inviting others to report patterns/buggy behaviors, and including the observed model-switch/context-compaction cache-miss issue.
+
+**Done:** drafted a reusable post that frames AskAway as a practical trace/observability extension, explains the GPT 5.5 -> Opus 4.8 context-limit compaction example, asks the community for token-waste patterns, and suggests possible optimization features without overclaiming.
+
+**Proof:** content delivered in chat; no source code changes required.
+
+## 2026-07-07 IST — Generated AskAway 2.0.0 VSIX artifact
+
+**Request:** generate the 2.0.0 release artifact.
+
+**Done:** verified `tasksync-chat/package.json` and `package-lock.json` are already versioned at 2.0.0; ran `tsc --noEmit`, `node --check media/webview.js`, and `node esbuild.js`; packaged `tasksync-chat/askaway-2.0.0.vsix` with VSCE using Node 22 because the active Node 16 cannot parse VSCE's newer `undici` dependency syntax.
+
+**Packaging cleanup:** first VSIX included release noise (`.tmp-vsix/`, `.gradle-test-build/`, root `test-*` harnesses, `run-gradle-tool.cjs`). Updated `tasksync-chat/.vscodeignore` to exclude those and repackaged. Final VSIX contains 25 files, 3.86 MB.
+
+**Proof:** `npx tsc -p ./ --noEmit` OK; `node --check media/webview.js` OK; `node esbuild.js` Build complete; `npx vsce package` DONE. Artifact SHA-256: `495852e25787e63097969e8f188f15ceab96e2f56416ee9f378febf876dbc024`.
+
+## 2026-07-07 IST — Disable Auto Compaction toggle + major version bump 2.0.0
+
+**Request:** add a Settings toggle to disable VS Code auto compaction (checked = disabled); create a new major version for the AskAway plugin.
+
+**Done:**
+- **Toggle (inverted mapping).** New "Disable Auto Compaction" switch in Settings → Optimization group. Checked = auto-compaction OFF. Maps to Copilot setting `github.copilot.chat.summarizeAgentConversationHistory.enabled` (confirmed via bundled Copilot `package.nls.json`: "Whether to auto-compact agent conversation history once the context window is filled", default true) → set to `!disabled`.
+- **Wiring (`webviewProvider.ts`):** added `autoCompactionDisabled?` to UpdateSettings interface; message union `updateAutoCompactionDisabled{disabled}`; read `summarizeEnabled` and broadcast `autoCompactionDisabled = summarizeEnabled === false` in `_updateSettingsUI`; switch case; handler `_handleUpdateAutoCompactionDisabled` (updates Copilot config at Workspace target when a folder is open else Global, mirrors debug-logging handler).
+- **Wiring (`media/webview.js`):** state var `autoCompactionDisabled`; DOM ref `autoCompactionToggle`; settings section (codicon-fold + info tooltip) appended after RTK; element caching; click/keydown listeners; message ingest `message.autoCompactionDisabled === true`; `toggleAutoCompactionSetting()` posts `updateAutoCompactionDisabled`; `updateAutoCompactionToggleUI()`.
+- **Version:** bumped `package.json` + `package-lock.json` (both fields) 1.0.35 → **2.0.0**; CHANGELOG.md AskAway v2.0.0 entry.
+
+**Proof:** `npx tsc -p ./ --noEmit` = No errors; `node --check media/webview.js` OK; package/lock JSON valid, version 2.0.0; `node esbuild.js` Build complete; DEPLOYED_OK (extension.js + webview.js + package.json copied to installed folder). Reload window to load.
+
+**Note:** installed dev folder is still `intuitiv.askaway-1.0.35` (physical); local deploy overwrites it in place. Packaging a fresh VSIX (`npx vsce package`) will produce an `intuitiv.askaway-2.0.0` install.
+
+## 2026-07-07 IST — README rewrite for Copilot token billing, Metrics, RTK, and optimization tools
+
+**Request:** replace the old README framing around remote `ask_user`/Telegram/Webex with the new AskAway value prop: Copilot token-based AI credit observability, live This Turn optimization, monthly billing-cycle metrics, per-model/per-tool usage, RTK savings, and shipped cost-aware tools.
+
+**Done:** rewrote root `README.md` to lead with token-based Copilot billing, explain why `ask_user` is now legacy/secondary for cost optimization, document Metrics enablement and interpretation, add This Turn and This Month sections, describe red flags (cache misses, high output, >4 min tools, >1K-token tool output, compaction/retry, model churn), include the two `resources/` screenshots, and document `gradle`, `code_nav`, `turn_budget`, RTK integration, legacy remote integrations, and coming cost-optimization tools.
+
+**Proof:** README headline grep passed; `resources/This Turn.jpg` and `resources/Turn budget.jpg` exist; `git diff -- README.md` shows a README-only documentation rewrite.
+
 ## 2026-07-06 (later) IST — Crisp budget banner, conciseness instruction, timeline alignment; committed + pushed
 
 **Requests:** budget banner too verbose → crisp; add strong "be concise" instruction (post-Caveman); fix uneven timeline formatting (screenshot); commit + push.
@@ -326,3 +664,5 @@
 **Re "is there a Gradle MCP?":** No official Gradle MCP server. Rather than depend on an external/community MCP, this built-in AskAway tool wraps the wrapper directly and does the failure summarization/log-filtering in-process — keeps heavy output out of the model context (token-billing friendly) and needs no extra install.
 
 **Proof:** `npx tsc --noEmit` clean; `node esbuild.js` Build complete; deployed to `~/.vscode/extensions/intuitiv.askaway-1.0.35/` — `gradle_build` present 2× in bundle, 1× in package.json.
+
+## 2026-07-13 IST — Moved TaskSync-specific content (deploy, observability, RTK details, communication) from global agent into workspace .github/copilot-instructions.md; added memory-write criteria; agent now appends audit without reading it.

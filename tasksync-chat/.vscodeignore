@@ -1,5 +1,7 @@
 .vscode/**
 .vscode-test/**
+.gradle-test-build/**
+.tmp-vsix/**
 src/**
 node_modules/**
 .gitignore
@@ -27,6 +29,8 @@ node_modules/**
 **/tests/**
 **/*.test.js
 **/*.spec.js
+test-*
+run-gradle-tool.cjs
 dist/localization.js
 dist/mcpServer.js
 

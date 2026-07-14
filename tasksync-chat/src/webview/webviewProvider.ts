@@ -117,13 +117,18 @@ interface ObservabilityMetrics {
     workspace: ScopeMetrics;     // cumulative for this workspace
     overall: ScopeMetrics;       // current calendar month across all workspaces
     perModel: ModelBreakdown[];  // current calendar month across all workspaces (debug)
+    /** Current-month context-compaction (summarizeConversationHistory) request count + credits. */
+    overallCompaction: { count: number; nanoAiu: number };
     turnRequests: TurnRequest[]; // individual requests of the current turn (newest last)
     turnEvents: TurnEvent[];     // chronological current-turn LLM/tool timeline
+    turnSubagents: TurnSubagentSummary[]; // sub-agent instance headers for grouping the timeline
     rtkCommandCount: number;
     rtkSavedTokens: number;
     rtkSavingsPct: number;
     gradle: { runs: number; optimizedRuns: number; tasksAvoided: number; configCacheReuses: number; savedTokens: number };
     toolCalls: ToolCallMetrics;
+    /** Epoch ms of the newest llm_request seen — powers the live prompt-cache age clock. */
+    lastRequestTs: number;
     source: string;
     updatedAt: number;
 }
@@ -180,6 +185,23 @@ interface TurnRequest {
     outputTokens: number;
     cachedTokens: number;
     cacheHitPct: number;
+    /** debugName-derived class: 'compaction' (summarizeConversationHistory), 'retry', or 'normal'. */
+    kindTag?: 'compaction' | 'retry' | 'normal';
+    /** Sub-agent label when this request came from a runSubagent-*.jsonl child session (else undefined). */
+    subagent?: string;
+    /** Stable per-instance group key (short hash of the child session id) for parallel sub-agents. */
+    subagentId?: string;
+}
+
+/** Aggregate header for one sub-agent instance's grouped timeline entry (current turn). */
+interface TurnSubagentSummary {
+    subagentId: string;      // short group key (matches events' subagentId)
+    label: string;           // agent name (Explore, AskAway Build, …)
+    done: boolean;           // true once the parent runSubagent tool_call has completed
+    durMs: number;           // authoritative total wall time from the parent tool_call (0 while running)
+    outputTokens: number;    // authoritative output tokens from the parent tool_call result (0 while running)
+    status: string;          // parent tool_call status ('ok' | error)
+    startedTs: number;       // first observed activity ts (for ordering)
 }
 
 type TurnEvent = TurnRequestEvent | TurnToolEvent;
@@ -198,6 +220,53 @@ interface TurnInputSplit {
     toolsCount: number;          // # of tool definitions
     messageCount: number;        // # of messages in inputMessages
     cachedTokens: number;        // model-reported cached tokens
+    composition?: SystemPromptComposition; // which files/blocks make up the system prompt
+    contributors?: RequestContributors;    // full-request breakdown (system+tools+conversation)
+}
+
+/** One contributor to the FULL request input (a category or a specific attached file). */
+interface RequestContributor {
+    label: string;
+    kind: 'system' | 'tools' | 'memory' | 'attachment' | 'context' | 'toolResult' | 'toolCall' | 'reasoning' | 'dialogue';
+    tokens: number;
+    path?: string;   // attached-file absolute path (link target), when kind === 'attachment'
+    count?: number;  // # of underlying items (e.g. memory files, attachments)
+}
+
+/** Full literal breakdown of everything in a request: system prompt + tools + the entire
+ *  conversation (memories, attached files, context framing, tool results, dialogue). Parsed
+ *  from the request's own `inputMessages` sidecar so it reflects THAT request exactly. */
+interface RequestContributors {
+    totalInputTokens: number;      // model-reported input (authoritative)
+    cachedTokens: number;          // model-reported cached portion
+    accountedTokens: number;       // Σ items.tokens (should ≈ totalInputTokens)
+    items: RequestContributor[];   // sorted desc by tokens
+    files: string[];               // distinct attached-file paths present in this request
+    memoryFiles: string[];         // distinct `## <file>` headers inside <userMemory> blocks
+}
+
+/** One attributable piece of the assembled system prompt (a file attachment or a catalog block). */
+interface SystemPromptSegment {
+    label: string;                // display name (file basename or catalog name)
+    kind: 'attachment' | 'instruction' | 'skills' | 'agents' | 'mode' | 'framing';
+    path?: string;                // absolute fs path for file segments (link target)
+    workspaceFolder?: string;     // owning workspace folder name, if Copilot reported one
+    tokens: number;               // exact tokens contributed by this segment
+    children?: SystemPromptChild[]; // per-item breakdown (individual skills / agents)
+}
+
+/** A single entry inside a catalog segment (one skill or one agent). */
+interface SystemPromptChild {
+    label: string;                // skill/agent name
+    path?: string;                // SKILL.md path for skills (link target)
+    tokens: number;               // exact tokens for this entry
+}
+
+/** Reverse-engineered breakdown of what the system prompt is composed of, in order. */
+interface SystemPromptComposition {
+    totalTokens: number;          // = TurnInputSplit.systemTokens (whole system prompt)
+    baseTokens: number;           // remainder attributed to Copilot's own base + framing text
+    segments: SystemPromptSegment[]; // attachments + catalogs, in the order they appear
 }
 
 interface TurnRequestEvent extends TurnRequest {
@@ -220,6 +289,10 @@ interface TurnToolEvent {
     group: string;
     inputPreview: string;
     outputPreview: string;
+    /** Sub-agent label when this tool call ran inside a runSubagent-*.jsonl child session. */
+    subagent?: string;
+    /** Stable per-instance group key (short hash of the child session id) for parallel sub-agents. */
+    subagentId?: string;
 }
 
 /** Per-entry metadata stored in the seen map (version 2+). */
@@ -249,6 +322,22 @@ interface ObservabilityLedger {
 
 interface MonthBucket extends ScopeMetrics {
     perModel: Record<string, ScopeMetrics>;
+    /** Requests whose debugName is a summarizeConversationHistory* (context compaction). */
+    compactionCount?: number;
+    compactionNanoAiu?: number;
+}
+
+/** Per-file, per-month aggregate for the stateless month recompute (memoized in _monthFileCache). */
+interface FileMonthAgg {
+    requestCount: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    nanoAiu: number;
+    cacheMisses: number;
+    compactionCount: number;
+    compactionNanoAiu: number;
+    perModel: Map<string, ScopeMetrics>;
 }
 
 interface MonthShard {
@@ -292,7 +381,7 @@ interface ToolShard {
 
 const execFileAsync = promisify(execFile);
 /** Bump to force a one-time clean rebuild of the global month shard when fold logic changes. */
-const GLOBAL_FOLD_VERSION = 2;
+const GLOBAL_FOLD_VERSION = 4;
 // Message types
 type ToWebviewMessage =
     | { type: 'updateQueue'; queue: QueuedPrompt[]; enabled: boolean }
@@ -330,6 +419,11 @@ type ToWebviewMessage =
         debugLoggingEnabled?: boolean;
         rtkCompressionEnabled?: boolean;
         rtkInstalled?: boolean;
+        autoCompactionDisabled?: boolean;
+        extendedCacheTtl?: boolean;
+        extendedCacheTtlMessages?: boolean;
+        cacheKeepWarmEnabled?: boolean;
+        cacheKeepWarmProbes?: number;
     }
     | { type: 'updateObservabilityMetrics'; metrics: ObservabilityMetrics }
     | { type: 'updateMemoriesList'; memories: Array<{ file: string; title: string; size: number; modified: number }> }
@@ -388,6 +482,7 @@ type FromWebviewMessage =
     | { type: 'removeReusablePrompt'; id: string }
     | { type: 'searchSlashCommands'; query: string }
     | { type: 'openExternal'; url: string }
+    | { type: 'openFile'; path: string }
     | { type: 'searchContext'; query: string }
     | { type: 'selectContextReference'; contextType: string; options?: Record<string, unknown> }
     | { type: 'voiceResponse'; taskId: string; transcription: string }
@@ -411,6 +506,12 @@ type FromWebviewMessage =
     | { type: 'updateSendWithCtrlEnterSetting'; enabled: boolean }
     | { type: 'updateDebugLoggingSetting'; enabled: boolean }
     | { type: 'updateRtkCompressionSetting'; enabled: boolean }
+    | { type: 'updateAutoCompactionDisabled'; disabled: boolean }
+    | { type: 'updateExtendedCacheTtl'; enabled: boolean }
+    | { type: 'updateExtendedCacheTtlMessages'; enabled: boolean }
+    | { type: 'updateCacheKeepWarm'; enabled: boolean }
+    | { type: 'updateCacheKeepWarmProbes'; value: number }
+    | { type: 'pingCache' }
     | { type: 'updateCavemanSetting'; enabled: boolean }
     | { type: 'updateResponseTimeout'; value: number }
     | { type: 'updateSessionWarningHours'; value: number }
@@ -480,13 +581,16 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         workspace: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
         overall: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
         perModel: [],
+        overallCompaction: { count: 0, nanoAiu: 0 },
         turnRequests: [],
         turnEvents: [],
+        turnSubagents: [],
         rtkCommandCount: 0,
         rtkSavedTokens: 0,
         rtkSavingsPct: 0,
         gradle: { runs: 0, optimizedRuns: 0, tasksAvoided: 0, configCacheReuses: 0, savedTokens: 0 },
         toolCalls: { totalCalls: 0, totalOutputTokens: 0, byTool: [], turn: { totalCalls: 0, totalOutputTokens: 0, byTool: [] } },
+        lastRequestTs: 0,
         source: 'unavailable',
         updatedAt: 0
     };
@@ -500,10 +604,21 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     private _turnRequests: TurnRequest[] = [];
     /** Chronological current-turn request/tool events for optimization debugging. */
     private _turnEvents: TurnEvent[] = [];
+    /** Sub-agent instance headers (current turn), keyed by subagentId, for timeline grouping. */
+    private _turnSubagents = new Map<string, TurnSubagentSummary>();
+    /** parentSpanId (from child_session_ref) → subagentId, to link the parent runSubagent tool_call. */
+    private _turnSpanToSubagent = new Map<string, string>();
+    /** subagentId → label learned from child_session_ref (used to label the finalize summary). */
+    private _turnSubagentLabelById = new Map<string, string>();
+    /** Epoch ms of the newest llm_request ever observed (any session) — for the cache-age clock. */
+    private _newestRequestTs = 0;
     /** True once the turn's first (initiating) request has been seen — used to pin it on top. */
     private _turnFirstReqSeen = false;
     /** Cache of sidecar-file stats (system prompt / tools files) keyed by absolute path. */
     private _splitFileCache = new Map<string, { tokens: number; count: number }>();
+    /** Cache of parsed system-prompt composition keyed by `<sidecarPath>:<systemTokens>`. */
+    private _promptCompositionCache = new Map<string, SystemPromptComposition>();
+    private _contributorCache = new Map<string, RequestContributors>();
     /** Rolling tail of recent request summaries (across polls) for cache-miss "before" context. */
     private _recentReqs: ReqSummary[] = [];
     /** Compact projection of a request summary for embedding as a neighbor in a cache-miss record. */
@@ -519,11 +634,22 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
     private _logTurnStartTs: number = 0;
     // Throttle the cross-workspace overall(month) computation (reads all month shards).
     private _overallLastComputedAt: number = 0;
-    private _overallCache: { totals: ScopeMetrics; perModel: ModelBreakdown[] } = {
+    private _overallCache: { totals: ScopeMetrics; perModel: ModelBreakdown[]; compaction: { count: number; nanoAiu: number } } = {
         totals: { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0 },
-        perModel: []
+        perModel: [],
+        compaction: { count: 0, nanoAiu: 0 }
     };
     private readonly _OVERALL_RECOMPUTE_MS = 5000;
+    /**
+     * Per-file memoized month sums for the STATELESS month recompute. Keyed by absolute log path.
+     * Each entry caches the file's size+mtime and its per-month aggregates; a file is only re-read
+     * when it grows/changes. This replaces the fragile byte-cursor + additive shard (which drifted
+     * on log rotation and latched bad values). The total is recomputed from current on-disk data
+     * every cycle, so it always self-heals to reality — no cursors, no fold versions, no latch.
+     */
+    private _monthFileCache = new Map<string, { size: number; mtime: number; months: Map<string, FileMonthAgg> }>();
+    /** True once the persisted month-file cache has been loaded from disk. */
+    private _monthCacheLoaded = false;
 
     // Debounce timer for queue persistence
     private _queueSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1733,6 +1859,17 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             .get<boolean>('agentDebugLog.fileLogging.enabled', false);
         const rtkCompressionEnabled = fs.existsSync(path.join(os.homedir(), '.askaway-rtk-enabled')) && this.isRtkInstalled();
         const rtkInstalled = this.isRtkInstalled();
+        // Auto-compaction toggle reflects Copilot's summarizeAgentConversationHistory.enabled
+        // (default ON). The AskAway switch is inverted: checked = compaction disabled.
+        const summarizeEnabled = vscode.workspace.getConfiguration('github.copilot.chat')
+            .get<boolean>('summarizeAgentConversationHistory.enabled', true);
+        const autoCompactionDisabled = summarizeEnabled === false;
+        // Native Copilot prompt-cache levers (both user-settable in the Copilot manifest).
+        const copilotChatCfg = vscode.workspace.getConfiguration('github.copilot.chat');
+        const extendedCacheTtl = copilotChatCfg.get<boolean>('anthropic.promptCaching.extendedTtl', false);
+        const extendedCacheTtlMessages = copilotChatCfg.get<boolean>('anthropic.promptCaching.extendedTtlMessages', false);
+        const cacheKeepWarmEnabled = copilotChatCfg.get<boolean>('agent.longToolCallCachePreservation.enabled', false);
+        const cacheKeepWarmProbes = copilotChatCfg.get<number>('agent.longToolCallCachePreservation.maxProbes', 1);
 
         this._broadcast({
             type: 'updateSettings',
@@ -1755,6 +1892,11 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             debugLoggingEnabled,
             rtkCompressionEnabled,
             rtkInstalled,
+            autoCompactionDisabled,
+            extendedCacheTtl,
+            extendedCacheTtlMessages,
+            cacheKeepWarmEnabled,
+            cacheKeepWarmProbes,
             webexStatus,
             telegramStatus
         } as any);
@@ -1819,15 +1961,10 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             nanoAiu: Math.max(previous.workspace.nanoAiu, next.workspace.nanoAiu)
         };
 
-        // Month overall is also monotonically non-decreasing within a month; protect against
-        // transient 0-reads (e.g. ledger file lock or throttled recompute returning stale 0).
-        const overall: ScopeMetrics = {
-            requestCount: Math.max(previous.overall.requestCount, next.overall.requestCount),
-            inputTokens: Math.max(previous.overall.inputTokens, next.overall.inputTokens),
-            outputTokens: Math.max(previous.overall.outputTokens, next.overall.outputTokens),
-            cachedTokens: Math.max(previous.overall.cachedTokens, next.overall.cachedTokens),
-            nanoAiu: Math.max(previous.overall.nanoAiu, next.overall.nanoAiu)
-        };
+        // Month overall is now a STATELESS recompute from current on-disk logs, so it must be
+        // allowed to correct in EITHER direction (self-heal) — do NOT latch it with Math.max,
+        // which previously locked in a bad (inflated) value for the whole session. Pass it through.
+        const overall: ScopeMetrics = { ...next.overall };
 
         return {
             ...next,
@@ -1866,13 +2003,16 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             workspace: this._emptyScope(),
             overall: this._emptyScope(),
             perModel: [],
+            overallCompaction: { count: 0, nanoAiu: 0 },
             turnRequests: [],
             turnEvents: [],
+            turnSubagents: [],
             rtkCommandCount: 0,
             rtkSavedTokens: 0,
             rtkSavingsPct: 0,
             gradle: { runs: 0, optimizedRuns: 0, tasksAvoided: 0, configCacheReuses: 0, savedTokens: 0 },
             toolCalls: { totalCalls: 0, totalOutputTokens: 0, byTool: [], turn: { totalCalls: 0, totalOutputTokens: 0, byTool: [] } },
+            lastRequestTs: 0,
             source: 'unavailable',
             updatedAt: Date.now()
         });
@@ -1900,6 +2040,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 const base = emptyMetrics();
                 return {
                     ...base,
+                    lastRequestTs: this._effectiveCacheActivityTs(),
                     requestCount: workspaceScope.requestCount,
                     inputTokens: workspaceScope.inputTokens,
                     outputTokens: workspaceScope.outputTokens,
@@ -1909,8 +2050,10 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     lastRequest: this._deriveLastRequest(),
                     overall: overall.totals,
                     perModel: overall.perModel,
+                    overallCompaction: overall.compaction,
                     turnRequests: [...this._turnRequests],
                     turnEvents: [...this._turnEvents],
+                    turnSubagents: Array.from(this._turnSubagents.values()),
                     rtkCommandCount: rtk.commandCount,
                     rtkSavedTokens: rtk.savedTokens,
                     rtkSavingsPct: rtk.savingsPct,
@@ -1971,7 +2114,26 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     continue;
                 }
 
-                const sessionId = path.basename(path.dirname(logFile));
+                // Parent turn = main.jsonl; child sub-agent sessions (runSubagent-*.jsonl) live in
+                // the SAME session dir, so derive a unique sessionId from the child file name to keep
+                // dedup keys (sid:li:hash) and short request IDs distinct from the parent's.
+                const isChildLog = this._isChildSubagentLog(logFile);
+                const sessionId = isChildLog
+                    ? path.basename(logFile, '.jsonl')
+                    : path.basename(path.dirname(logFile));
+                const subagentLabel = isChildLog ? this._parseSubagentLabel(path.basename(logFile)) : undefined;
+                // Group key for this sub-agent instance = short hash of its child session id (the
+                // trailing filename segment, e.g. `runSubagent-Explore-toolu_01Cha.jsonl`). Stable
+                // across polls so parallel sub-agents stay in distinct collapsible groups. NOTE: we
+                // do NOT register the sub-agent here — only when it emits an IN-WINDOW event (see
+                // the request/tool push below) — otherwise old child files (previous turn) that get
+                // read this poll would inflate the header count with no rows to show.
+                let subagentId: string | undefined;
+                if (isChildLog) {
+                    const base = path.basename(logFile, '.jsonl');
+                    const childSid = base.split('-').slice(-1)[0] || base;
+                    subagentId = this._shortSubagentId(childSid);
+                }
                 const lines = raw.split(/\r?\n/);
                 for (let i = 0; i < lines.length; i++) {
                     const lineIndex = lineIndexBase + i;
@@ -1983,12 +2145,37 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     // ── User-submit boundary: `user_message` fires once per real user
                     // submission (unlike `turn_start`, which fires for every agent iteration).
                     // Use the log timestamp as the precise "This turn" window start.
-                    if (line.indexOf('"type":"user_message"') !== -1) {
+                    // IMPORTANT: only the PARENT (main.jsonl) user_message is a real turn boundary.
+                    // Child sub-agent logs also contain a user_message (the sub-agent's own prompt);
+                    // resetting on those would wipe the parent turn's accumulated sub-agent credits.
+                    if (!isChildLog && line.indexOf('"type":"user_message"') !== -1) {
                         try {
                             const ts = (JSON.parse(line) as { ts?: number }).ts;
                             if (typeof ts === 'number' && ts > this._logTurnStartTs) {
                                 this._logTurnStartTs = ts;
                                 this._resetTurnMetrics(ts);
+                            }
+                        } catch { /* malformed — skip */ }
+                        continue;
+                    }
+
+                    // ── Sub-agent linkage: `child_session_ref` (in main.jsonl) maps the parent
+                    // runSubagent tool_call's span to a child session/log so we can attribute the
+                    // parent tool_call's authoritative duration/output to the correct group.
+                    if (!isChildLog && line.indexOf('"type":"child_session_ref"') !== -1) {
+                        try {
+                            const c = JSON.parse(line) as Record<string, unknown>;
+                            const cAttrs = (c.attrs as Record<string, unknown> | undefined) ?? {};
+                            const childFile = typeof cAttrs.childLogFile === 'string' ? cAttrs.childLogFile : '';
+                            const childSid = typeof cAttrs.childSessionId === 'string' ? cAttrs.childSessionId : '';
+                            const parentSpan = typeof c.parentSpanId === 'string' ? c.parentSpanId : '';
+                            if (childSid && parentSpan) {
+                                const saId = this._shortSubagentId(childSid);
+                                this._turnSpanToSubagent.set(parentSpan, saId);
+                                // Remember the label so a finalize/event can name it — but DON'T create
+                                // a header entry here (a spawn ref alone shouldn't inflate the count;
+                                // the group appears only once it has an in-window event).
+                                if (childFile) { this._turnSubagentLabelById.set(saId, this._parseSubagentLabel(childFile)); }
                             }
                         } catch { /* malformed — skip */ }
                         continue;
@@ -2020,8 +2207,47 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                                 inChars: argsStr.length, outChars: resultStr.length,
                                 group, workspaceKey
                             }));
+                            // The parent runSubagent tool_call (in main.jsonl) is the group anchor:
+                            // fold its authoritative total duration/output into the sub-agent header
+                            // instead of showing it as a flat timeline row (its nested requests/tools
+                            // are shown inside the collapsible group).
+                            if (!isChildLog && toolName === 'runSubagent') {
+                                const spanId = typeof t.spanId === 'string' ? t.spanId : '';
+                                const saId = this._turnSpanToSubagent.get(spanId);
+                                // Finalize ONLY if the group already exists (it had in-window events).
+                                // Don't create a phantom entry — otherwise the header count would
+                                // exceed the number of groups actually shown in the timeline.
+                                const existing = saId ? this._turnSubagents.get(saId) : undefined;
+                                if (saId && existing) {
+                                    const label = existing.label
+                                        ?? (() => { try { const a = JSON.parse(argsStr) as { agentName?: string }; return a.agentName || 'sub-agent'; } catch { return 'sub-agent'; } })();
+                                    this._turnSubagents.set(saId, {
+                                        subagentId: saId, label,
+                                        done: true,
+                                        durMs, outputTokens: countTokens(resultStr), status: tStatus,
+                                        startedTs: existing.startedTs ?? tTs,
+                                    });
+                                }
+                                // Still fold into the turn tool aggregate (tool table), but do NOT
+                                // push a flat timeline event — the group header represents it.
+                                if (tTs >= this._lastSubmitTs) {
+                                    this._foldToolAgg(this._turnToolAgg, toolName, durMs, tStatus, argsStr.length, resultStr.length, group);
+                                }
+                                continue;
+                            }
                             if (tTs >= this._lastSubmitTs) {
                                 this._foldToolAgg(this._turnToolAgg, toolName, durMs, tStatus, argsStr.length, resultStr.length, group);
+                                if (isChildLog && subagentId) { this._ensureTurnSubagent(subagentId, subagentLabel, tTs); }
+                                // Copilot truncates attrs.result (~5K chars) in the debug log, so
+                                // resultStr undercounts big outputs. Reconcile against the lossless
+                                // PostToolUse hook log (~/.askaway/tool-io.jsonl) when available.
+                                const io = this._lookupToolIo(toolName, tTs, resultStr.length, argsStr.length);
+                                // The hook exists only to RECOVER truncated big outputs, so it may
+                                // only ever INCREASE a count — never replace a good debug value with
+                                // an empty one. (Copilot's PostToolUse now delivers an empty
+                                // tool_response, which would otherwise zero out every tool row.)
+                                const debugInTok = countTokens(argsStr);
+                                const debugOutTok = countTokens(resultStr);
                                 this._pushTurnEvent({
                                     kind: 'tool',
                                     id: this._shortReqId(sessionId, lineIndex),
@@ -2029,11 +2255,13 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                                     tool: toolName,
                                     status: tStatus,
                                     durMs,
-                                    inputTokens: countTokens(argsStr),
-                                    outputTokens: countTokens(resultStr),
+                                    inputTokens: io ? Math.max(io.inTok, debugInTok) : debugInTok,
+                                    outputTokens: io ? Math.max(io.outTok, debugOutTok) : debugOutTok,
                                     group,
                                     inputPreview: this._previewToolPayload(argsStr),
-                                    outputPreview: this._previewToolPayload(resultStr)
+                                    outputPreview: this._previewToolPayload(resultStr) + (io && io.truncated ? `\n… [debug-log preview truncated; full output ≈ ${io.outTok.toLocaleString()} tok / ${io.outChars.toLocaleString()} chars]` : ''),
+                                    subagent: subagentLabel,
+                                    subagentId,
                                 });
                             }
                         } catch { /* malformed tool_call — skip */ }
@@ -2067,6 +2295,8 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     if (!billableOrIdentified) {
                         continue;
                     }
+                    // Track the newest request time (any session) for the live prompt-cache age clock.
+                    if (ts > this._newestRequestTs) { this._newestRequestTs = ts; }
 
                     // NOTE: we deliberately do NOT skip `summarize*` (compaction) or retry calls —
                     // they consume real credits (copilotUsageNanoAiu), so counting them keeps
@@ -2077,6 +2307,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     // _resetTurnMetrics() clears it at each turn boundary.
                     const isMiss = this._isCacheMiss(inputTokens, cachedTokens);
                     if (ts >= this._lastSubmitTs) {
+                        if (isChildLog && subagentId) { this._ensureTurnSubagent(subagentId, subagentLabel, ts); }
                         this._lastRequestMetrics.requestCount += 1;
                         this._lastRequestMetrics.inputTokens += inputTokens;
                         this._lastRequestMetrics.outputTokens += outputTokens;
@@ -2089,6 +2320,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                             ts, model, nanoAiu,
                             inputTokens, outputTokens, cachedTokens,
                             cacheHitPct: inputTokens > 0 ? Math.round(cachedTokens / inputTokens * 100) : 100,
+                            kindTag: this._classifyRole(debugName),
+                            subagent: subagentLabel,
+                            subagentId,
                         };
                         this._turnRequests.push(turnRequest);
                         if (this._turnRequests.length > 500) { this._turnRequests.shift(); }
@@ -2225,13 +2459,16 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 workspace: workspaceScope,
                 overall: overall.totals,
                 perModel: overall.perModel,
+                overallCompaction: overall.compaction,
                 turnRequests: [...this._turnRequests],
                 turnEvents: [...this._turnEvents],
+                turnSubagents: Array.from(this._turnSubagents.values()),
                 rtkCommandCount: rtk.commandCount,
                 rtkSavedTokens: rtk.savedTokens,
                 rtkSavingsPct: rtk.savingsPct,
                 gradle: this._gradleWithSavings(gradleObs, toolObs),
                 toolCalls: toolObs,
+                lastRequestTs: this._newestRequestTs,
                 source: `ledger:${logFiles.length} logs`,
                 updatedAt: Date.now()
             };
@@ -2253,49 +2490,178 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
      * (not just the ones AskAway happened to mirror). The shard only ever grows and is
      * persisted, so the credit figure can never drop even if debug logs later rotate away.
      */
-    private async _computeOverallMonth(currentMonth: string): Promise<{ totals: ScopeMetrics; perModel: ModelBreakdown[] }> {
+    private async _computeOverallMonth(currentMonth: string): Promise<{ totals: ScopeMetrics; perModel: ModelBreakdown[]; compaction: { count: number; nanoAiu: number } }> {
         const now = Date.now();
         if (now - this._overallLastComputedAt < this._OVERALL_RECOMPUTE_MS) {
             return this._overallCache;
         }
         this._overallLastComputedAt = now;
 
-        const totals = this._emptyScope();
-        const perModelMap = new Map<string, ScopeMetrics>();
-        let shard: MonthShard;
-        try {
-            shard = await this._ingestGlobalDebugLogs();
-        } catch {
-            this._overallCache = { totals, perModel: [] };
-            return this._overallCache;
+        // Durable-but-safe month source. Each debug-log file's per-month sums are memoized by
+        // size+mtime and persisted. A file is re-summed ONLY when it changes (whole-file re-sum →
+        // no double count, self-healing); when Copilot ROTATES a file away we KEEP its last-known
+        // sum so the month total never shrinks. This is corruption-proof: keyed by file path with
+        // whole-file sums — no byte cursors, no additive drift, no monotonic latch.
+        await this._loadMonthFileCache();
+        let changed = false;
+        let files: string[] = [];
+        try { files = await this._findAllCopilotDebugLogFiles(); } catch { /* keep cached */ }
+        for (const file of files) {
+            try {
+                const st = await fs.promises.stat(file);
+                const cached = this._monthFileCache.get(file);
+                if (cached && cached.size === st.size && cached.mtime === st.mtimeMs) { continue; }
+                const agg = await this._sumFileByMonth(file);
+                this._monthFileCache.set(file, { size: st.size, mtime: st.mtimeMs, months: agg });
+                changed = true;
+            } catch {
+                // Transient stat/read failure: keep the last-good cached entry (no flicker).
+            }
         }
 
-        const bucket = shard.months[currentMonth];
-        if (bucket) {
-            totals.requestCount += bucket.requestCount || 0;
-            totals.inputTokens += bucket.inputTokens || 0;
-            totals.outputTokens += bucket.outputTokens || 0;
-            totals.cachedTokens += bucket.cachedTokens || 0;
-            totals.nanoAiu += bucket.nanoAiu || 0;
-            totals.cacheMisses = (totals.cacheMisses || 0) + (bucket.cacheMisses || 0);
-            for (const [model, s] of Object.entries(bucket.perModel || {})) {
+        // Prune entries with no activity in the current or previous month (bounds growth). This
+        // keeps rotated-away files that still contribute to the visible window.
+        const keep = new Set<string>([currentMonth, this._prevMonthKey(currentMonth)]);
+        for (const [key, entry] of Array.from(this._monthFileCache.entries())) {
+            let relevant = false;
+            for (const mk of entry.months.keys()) { if (keep.has(mk)) { relevant = true; break; } }
+            if (!relevant) { this._monthFileCache.delete(key); changed = true; }
+        }
+
+        // Aggregate the target month across ALL cached files (current + rotated-away).
+        const totals = this._emptyScope();
+        const perModelMap = new Map<string, ScopeMetrics>();
+        const compaction = { count: 0, nanoAiu: 0 };
+        for (const entry of this._monthFileCache.values()) {
+            const bucket = entry.months.get(currentMonth);
+            if (!bucket) { continue; }
+            totals.requestCount += bucket.requestCount;
+            totals.inputTokens += bucket.inputTokens;
+            totals.outputTokens += bucket.outputTokens;
+            totals.cachedTokens += bucket.cachedTokens;
+            totals.nanoAiu += bucket.nanoAiu;
+            totals.cacheMisses = (totals.cacheMisses || 0) + bucket.cacheMisses;
+            compaction.count += bucket.compactionCount;
+            compaction.nanoAiu += bucket.compactionNanoAiu;
+            for (const [model, s] of bucket.perModel) {
                 const acc = perModelMap.get(model) ?? this._emptyScope();
-                acc.requestCount += s.requestCount || 0;
-                acc.inputTokens += s.inputTokens || 0;
-                acc.outputTokens += s.outputTokens || 0;
-                acc.cachedTokens += s.cachedTokens || 0;
-                acc.nanoAiu += s.nanoAiu || 0;
+                acc.requestCount += s.requestCount;
+                acc.inputTokens += s.inputTokens;
+                acc.outputTokens += s.outputTokens;
+                acc.cachedTokens += s.cachedTokens;
+                acc.nanoAiu += s.nanoAiu;
                 acc.cacheMisses = (acc.cacheMisses || 0) + (s.cacheMisses || 0);
                 perModelMap.set(model, acc);
             }
         }
+        if (changed) { void this._saveMonthFileCache(); }
 
         const perModel: ModelBreakdown[] = Array.from(perModelMap.entries())
             .map(([model, s]) => ({ model, ...s }))
             .sort((a, b) => b.nanoAiu - a.nanoAiu);
 
-        this._overallCache = { totals, perModel };
+        this._overallCache = { totals, perModel, compaction };
         return this._overallCache;
+    }
+
+    /** Month key one month before the given `YYYY-MM`. */
+    private _prevMonthKey(monthKey: string): string {
+        const [y, m] = monthKey.split('-').map(Number);
+        if (!y || !m) { return monthKey; }
+        const d = new Date(y, m - 2, 1); // m is 1-based; m-2 = previous month 0-based
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    }
+
+    private _getMonthCachePath(): string {
+        return path.join(this._context.globalStorageUri.fsPath, 'observability-monthcache.json');
+    }
+
+    /** Load the persisted per-file month sums once. Corrupt/missing → start empty (self-heals). */
+    private async _loadMonthFileCache(): Promise<void> {
+        if (this._monthCacheLoaded) { return; }
+        this._monthCacheLoaded = true;
+        try {
+            const raw = await fs.promises.readFile(this._getMonthCachePath(), 'utf8');
+            const parsed = JSON.parse(raw) as { files?: Record<string, { size: number; mtime: number; months: Record<string, unknown> }> };
+            for (const [file, e] of Object.entries(parsed.files || {})) {
+                const months = new Map<string, FileMonthAgg>();
+                for (const [mk, b] of Object.entries(e.months || {})) {
+                    const bb = b as Record<string, unknown>;
+                    const perModel = new Map<string, ScopeMetrics>();
+                    for (const [model, s] of Object.entries((bb.perModel as Record<string, unknown>) || {})) {
+                        const ss = s as Record<string, number>;
+                        perModel.set(model, { requestCount: ss.requestCount || 0, inputTokens: ss.inputTokens || 0, outputTokens: ss.outputTokens || 0, cachedTokens: ss.cachedTokens || 0, nanoAiu: ss.nanoAiu || 0, cacheMisses: ss.cacheMisses || 0 });
+                    }
+                    months.set(mk, {
+                        requestCount: Number(bb.requestCount) || 0, inputTokens: Number(bb.inputTokens) || 0,
+                        outputTokens: Number(bb.outputTokens) || 0, cachedTokens: Number(bb.cachedTokens) || 0,
+                        nanoAiu: Number(bb.nanoAiu) || 0, cacheMisses: Number(bb.cacheMisses) || 0,
+                        compactionCount: Number(bb.compactionCount) || 0, compactionNanoAiu: Number(bb.compactionNanoAiu) || 0,
+                        perModel,
+                    });
+                }
+                this._monthFileCache.set(file, { size: Number(e.size) || 0, mtime: Number(e.mtime) || 0, months });
+            }
+        } catch { /* none yet / corrupt → rebuild from logs */ }
+    }
+
+    private async _saveMonthFileCache(): Promise<void> {
+        try {
+            const files: Record<string, unknown> = {};
+            for (const [file, e] of this._monthFileCache.entries()) {
+                const months: Record<string, unknown> = {};
+                for (const [mk, b] of e.months.entries()) {
+                    const perModel: Record<string, unknown> = {};
+                    for (const [model, s] of b.perModel.entries()) { perModel[model] = s; }
+                    months[mk] = {
+                        requestCount: b.requestCount, inputTokens: b.inputTokens, outputTokens: b.outputTokens,
+                        cachedTokens: b.cachedTokens, nanoAiu: b.nanoAiu, cacheMisses: b.cacheMisses,
+                        compactionCount: b.compactionCount, compactionNanoAiu: b.compactionNanoAiu, perModel,
+                    };
+                }
+                files[file] = { size: e.size, mtime: e.mtime, months };
+            }
+            const p = this._getMonthCachePath();
+            await fs.promises.mkdir(path.dirname(p), { recursive: true });
+            await fs.promises.writeFile(p, JSON.stringify({ version: 1, files }));
+        } catch { /* best-effort */ }
+    }
+
+    /** Read one debug-log file fully and bucket its llm_requests by month (stateless month recompute). */
+    private async _sumFileByMonth(file: string): Promise<Map<string, FileMonthAgg>> {
+        const out = new Map<string, FileMonthAgg>();
+        let data: string;
+        try { data = await fs.promises.readFile(file, 'utf8'); } catch { return out; }
+        const empty = (): FileMonthAgg => ({
+            requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0,
+            cacheMisses: 0, compactionCount: 0, compactionNanoAiu: 0, perModel: new Map(),
+        });
+        for (const line of data.split('\n')) {
+            if (!line || line.indexOf('llm_request') === -1) { continue; }
+            let p: Record<string, unknown>;
+            try { p = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+            const attrs = p.attrs as Record<string, unknown> | undefined;
+            if (!attrs) { continue; }
+            const ts = typeof p.ts === 'number' ? p.ts : 0;
+            const inTok = typeof attrs.inputTokens === 'number' ? attrs.inputTokens : 0;
+            const outTok = typeof attrs.outputTokens === 'number' ? attrs.outputTokens : 0;
+            const cachedTok = typeof attrs.cachedTokens === 'number' ? attrs.cachedTokens : 0;
+            const nano = typeof attrs.copilotUsageNanoAiu === 'number' ? attrs.copilotUsageNanoAiu : 0;
+            const model = typeof attrs.model === 'string' ? attrs.model : 'unknown';
+            const role = typeof attrs.debugName === 'string' ? attrs.debugName : '';
+            if (model === 'unknown' && inTok === 0 && outTok === 0 && cachedTok === 0 && nano === 0) { continue; }
+            const mk = this._getMonthKey(ts);
+            let b = out.get(mk);
+            if (!b) { b = empty(); out.set(mk, b); }
+            b.requestCount += 1; b.inputTokens += inTok; b.outputTokens += outTok; b.cachedTokens += cachedTok; b.nanoAiu += nano;
+            if (this._isCacheMiss(inTok, cachedTok)) { b.cacheMisses += 1; }
+            if (this._classifyRole(role) === 'compaction') { b.compactionCount += 1; b.compactionNanoAiu += nano; }
+            let pm = b.perModel.get(model);
+            if (!pm) { pm = this._emptyScope(); b.perModel.set(model, pm); }
+            pm.requestCount += 1; pm.inputTokens += inTok; pm.outputTokens += outTok; pm.cachedTokens += cachedTok; pm.nanoAiu += nano;
+            if (this._isCacheMiss(inTok, cachedTok)) { pm.cacheMisses = (pm.cacheMisses || 0) + 1; }
+        }
+        return out;
     }
 
     /** Path of the persisted cursor file for the all-workspace global ingest. */
@@ -2342,7 +2708,15 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             try { sessions = await fs.promises.readdir(debugRoot, { withFileTypes: true }); } catch { continue; }
             for (const s of sessions) {
                 if (!s.isDirectory()) { continue; }
-                out.push(path.join(debugRoot, s.name, 'main.jsonl'));
+                // Include the parent main.jsonl AND every runSubagent-*.jsonl child session
+                // so sub-agent credits are folded into the month total (see finder above).
+                let entries: fs.Dirent[] = [];
+                try { entries = await fs.promises.readdir(path.join(debugRoot, s.name), { withFileTypes: true }); } catch { continue; }
+                for (const f of entries) {
+                    if (f.isFile() && this._isRequestLogFile(f.name)) {
+                        out.push(path.join(debugRoot, s.name, f.name));
+                    }
+                }
             }
         }
         return out;
@@ -2353,14 +2727,27 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         return inputTokens > 0 && cachedTokens < inputTokens * 0.5;
     }
 
+    /** Classify a request by its Copilot debugName. Compaction = summarizeConversationHistory*;
+     *  retry = retry-*; everything else is a normal agent/model call. */
+    private _classifyRole(role: string): 'compaction' | 'retry' | 'normal' {
+        const r = (role || '').toLowerCase();
+        if (r.indexOf('summarize') !== -1) { return 'compaction'; }
+        if (r.indexOf('retry') !== -1) { return 'retry'; }
+        return 'normal';
+    }
+
     /** Fold one request's usage into the global month shard (dedup handled by caller). */
-    private _foldReqIntoShard(shard: MonthShard, ts: number, model: string, inTok: number, outTok: number, cachedTok: number, nano: number): void {
+    private _foldReqIntoShard(shard: MonthShard, ts: number, model: string, inTok: number, outTok: number, cachedTok: number, nano: number, role?: string): void {
         const monthKey = this._getMonthKey(ts);
         const miss = this._isCacheMiss(inTok, cachedTok) ? 1 : 0;
         let bucket = shard.months[monthKey];
         if (!bucket) { bucket = { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0, cacheMisses: 0, perModel: {} }; shard.months[monthKey] = bucket; }
         bucket.requestCount += 1; bucket.inputTokens += inTok; bucket.outputTokens += outTok; bucket.cachedTokens += cachedTok; bucket.nanoAiu += nano;
         bucket.cacheMisses = (bucket.cacheMisses || 0) + miss;
+        if (role && this._classifyRole(role) === 'compaction') {
+            bucket.compactionCount = (bucket.compactionCount || 0) + 1;
+            bucket.compactionNanoAiu = (bucket.compactionNanoAiu || 0) + nano;
+        }
         let pm = bucket.perModel[model];
         if (!pm) { pm = { requestCount: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, nanoAiu: 0, cacheMisses: 0 }; bucket.perModel[model] = pm; }
         pm.requestCount += 1; pm.inputTokens += inTok; pm.outputTokens += outTok; pm.cachedTokens += cachedTok; pm.nanoAiu += nano;
@@ -2418,6 +2805,7 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                         typeof attrs.outputTokens === 'number' ? attrs.outputTokens : 0,
                         typeof attrs.cachedTokens === 'number' ? attrs.cachedTokens : 0,
                         typeof attrs.copilotUsageNanoAiu === 'number' ? attrs.copilotUsageNanoAiu : 0,
+                        typeof attrs.debugName === 'string' ? attrs.debugName : '',
                     );
                 }
                 const consumedLines = text.split('\n').length - 1;
@@ -2582,6 +2970,8 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                 userTokens, totalInputTokens,
                 skillsCount: sys.count, toolsCount: tools.count,
                 messageCount, cachedTokens: cachedTokens || 0,
+                composition: this._analyzeSystemPromptComposition(sessionDir, attrs.systemPromptFile, sys.tokens),
+                contributors: this._analyzeRequestContributors(inputMessages, sys.tokens, tools.tokens, totalInputTokens, cachedTokens || 0),
             };
         } catch {
             return undefined;
@@ -2611,6 +3001,286 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         if (this._splitFileCache.size > 200) { this._splitFileCache.clear(); }
         this._splitFileCache.set(p, stats);
         return stats;
+    }
+
+    /**
+     * Effective prompt-cache activity time = max of the newest llm_request ts (from debug
+     * logs) and the event-driven sentinel `~/.askaway/cache-activity-ts` written by the
+     * cache-timer hook on UserPromptSubmit/PostToolUse/Stop. The hook resets the clock the
+     * instant you submit (no 2s poll lag) and marks each model round precisely.
+     */
+    private _effectiveCacheActivityTs(): number {
+        let sentinel = 0;
+        try {
+            const raw = fs.readFileSync(path.join(os.homedir(), '.askaway', 'cache-activity-ts'), 'utf8');
+            sentinel = parseInt(raw.trim(), 10) || 0;
+        } catch { /* sentinel absent until the first hook fires */ }
+        return Math.max(this._newestRequestTs, sentinel);
+    }
+
+    /** Reverse-engineer the assembled system prompt into its source pieces. Copilot wraps every
+     *  included instruction file in `<attachment filePath="…">…</attachment>` and its skill/agent
+     *  catalogs in `<skills>`/`<agents>` blocks, so we attribute those precisely and treat the
+     *  remaining tokens as Copilot's own (closed) base + framing text. Cached by sidecar path. */
+    private _analyzeSystemPromptComposition(
+        sessionDir: string, name: unknown, systemTokens: number
+    ): SystemPromptComposition | undefined {
+        if (typeof name !== 'string' || !name || !systemTokens) { return undefined; }
+        const p = path.join(sessionDir, name);
+        const cacheKey = `${p}:${systemTokens}`;
+        const hit = this._promptCompositionCache.get(cacheKey);
+        if (hit) { return hit; }
+        let text = '';
+        try {
+            const raw = fs.readFileSync(p, 'utf8');
+            try {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) {
+                    text = parsed.map((x) => (x && typeof x.content === 'string') ? x.content : '').join('\n');
+                } else if (parsed && typeof parsed.content === 'string') {
+                    text = parsed.content;
+                } else { text = raw; }
+            } catch { text = raw; }
+        } catch { return undefined; }
+        if (!text) { return undefined; }
+        // Sidecars can be double-JSON-encoded, so unescape quotes/newlines before matching.
+        const norm = text.replace(/\\"/g, '"').replace(/\\n/g, '\n');
+        const segments: (SystemPromptSegment & { order: number })[] = [];
+        const consumedRanges: { start: number; end: number }[] = [];
+        const attRe = /<attachment\s+filePath="([^"]+)"(?:\s+workspaceFolder="([^"]+)")?>([\s\S]*?)<\/attachment>/g;
+        let m: RegExpExecArray | null;
+        while ((m = attRe.exec(norm)) !== null) {
+            const filePath = m[1];
+            consumedRanges.push({ start: m.index, end: m.index + m[0].length });
+            segments.push({
+                label: filePath.split('/').pop() || filePath,
+                kind: 'attachment', path: filePath,
+                workspaceFolder: m[2] || undefined,
+                tokens: countTokens(m[3] || ''), order: m.index,
+            });
+        }
+        // Custom instruction files (applyTo-based): <instruction><file>PATH</file>…</instruction>.
+        const insRe = /<instruction>\s*<file>([^<]+)<\/file>([\s\S]*?)<\/instruction>/g;
+        while ((m = insRe.exec(norm)) !== null) {
+            const filePath = m[1].trim();
+            consumedRanges.push({ start: m.index, end: m.index + m[0].length });
+            segments.push({
+                label: filePath.split('/').pop() || filePath,
+                kind: 'instruction', path: filePath,
+                tokens: countTokens(m[0]), order: m.index,
+            });
+        }
+        // Skills catalog — itemize each skill (name + SKILL.md link + tokens).
+        const sk = /<skills>([\s\S]*?)<\/skills>/.exec(norm);
+        if (sk) {
+            const inner = sk[1];
+            const children: SystemPromptChild[] = [];
+            const skRe = /<skill>([\s\S]*?)<\/skill>/g;
+            let s: RegExpExecArray | null;
+            while ((s = skRe.exec(inner)) !== null) {
+                const block = s[1];
+                const nm = /<name>([^<]*)<\/name>/.exec(block);
+                const fl = /<file>([^<]*)<\/file>/.exec(block);
+                children.push({
+                    label: (nm && nm[1].trim()) || 'skill',
+                    path: fl ? fl[1].trim() : undefined,
+                    tokens: countTokens(s[0]),
+                });
+            }
+            segments.push({ label: `Skills (${children.length})`, kind: 'skills', tokens: countTokens(inner), order: sk.index, children });
+        }
+        // Agents catalog — itemize each agent (name + tokens; no file to link).
+        const ag = /<agents>([\s\S]*?)<\/agents>/.exec(norm);
+        if (ag) {
+            const inner = ag[1];
+            const children: SystemPromptChild[] = [];
+            const agRe = /<agent>([\s\S]*?)<\/agent>/g;
+            let a: RegExpExecArray | null;
+            while ((a = agRe.exec(inner)) !== null) {
+                const nm = /<name>([^<]*)<\/name>/.exec(a[1]);
+                children.push({ label: (nm && nm[1].trim()) || 'agent', tokens: countTokens(a[0]) });
+            }
+            segments.push({ label: `Agents (${children.length})`, kind: 'agents', tokens: countTokens(inner), order: ag.index, children });
+        }
+        // Itemize the remaining outermost tagged sections (agent-mode instructions + Copilot
+        // framing) instead of dumping them all into "base". These are the biggest source of
+        // apparent inaccuracy: e.g. a custom agent's <modeInstructions> can be ~20% of the whole
+        // prompt yet was previously hidden inside the opaque base bucket. Skills/agents live
+        // nested inside an <instructions> block, so subtract their (already-attributed) tokens
+        // from any section that contains them to avoid double counting.
+        const FRIENDLY: Record<string, string> = {
+            modeInstructions: 'Agent mode instructions',
+            instructions: 'Copilot instructions framing',
+            toolUseInstructions: 'Tool-use instructions',
+            memoryInstructions: 'Memory instructions',
+            outputFormatting: 'Output formatting',
+            notebookInstructions: 'Notebook instructions',
+            communicationStyle: 'Communication style',
+            operationalSafety: 'Operational safety',
+            securityRequirements: 'Security requirements',
+            implementationDiscipline: 'Implementation discipline',
+            taskTracking: 'Task tracking',
+            parallelizationStrategy: 'Parallelization strategy',
+        };
+        const alreadyHandled = new Set(['attachment', 'instruction', 'skills', 'agents']);
+        const nestedAttributed: { start: number; end: number; tokens: number }[] = [];
+        if (sk) { nestedAttributed.push({ start: sk.index, end: sk.index + sk[0].length, tokens: countTokens(sk[0]) }); }
+        if (ag) { nestedAttributed.push({ start: ag.index, end: ag.index + ag[0].length, tokens: countTokens(ag[0]) }); }
+        const secRe = /<([a-zA-Z_][\w]*)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/g;
+        while ((m = secRe.exec(norm)) !== null) {
+            const tag = m[1];
+            if (alreadyHandled.has(tag)) { continue; }
+            const start = m.index;
+            const end = m.index + m[0].length;
+            // Skip tags that live inside an already-attributed attachment/instruction block.
+            if (consumedRanges.some((r) => start >= r.start && end <= r.end)) { continue; }
+            let tok = countTokens(m[0]);
+            for (const n of nestedAttributed) {
+                if (n.start >= start && n.end <= end) { tok -= n.tokens; }
+            }
+            if (tok <= 0) { continue; }
+            segments.push({
+                label: FRIENDLY[tag] || tag,
+                kind: tag === 'modeInstructions' ? 'mode' : 'framing',
+                tokens: tok, order: start,
+            });
+        }
+        segments.sort((a, b) => a.order - b.order);
+        const attributed = segments.reduce((s, x) => s + x.tokens, 0);
+        const comp: SystemPromptComposition = {
+            totalTokens: systemTokens,
+            baseTokens: Math.max(0, systemTokens - attributed),
+            segments: segments.map(({ order, ...s }) => s),
+        };
+        if (this._promptCompositionCache.size > 200) { this._promptCompositionCache.clear(); }
+        this._promptCompositionCache.set(cacheKey, comp);
+        return comp;
+    }
+
+    /** Break the FULL request into what actually contributed: system prompt, tool defs, and the
+     *  entire conversation split into user memory, attached files, context framing, tool results
+     *  and dialogue. Parsed from the request's own `inputMessages` (the complete messages array),
+     *  so it reflects THAT request literally — not a guess. Cached by content signature since the
+     *  input is large (a full conversation can be hundreds of KB). */
+    private _analyzeRequestContributors(
+        inputMessages: string, systemTokens: number, toolsTokens: number,
+        totalInputTokens: number, cachedTokens: number
+    ): RequestContributors | undefined {
+        if (!inputMessages || !totalInputTokens) { return undefined; }
+        const cacheKey = `${inputMessages.length}:${systemTokens}:${toolsTokens}:${totalInputTokens}`;
+        const hit = this._contributorCache.get(cacheKey);
+        if (hit) { return hit; }
+        let arr: unknown;
+        try { arr = JSON.parse(inputMessages); } catch { return undefined; }
+        if (!Array.isArray(arr)) { return undefined; }
+        // Separate each message PART by its real shape. Copilot logs the messages array with
+        // distinct part types — a plain `content` string is ONLY present on `text`/`reasoning`
+        // parts. Tool traffic uses different fields with NO `content`:
+        //   - `tool_call`          → the model's tool invocation; payload in `p.arguments`
+        //   - `tool_call_response` → the tool's OUTPUT (role:user); payload in `p.response`
+        //     (an array of `{type:'text',text}` parts)
+        //   - `reasoning`          → the model's hidden chain-of-thought; `p.content`
+        // Older/other shapes (`tool_result`, role `tool`) are handled as a fallback. Reading
+        // only `p.content` (the previous behaviour) dropped every tool_call/tool_call_response
+        // to 0, so their (usually dominant) tokens were swept into the dialogue residual and
+        // mislabeled "Conversation (user + assistant)".
+        let toolResultTokens = 0;   // tool OUTPUTS (read_file/terminal/etc. responses)
+        let toolCallTokens = 0;     // the model's tool-call ARGUMENTS
+        let reasoningTokens = 0;    // assistant chain-of-thought
+        const texts: string[] = []; // genuine user + assistant TEXT only
+        const toolNameById = new Map<string, string>();          // tool_call id → tool name
+        const toolResultByName = new Map<string, { calls: number; tokens: number }>(); // per-tool output weight
+        const toolResponseText = (r: unknown): string => {
+            if (Array.isArray(r)) {
+                return (r as Array<Record<string, unknown>>).map(x =>
+                    x && typeof x.text === 'string' ? x.text
+                        : (typeof x === 'string' ? x : JSON.stringify(x))).join('\n');
+            }
+            return typeof r === 'string' ? r : (r ? JSON.stringify(r) : '');
+        };
+        const addToolResult = (name: string, tokens: number): void => {
+            toolResultTokens += tokens;
+            const e = toolResultByName.get(name) || { calls: 0, tokens: 0 };
+            e.calls += 1; e.tokens += tokens;
+            toolResultByName.set(name, e);
+        };
+        for (const msg of arr as Array<Record<string, unknown>>) {
+            const role = typeof msg.role === 'string' ? msg.role : '';
+            const parts = Array.isArray(msg.parts) ? msg.parts
+                : (typeof msg.content === 'string' ? [{ type: 'text', content: msg.content }] : []);
+            for (const p of parts as Array<Record<string, unknown>>) {
+                const t = typeof p.type === 'string' ? p.type : '';
+                const c = typeof p.content === 'string' ? p.content : '';
+                if (t === 'tool_call') {
+                    // Assistant's tool invocation — precedes its response, so record the name now.
+                    if (typeof p.id === 'string' && typeof p.name === 'string') { toolNameById.set(p.id, p.name); }
+                    toolCallTokens += countTokens(JSON.stringify(p.arguments ?? {}));
+                } else if (t === 'tool_call_response') {
+                    const nm = (typeof p.id === 'string' && toolNameById.get(p.id)) || 'tool';
+                    addToolResult(nm, countTokens(toolResponseText(p.response)));
+                } else if (t === 'tool_result' || role === 'tool') {
+                    addToolResult('tool', countTokens(c || toolResponseText(p.response)));
+                } else if (t === 'reasoning') { reasoningTokens += countTokens(c); }
+                else if (c) { texts.push(c); }
+            }
+        }
+        const joined = texts.join('\n');
+        // User memory blocks (+ the `## <file>` headers name the contributing memory files).
+        let memoryTokens = 0;
+        const memoryFiles = new Set<string>();
+        let m: RegExpExecArray | null;
+        const memRe = /<userMemory>([\s\S]*?)<\/userMemory>/g;
+        while ((m = memRe.exec(joined)) !== null) {
+            memoryTokens += countTokens(m[1]);
+            // User memory injects one `## <file>.md` header per contributing memory file; inner
+            // sub-sections are also `##`, so match only headers that are a bare `.md` filename.
+            const hdrRe = /^##\s+([^\s#][^\n]*?\.md)\s*$/gm;
+            let h: RegExpExecArray | null;
+            while ((h = hdrRe.exec(m[1])) !== null) { memoryFiles.add(h[1].trim()); }
+        }
+        // Attached files (deduped by path, tokens summed across occurrences).
+        const fileTokens = new Map<string, number>();
+        const attRe = /<attachment\s+filePath="([^"]+)"(?:\s+workspaceFolder="[^"]+")?>([\s\S]*?)<\/attachment>/g;
+        while ((m = attRe.exec(joined)) !== null) {
+            fileTokens.set(m[1], (fileTokens.get(m[1]) || 0) + countTokens(m[2]));
+        }
+        const attachmentTokens = Array.from(fileTokens.values()).reduce((s, v) => s + v, 0);
+        // Context/framing blocks injected around the user's turns.
+        let contextTokens = 0;
+        for (const tag of ['environment_info', 'workspace_info', 'context', 'reminderInstructions', 'userRequest']) {
+            const re = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'g');
+            while ((m = re.exec(joined)) !== null) { contextTokens += countTokens(m[0]); }
+        }
+        // Plain dialogue = genuine user/assistant TEXT minus the framing blocks that live inside
+        // it (memory/attachments/context). Measured directly — NOT a residual — so tool outputs,
+        // tool-call arguments and reasoning are no longer mislabeled as conversation.
+        const textTotal = countTokens(joined);
+        const dialogueTokens = Math.max(0, textTotal - memoryTokens - attachmentTokens - contextTokens);
+        const items: RequestContributor[] = [];
+        if (systemTokens > 0) { items.push({ label: 'System prompt', kind: 'system', tokens: systemTokens }); }
+        if (toolsTokens > 0) { items.push({ label: 'Tool definitions', kind: 'tools', tokens: toolsTokens }); }
+        if (memoryTokens > 0) { items.push({ label: `User memory (${memoryFiles.size} file${memoryFiles.size === 1 ? '' : 's'})`, kind: 'memory', tokens: memoryTokens, count: memoryFiles.size }); }
+        for (const [p, t] of Array.from(fileTokens.entries())) {
+            items.push({ label: p.split('/').pop() || p, kind: 'attachment', tokens: t, path: p });
+        }
+        if (contextTokens > 0) { items.push({ label: 'Context / environment framing', kind: 'context', tokens: contextTokens }); }
+        // Tool OUTPUTS broken down per tool (descending) so the heavy hitter is obvious — e.g. a
+        // single `memory view` of a large file can dwarf everything. Each line shows call count.
+        for (const [name, e] of Array.from(toolResultByName.entries()).sort((a, b) => b[1].tokens - a[1].tokens)) {
+            items.push({ label: `Tool output: ${name} (${e.calls} call${e.calls === 1 ? '' : 's'})`, kind: 'toolResult', tokens: e.tokens, count: e.calls });
+        }
+        if (toolCallTokens > 0) { items.push({ label: 'Tool calls (arguments)', kind: 'toolCall', tokens: toolCallTokens }); }
+        if (reasoningTokens > 0) { items.push({ label: 'Assistant reasoning', kind: 'reasoning', tokens: reasoningTokens }); }
+        if (dialogueTokens > 0) { items.push({ label: 'Conversation (user + assistant text)', kind: 'dialogue', tokens: dialogueTokens }); }
+        items.sort((a, b) => b.tokens - a.tokens);
+        const result: RequestContributors = {
+            totalInputTokens, cachedTokens,
+            accountedTokens: items.reduce((s, x) => s + x.tokens, 0),
+            items, files: Array.from(fileTokens.keys()), memoryFiles: Array.from(memoryFiles),
+        };
+        if (this._contributorCache.size > 200) { this._contributorCache.clear(); }
+        this._contributorCache.set(cacheKey, result);
+        return result;
     }
 
     private _pushTurnEvent(event: TurnEvent): void {
@@ -3025,6 +3695,33 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         return '';
     }
 
+    /** True for debug-log files that contain llm_request lines: the parent `main.jsonl` and
+     *  `runSubagent-*.jsonl` child sub-agent sessions. Excludes `title-*.jsonl` (chat titles). */
+    private _isRequestLogFile(name: string): boolean {
+        if (!name.endsWith('.jsonl')) { return false; }
+        if (name.startsWith('title-')) { return false; }
+        return name === 'main.jsonl' || name.startsWith('runSubagent');
+    }
+
+    /** A debug-log file is a CHILD sub-agent session (not the parent agent turn) when it is not
+     *  `main.jsonl`. Child logs carry their own `user_message` (the sub-agent's prompt) which must
+     *  NOT reset the parent "This turn" window. */
+    private _isChildSubagentLog(logFile: string): boolean {
+        return path.basename(logFile) !== 'main.jsonl';
+    }
+
+    /** Extract the sub-agent label from a child log filename, e.g.
+     *  `runSubagent-Explore-toolu_01Cha.jsonl` → `Explore`. Drops the `runSubagent-` prefix and the
+     *  trailing session-id segment; preserves multi-part labels (`AskAway-Build`). */
+    private _parseSubagentLabel(fileName: string): string {
+        const base = fileName.replace(/\.jsonl$/i, '');
+        const parts = base.split('-');
+        if (parts.length >= 3 && parts[0] === 'runSubagent') {
+            return parts.slice(1, -1).join('-') || 'sub-agent';
+        }
+        return 'sub-agent';
+    }
+
     private async _findWorkspaceCopilotDebugLogFiles(): Promise<string[]> {
         const candidates: string[] = [];
 
@@ -3047,12 +3744,25 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
                     continue;
                 }
 
-                const mainLog = path.join(debugRoot, sessionDir.name, 'main.jsonl');
+                // main.jsonl is the parent agent session; runSubagent-*.jsonl are child
+                // sub-agent sessions (their LLM requests are billed but logged separately).
+                // Include BOTH so sub-agent credits are counted. Exclude title-*.jsonl (chat
+                // titles, not requests).
+                let entries: fs.Dirent[] = [];
                 try {
-                    await fs.promises.access(mainLog, fs.constants.R_OK);
-                    candidates.push(mainLog);
+                    entries = await fs.promises.readdir(path.join(debugRoot, sessionDir.name), { withFileTypes: true });
                 } catch {
-                    // Skip unreadable candidate.
+                    continue;
+                }
+                for (const f of entries) {
+                    if (!f.isFile() || !this._isRequestLogFile(f.name)) { continue; }
+                    const logFile = path.join(debugRoot, sessionDir.name, f.name);
+                    try {
+                        await fs.promises.access(logFile, fs.constants.R_OK);
+                        candidates.push(logFile);
+                    } catch {
+                        // Skip unreadable candidate.
+                    }
                 }
             }
         }
@@ -3822,6 +4532,24 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             case 'updateRtkCompressionSetting':
                 this._handleUpdateRtkCompressionSetting(message.enabled);
                 break;
+            case 'updateAutoCompactionDisabled':
+                this._handleUpdateAutoCompactionDisabled(message.disabled);
+                break;
+            case 'updateExtendedCacheTtl':
+                this._handleUpdateCopilotChatSetting('anthropic.promptCaching.extendedTtl', message.enabled);
+                break;
+            case 'updateExtendedCacheTtlMessages':
+                this._handleUpdateCopilotChatSetting('anthropic.promptCaching.extendedTtlMessages', message.enabled);
+                break;
+            case 'updateCacheKeepWarm':
+                this._handleUpdateCopilotChatSetting('agent.longToolCallCachePreservation.enabled', message.enabled);
+                break;
+            case 'updateCacheKeepWarmProbes':
+                this._handleUpdateCopilotChatSetting('agent.longToolCallCachePreservation.maxProbes', Math.max(0, Math.min(10, Math.round(message.value || 0))));
+                break;
+            case 'pingCache':
+                this._handlePingCache();
+                break;
             case 'updateResponseTimeout':
                 this._handleUpdateResponseTimeout(message.value);
                 break;
@@ -3875,6 +4603,12 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             case 'openExternal':
                 if (message.url) {
                     vscode.env.openExternal(vscode.Uri.parse(message.url));
+                }
+                break;
+            case 'openFile':
+                if (message.path && typeof message.path === 'string') {
+                    vscode.commands.executeCommand('vscode.open', vscode.Uri.file(message.path))
+                        .then(undefined, () => { /* file may no longer exist — ignore */ });
                 }
                 break;
             case 'searchContext':
@@ -4036,6 +4770,9 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
         this._turnToolAgg.clear();
         this._turnRequests = [];
         this._turnEvents = [];
+        this._turnSubagents.clear();
+        this._turnSpanToSubagent.clear();
+        this._turnSubagentLabelById.clear();
         this._turnFirstReqSeen = false;
     }
 
@@ -4043,6 +4780,96 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
      *  the user can ask to investigate a specific request, and written into the master table. */
     private _shortReqId(sid: string, lineIndex: number): string {
         return this._hashText(`${sid}:${lineIndex}`).slice(0, 5).toUpperCase();
+    }
+
+    /** Lossless tool I/O reconciliation. The PostToolUse hook (~/.askaway/tool-io.jsonl) logs the
+     *  FULL, untruncated size of every tool call (Copilot truncates attrs.result in its debug log
+     *  to ~5K chars). We index those rows by tool name and match the one whose timestamp is closest
+     *  to the debug tool_call event. Returns the real in/out sizes when the hook captured a larger
+     *  output than the (possibly truncated) debug result. Cached by file size+mtime. */
+    private _toolIoIndex: Map<string, Array<{ ts: number; inChars: number; outChars: number; inTok: number; outTok: number }>> | null = null;
+    private _toolIoSig = '';
+    private _toolIoTokMemo = new Map<string, { inTok: number; outTok: number }>();
+    private _loadToolIoIndex(): Map<string, Array<{ ts: number; inChars: number; outChars: number; inTok: number; outTok: number }>> {
+        const file = path.join(os.homedir(), '.askaway', 'tool-io.jsonl');
+        let st: fs.Stats | undefined;
+        try { st = fs.statSync(file); } catch { this._toolIoIndex = new Map(); this._toolIoSig = ''; return this._toolIoIndex; }
+        const sig = `${st.size}:${st.mtimeMs}`;
+        if (this._toolIoIndex && sig === this._toolIoSig) { return this._toolIoIndex; }
+        const idx = new Map<string, Array<{ ts: number; inChars: number; outChars: number; inTok: number; outTok: number }>>();
+        try {
+            const raw = fs.readFileSync(file, 'utf8');
+            for (const line of raw.split('\n')) {
+                if (!line) { continue; }
+                try {
+                    const r = JSON.parse(line) as Record<string, unknown>;
+                    const tool = typeof r.tool === 'string' ? r.tool : '';
+                    if (!tool) { continue; }
+                    // Tokenize the FULL logged text with the real gpt-tokenizer (no chars/4).
+                    // Only the resulting counts are retained; text is discarded to bound memory.
+                    const inText = typeof r.in === 'string' ? r.in : '';
+                    const outText = typeof r.out === 'string' ? r.out : '';
+                    const memoKey = `${Number(r.ts) || 0}:${Number(r.inChars) || inText.length}:${Number(r.outChars) || outText.length}`;
+                    let toks = this._toolIoTokMemo.get(memoKey);
+                    if (!toks) {
+                        toks = { inTok: inText ? countTokens(inText) : 0, outTok: outText ? countTokens(outText) : 0 };
+                        if (this._toolIoTokMemo.size > 5000) { this._toolIoTokMemo.clear(); }
+                        this._toolIoTokMemo.set(memoKey, toks);
+                    }
+                    const entry = {
+                        ts: Number(r.ts) || 0,
+                        inChars: Number(r.inChars) || inText.length,
+                        outChars: Number(r.outChars) || outText.length,
+                        inTok: toks.inTok,
+                        outTok: toks.outTok,
+                    };
+                    const list = idx.get(tool) || [];
+                    list.push(entry);
+                    idx.set(tool, list);
+                } catch { /* skip */ }
+            }
+        } catch { /* unreadable */ }
+        this._toolIoIndex = idx;
+        this._toolIoSig = sig;
+        return idx;
+    }
+
+    /** Look up the lossless tool I/O for a debug tool_call event. Matches the nearest-in-time hook
+     *  row for the same tool; only overrides when the hook output is materially larger than the
+     *  (truncated) debug result — signalling truncation. `truncated` flags that case for the UI. */
+    private _lookupToolIo(
+        tool: string, ts: number, debugOutChars: number, debugInChars: number
+    ): { inTok: number; outTok: number; outChars: number; truncated: boolean } | null {
+        const idx = this._loadToolIoIndex();
+        const list = idx.get(tool);
+        if (!list || !list.length) { return null; }
+        let best: { ts: number; inChars: number; outChars: number; inTok: number; outTok: number } | null = null;
+        let bestDelta = Number.POSITIVE_INFINITY;
+        for (const e of list) {
+            const d = Math.abs(e.ts - ts);
+            if (d < bestDelta) { bestDelta = d; best = e; }
+        }
+        // Require the match to be within a reasonable window (30s) of the debug event.
+        if (!best || bestDelta > 30000) { return null; }
+        const truncated = best.outChars > debugOutChars + 64;
+        return { inTok: best.inTok, outTok: best.outTok, outChars: best.outChars, truncated };
+    }
+
+    /** Stable 5-char group key for a sub-agent instance (hash of its child session id). */
+    private _shortSubagentId(childSessionId: string): string {
+        return this._hashText(`sa:${childSessionId}`).slice(0, 5).toUpperCase();
+    }
+
+    /** Ensure a sub-agent header entry exists — called ONLY when an in-window event is emitted for
+     *  it, so the header count always equals the number of groups actually shown in the timeline. */
+    private _ensureTurnSubagent(subagentId: string, label?: string, ts?: number): void {
+        if (this._turnSubagents.has(subagentId)) { return; }
+        this._turnSubagents.set(subagentId, {
+            subagentId,
+            label: label || this._turnSubagentLabelById.get(subagentId) || 'sub-agent',
+            done: false, durMs: 0, outputTokens: 0, status: 'running',
+            startedTs: ts || Date.now(),
+        });
     }
 
     /**
@@ -4789,6 +5616,58 @@ export class TaskSyncWebviewProvider implements vscode.WebviewViewProvider, vsco
             this._updateSettingsUI();
         } finally {
             this._isUpdatingConfig = false;
+        }
+    }
+
+    private async _handleUpdateAutoCompactionDisabled(disabled: boolean): Promise<void> {
+        this._isUpdatingConfig = true;
+        try {
+            // Inverted: checked in the UI means auto-compaction is DISABLED, so we set
+            // Copilot's summarizeAgentConversationHistory.enabled to the opposite value.
+            const copilotConfig = vscode.workspace.getConfiguration('github.copilot.chat');
+            const target = vscode.workspace.workspaceFolders?.length
+                ? vscode.ConfigurationTarget.Workspace
+                : vscode.ConfigurationTarget.Global;
+            await copilotConfig.update('summarizeAgentConversationHistory.enabled', !disabled, target);
+            this._updateSettingsUI();
+        } finally {
+            this._isUpdatingConfig = false;
+        }
+    }
+
+    /** Generic setter for a github.copilot.chat.* value (used by the prompt-cache toggles).
+     *  Optionally mirrors the same value to a companion key. */
+    private async _handleUpdateCopilotChatSetting(key: string, value: boolean | number, companionKey?: string): Promise<void> {
+        this._isUpdatingConfig = true;
+        try {
+            const copilotConfig = vscode.workspace.getConfiguration('github.copilot.chat');
+            const target = vscode.workspace.workspaceFolders?.length
+                ? vscode.ConfigurationTarget.Workspace
+                : vscode.ConfigurationTarget.Global;
+            await copilotConfig.update(key, value, target);
+            if (companionKey) { await copilotConfig.update(companionKey, value, target); }
+            this._updateSettingsUI();
+        } finally {
+            this._isUpdatingConfig = false;
+        }
+    }
+
+    /** Manual "keep-warm" ping. To get a cache HIT the follow-up must land on the SAME agent
+     *  conversation (identical system-prompt + tools + history prefix). Copilot's internal probe
+     *  reuses its private lastFetchOptions verbatim and is only reachable during sub-agent calls,
+     *  so we approximate it WITHOUT changing the agent: fill the CURRENT chat input (isPartialQuery
+     *  keeps the active mode/agent) and submit it in place. Opening a fresh `chat.open` turn would
+     *  switch to the default agent → different system prompt → cache MISS (the bug being fixed). */
+    private async _handlePingCache(): Promise<void> {
+        const query = 'keepalive; reply: ok';
+        try {
+            await vscode.commands.executeCommand('workbench.action.chat.open', { query, isPartialQuery: true });
+            await vscode.commands.executeCommand('workbench.action.chat.submit');
+        } catch (e) {
+            vscode.window.showWarningMessage(
+                `AskAway: could not send cache ping in the current agent. The reliable keep-warm is the native ` +
+                `"Keep cache warm (sub-agent probes)" + "Extended prompt cache (1 hour)" settings. (${e instanceof Error ? e.message : String(e)})`
+            );
         }
     }
 

@@ -9,6 +9,7 @@ import { McpServerManager } from './mcp/mcpServer';
 import { killAllGradleRuns } from './gradle/gradleEngine';
 import { ContextManager } from './context';
 import { PlanEditorProvider } from './plan/planEditorProvider';
+import { COWORK_BUNDLE_B64, COWORK_APPLY_B64, COWORK_PROMPT_B64 } from './cowork/coworkAssets';
 
 // Heavy modules loaded lazily to avoid blocking activation
 // RemoteUiServer imports express + socket.io (expensive)
@@ -108,6 +109,11 @@ You are the main AskAway Build Agent. Your job is to orchestrate implementation 
 - Do NOT run \`grep\` or \`rg\` in the terminal for code search when \`rg_search\` is available.
 - Do NOT read entire files to locate a symbol when \`code_nav\` (definition/references/document_symbols) or \`rg_search\` can locate it in one call.
 
+## Turn Budget
+- A per-turn budget banner (\`Turn budget: N AIU · last turn …\`) reports the soft AIU limit and the previous turn's spend. It is advisory and never blocks.
+- Work within it: prefer targeted searches (\`rg_search\`/\`code_nav\`) over broad scans and full-file reads, batch independent tool calls in one step, avoid re-reading large files, delegate heavy exploration to a cheaper sub-agent, and finalize as soon as the task is done.
+- Call the \`turn_budget\` tool to check live in-turn spend when a turn runs long.
+
 ## Communication
 - BE CRISP. Default to the shortest correct answer (1–3 sentences). Lead with the result first; add detail only when asked or essential.
 - No preamble, no restating the question, no filler, no narrating what you are about to do. Never pad the final response.
@@ -191,29 +197,345 @@ try {
         const dl = path.join(wsRoot, h, 'GitHub.copilot-chat', 'debug-logs');
         for (const s of safeReaddir(dl)) {
             const m = path.join(dl, s, 'main.jsonl');
-            try { const st = fs.statSync(m); if (!newest || st.mtimeMs > newest.mt) { newest = { file: m, mt: st.mtimeMs }; } } catch (e) {}
+            try { const st = fs.statSync(m); if (!newest || st.mtimeMs > newest.mt) { newest = { dir: path.join(dl, s), mt: st.mtimeMs }; } } catch (e) {}
         }
     }
     if (!newest) { process.exit(0); }
-    const lines = fs.readFileSync(newest.file, 'utf8').split('\\n');
+    // Parent turn boundary = newest user_message in main.jsonl (child sub-agent logs have their own).
+    const mainLines = fs.readFileSync(path.join(newest.dir, 'main.jsonl'), 'utf8').split('\\n');
     let lastSubmit = 0;
-    for (const l of lines) { if (l.indexOf('"type":"user_message"') === -1) { continue; } try { const p = JSON.parse(l); if (typeof p.ts === 'number' && p.ts > lastSubmit) { lastSubmit = p.ts; } } catch (e) {} }
+    for (const l of mainLines) { if (l.indexOf('"type":"user_message"') === -1) { continue; } try { const p = JSON.parse(l); if (typeof p.ts === 'number' && p.ts > lastSubmit) { lastSubmit = p.ts; } } catch (e) {} }
+    // Sum main.jsonl PLUS runSubagent-*.jsonl child sessions (sub-agent calls are billed but logged separately).
+    const files = safeReaddir(newest.dir).filter(n => n.endsWith('.jsonl') && n.indexOf('title-') !== 0 && (n === 'main.jsonl' || n.indexOf('runSubagent') === 0)).map(n => path.join(newest.dir, n));
     let nano = 0;
-    for (const l of lines) { if (l.indexOf('llm_request') === -1) { continue; } let p; try { p = JSON.parse(l); } catch (e) { continue; } const ts = typeof p.ts === 'number' ? p.ts : 0; if (ts < lastSubmit) { continue; } nano += (p.attrs && typeof p.attrs.copilotUsageNanoAiu === 'number') ? p.attrs.copilotUsageNanoAiu : 0; }
+    for (const f of files) {
+        let data; try { data = fs.readFileSync(f, 'utf8'); } catch (e) { continue; }
+        for (const l of data.split('\\n')) { if (l.indexOf('llm_request') === -1) { continue; } let p; try { p = JSON.parse(l); } catch (e) { continue; } const ts = typeof p.ts === 'number' ? p.ts : 0; if (ts < lastSubmit) { continue; } nano += (p.attrs && typeof p.attrs.copilotUsageNanoAiu === 'number') ? p.attrs.copilotUsageNanoAiu : 0; }
+    }
     // At UserPromptSubmit the NEW turn's user_message is not yet in the log, so the newest
     // user_message ts is the PREVIOUS turn's — and \`nano\` below is the previous turn's total.
     // The current turn is genuinely fresh (0 spent) at this instant, so present it that way
     // and expose the previous turn as context. Live in-turn spend comes from the turn_budget tool.
+    // One line of NUMBERS only. The how-to guidance is static and lives in the cached
+    // AskAway Build agent instructions (## Turn Budget), so it costs ~0 per turn here.
     const prevSpent = nano / 1e9;
     const pctPrev = Math.round(prevSpent / limit * 100);
-    const tier = pctPrev >= 100 ? ', OVER' : (pctPrev >= 75 ? ', high' : '');
     const ctx = lastSubmit === 0
-        ? 'Budget: ' + limit + ' AIU/turn (fresh).'
-        : 'Budget: ' + limit + ' AIU/turn (fresh). Last turn ' + prevSpent.toFixed(0) + '/' + limit + ' (' + pctPrev + '%' + tier + ').';
+        ? 'Turn budget: ' + limit + ' AIU'
+        : 'Turn budget: ' + limit + ' AIU · last turn ' + prevSpent.toFixed(0) + ' (' + pctPrev + '%' + (pctPrev >= 100 ? ', OVER — be frugal' : '') + ')';
     process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: ctx } }));
 } catch (e) {}
 process.exit(0);
 `;
+
+// ── Prompt-cache activity timer (event-driven) ────────────────────────────────
+// The webview shows a "prompt cache age" clock. Polling the debug log lags (Copilot
+// logs an llm_request only on completion) and never resets on a fresh submission.
+// These hooks stamp ~/.askaway/cache-activity-ts on model-activity events so the clock
+// is event-driven: UserPromptSubmit resets it (age 0), PostToolUse/Stop mark the last
+// model round. The extension reads the sentinel each broadcast (max with the log ts).
+const CACHE_TIMER_GATE_COMMAND = '$HOME/.askaway/hooks/cache-timer-gate.sh';
+const CACHE_TIMER_GATE_SCRIPT = `#!/bin/sh
+# AskAway prompt-cache activity timer. Records wall-clock time of model activity so the
+# webview cache-age clock is event-driven. Passes stdin to node (it reads hook_event_name
+# to detect turn end). No-op if node is missing.
+CFG="$HOME/.askaway"
+NODE="$(command -v node 2>/dev/null)"
+if [ -z "$NODE" ]; then
+    for p in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.local/bin/node"; do
+        [ -x "$p" ] && NODE="$p" && break
+    done
+fi
+[ -n "$NODE" ] || { cat >/dev/null 2>&1; exit 0; }
+"$NODE" "$CFG/hooks/cache-timer.js"
+exit 0
+`;
+const CACHE_TIMER_INJECT_SCRIPT = `// AskAway prompt-cache activity timer. Stamps ~/.askaway/cache-activity-ts on each
+// model-activity hook event; on the Stop event it also stamps ~/.askaway/turn-complete-ts
+// so the webview can play the "turn complete" sound. No stdout.
+const fs = require('fs'), path = require('path'), os = require('os');
+try {
+    let ev = '';
+    try { const p = JSON.parse(fs.readFileSync(0, 'utf8')); ev = p.hook_event_name || p.hookEventName || ''; } catch (e) {}
+    const cfg = path.join(os.homedir(), '.askaway');
+    try { fs.mkdirSync(cfg, { recursive: true }); } catch (e) {}
+    const now = String(Date.now());
+    fs.writeFileSync(path.join(cfg, 'cache-activity-ts'), now, 'utf8');
+    if (ev === 'Stop') { fs.writeFileSync(path.join(cfg, 'turn-complete-ts'), now, 'utf8'); }
+} catch (e) {}
+process.exit(0);
+`;
+
+/** Install the prompt-cache activity timer hook (UserPromptSubmit / PostToolUse / Stop). */
+async function ensureCacheTimerHookInstalled(): Promise<void> {
+    const gatePath = path.join(os.homedir(), '.askaway', 'hooks', 'cache-timer-gate.sh');
+    const injectPath = path.join(os.homedir(), '.askaway', 'hooks', 'cache-timer.js');
+    const events = ['UserPromptSubmit', 'PostToolUse', 'Stop'];
+    try {
+        await fs.promises.mkdir(path.dirname(gatePath), { recursive: true });
+        if (await fs.promises.readFile(gatePath, 'utf8').catch(() => undefined) !== CACHE_TIMER_GATE_SCRIPT) {
+            await fs.promises.writeFile(gatePath, CACHE_TIMER_GATE_SCRIPT, 'utf8');
+        }
+        await fs.promises.chmod(gatePath, 0o755);
+        if (await fs.promises.readFile(injectPath, 'utf8').catch(() => undefined) !== CACHE_TIMER_INJECT_SCRIPT) {
+            await fs.promises.writeFile(injectPath, CACHE_TIMER_INJECT_SCRIPT, 'utf8');
+        }
+        const gateAbs = path.join(os.homedir(), '.askaway', 'hooks', 'cache-timer-gate.sh');
+
+        // VS Code Copilot: ~/.copilot/hooks/cache-timer.json (one file, several events).
+        const copilotHookPath = path.join(os.homedir(), '.copilot', 'hooks', 'cache-timer.json');
+        await fs.promises.mkdir(path.dirname(copilotHookPath), { recursive: true });
+        const cfg: any = { version: 1, hooks: {} };
+        for (const ev of events) {
+            cfg.hooks[ev] = [{ type: 'command', command: gateAbs, cwd: '.', timeout: 5 }];
+        }
+        await fs.promises.writeFile(copilotHookPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+
+        // Claude Code: ~/.claude/settings.json hooks.<event>
+        const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+        await fs.promises.mkdir(path.dirname(claudeSettingsPath), { recursive: true });
+        let settings: any = {};
+        try { settings = JSON.parse(await fs.promises.readFile(claudeSettingsPath, 'utf8')); } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') { throw err; }
+        }
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) { settings = {}; }
+        if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) { settings.hooks = {}; }
+        let changed = false;
+        for (const ev of events) {
+            if (!Array.isArray(settings.hooks[ev])) { settings.hooks[ev] = []; }
+            const has = settings.hooks[ev].some((e: any) =>
+                Array.isArray(e?.hooks) && e.hooks.some((h: any) => h?.command === CACHE_TIMER_GATE_COMMAND));
+            if (!has) {
+                settings.hooks[ev].push({ hooks: [{ type: 'command', command: CACHE_TIMER_GATE_COMMAND }] });
+                changed = true;
+            }
+        }
+        if (changed) {
+            await fs.promises.writeFile(claudeSettingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+        }
+
+        logRuntime('Installed AskAway cache-timer hook', { gatePath, injectPath });
+    } catch (err) {
+        logRuntime('Warning: Could not install AskAway cache-timer hook', formatError(err));
+    }
+}
+
+// ── Tool I/O logger (PostToolUse) ─────────────────────────────────────────────
+// Copilot truncates the tool result in its DEBUG LOG (attrs.result, ~5K chars), so the
+// observability tool row undercounts big outputs (a 185KB memory read shows as ~1.3K tok
+// instead of ~48K). The PostToolUse hook receives the FULL, untruncated tool_response plus
+// tool_name + tool_use_id, so we log the real input/output sizes to ~/.askaway/tool-io.jsonl
+// and the webview reconciles the tool row against it. Lossless, independent of the debug log.
+const TOOL_IO_GATE_COMMAND = '$HOME/.askaway/hooks/tool-io-gate.sh';
+const TOOL_IO_GATE_SCRIPT = `#!/bin/sh
+# AskAway tool I/O logger. Pipes the PostToolUse payload (stdin) to node, which appends the
+# real (untruncated) input/output sizes to ~/.askaway/tool-io.jsonl. No-op if node is missing.
+CFG="$HOME/.askaway"
+NODE="$(command -v node 2>/dev/null)"
+if [ -z "$NODE" ]; then
+    for p in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.local/bin/node"; do
+        [ -x "$p" ] && NODE="$p" && break
+    done
+fi
+[ -n "$NODE" ] || { cat >/dev/null 2>&1; exit 0; }
+"$NODE" "$CFG/hooks/tool-io.js"
+exit 0
+`;
+const TOOL_IO_INJECT_SCRIPT = `// AskAway tool I/O logger. Reads a PostToolUse payload from stdin and appends one JSONL row
+// {ts, tool, id, inChars, outChars, in, out} with the FULL (untruncated) input/output Copilot
+// handed the model. The EXTENSION tokenizes 'in'/'out' with the real gpt-tokenizer (there is no
+// tokenizer here), so no chars/4 estimate is stored. Text is capped at 1MB/field and the file is
+// bounded to the last ~2000 rows / 16MB. No stdout.
+const fs = require('fs'), path = require('path'), os = require('os');
+try {
+    let p = {};
+    try { p = JSON.parse(fs.readFileSync(0, 'utf8')); } catch (e) {}
+    const tool = p.tool_name || p.toolName || '';
+    if (!tool) { process.exit(0); }
+    const id = p.tool_use_id || p.toolUseId || '';
+    const inStr = typeof p.tool_input === 'string' ? p.tool_input : JSON.stringify(p.tool_input || {});
+    // Copilot has changed the PostToolUse response key over time; probe the known aliases so a
+    // rename doesn't silently zero out captured output.
+    const respRaw = (p.tool_response !== undefined ? p.tool_response
+        : p.tool_result !== undefined ? p.tool_result
+        : p.toolResponse !== undefined ? p.toolResponse
+        : p.response !== undefined ? p.response
+        : p.output !== undefined ? p.output
+        : p.result);
+    const outStr = typeof respRaw === 'string' ? respRaw : JSON.stringify(respRaw || '');
+    const CAP = 1024 * 1024;
+    const row = { ts: Date.now(), tool: tool, id: id, inChars: inStr.length, outChars: outStr.length, in: inStr.slice(0, CAP), out: outStr.slice(0, CAP) };
+    const cfg = path.join(os.homedir(), '.askaway');
+    try { fs.mkdirSync(cfg, { recursive: true }); } catch (e) {}
+    const file = path.join(cfg, 'tool-io.jsonl');
+    fs.appendFileSync(file, JSON.stringify(row) + '\\n', 'utf8');
+    try {
+        const st = fs.statSync(file);
+        if (st.size > 16 * 1024 * 1024) {
+            const lines = fs.readFileSync(file, 'utf8').split('\\n').filter(Boolean);
+            fs.writeFileSync(file, lines.slice(-2000).join('\\n') + '\\n', 'utf8');
+        }
+    } catch (e) {}
+} catch (e) {}
+process.exit(0);
+`;
+
+/** Install the tool I/O logger hook (PostToolUse). Logs full, untruncated tool input/output
+ *  sizes so the observability tool row reflects what the model actually received. */
+async function ensureToolIoHookInstalled(): Promise<void> {
+    const gatePath = path.join(os.homedir(), '.askaway', 'hooks', 'tool-io-gate.sh');
+    const injectPath = path.join(os.homedir(), '.askaway', 'hooks', 'tool-io.js');
+    const events = ['PostToolUse'];
+    try {
+        await fs.promises.mkdir(path.dirname(gatePath), { recursive: true });
+        if (await fs.promises.readFile(gatePath, 'utf8').catch(() => undefined) !== TOOL_IO_GATE_SCRIPT) {
+            await fs.promises.writeFile(gatePath, TOOL_IO_GATE_SCRIPT, 'utf8');
+        }
+        await fs.promises.chmod(gatePath, 0o755);
+        if (await fs.promises.readFile(injectPath, 'utf8').catch(() => undefined) !== TOOL_IO_INJECT_SCRIPT) {
+            await fs.promises.writeFile(injectPath, TOOL_IO_INJECT_SCRIPT, 'utf8');
+        }
+        const gateAbs = path.join(os.homedir(), '.askaway', 'hooks', 'tool-io-gate.sh');
+
+        // VS Code Copilot: ~/.copilot/hooks/tool-io.json
+        const copilotHookPath = path.join(os.homedir(), '.copilot', 'hooks', 'tool-io.json');
+        await fs.promises.mkdir(path.dirname(copilotHookPath), { recursive: true });
+        const cfg: any = { version: 1, hooks: {} };
+        for (const ev of events) {
+            cfg.hooks[ev] = [{ type: 'command', command: gateAbs, cwd: '.', timeout: 5 }];
+        }
+        await fs.promises.writeFile(copilotHookPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+
+        // Claude Code: ~/.claude/settings.json hooks.PostToolUse
+        const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+        await fs.promises.mkdir(path.dirname(claudeSettingsPath), { recursive: true });
+        let settings: any = {};
+        try { settings = JSON.parse(await fs.promises.readFile(claudeSettingsPath, 'utf8')); } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') { throw err; }
+        }
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) { settings = {}; }
+        if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) { settings.hooks = {}; }
+        let changed = false;
+        for (const ev of events) {
+            if (!Array.isArray(settings.hooks[ev])) { settings.hooks[ev] = []; }
+            const has = settings.hooks[ev].some((e: any) =>
+                Array.isArray(e?.hooks) && e.hooks.some((h: any) => h?.command === TOOL_IO_GATE_COMMAND));
+            if (!has) {
+                settings.hooks[ev].push({ hooks: [{ type: 'command', command: TOOL_IO_GATE_COMMAND }] });
+                changed = true;
+            }
+        }
+        if (changed) {
+            await fs.promises.writeFile(claudeSettingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+        }
+
+        logRuntime('Installed AskAway tool-io hook', { gatePath, injectPath });
+    } catch (err) {
+        logRuntime('Warning: Could not install AskAway tool-io hook', formatError(err));
+    }
+}
+
+// ── Sub-agent model interception (PreToolUse) ─────────────────────────────────
+// Opt-in: when askaway.subagentModel is set, a PreToolUse hook rewrites the `model`
+// arg of Copilot's built-in `runSubagent` tool so sub-agents run on a cheaper model.
+// Same mechanism as the RTK command rewrite. No-op when the sentinel is empty/absent.
+const SUBAGENT_MODEL_GATE_COMMAND = '$HOME/.askaway/hooks/subagent-model-gate.sh';
+const SUBAGENT_MODEL_GATE_SCRIPT = `#!/bin/sh
+# AskAway sub-agent model injector (PreToolUse). Passes stdin through to node so the
+# tool payload reaches the injector. No-op (stdin consumed, tool unchanged) when the
+# sentinel is absent or node can't be found.
+CFG="$HOME/.askaway"
+[ -f "$CFG/subagent-model" ] || { cat >/dev/null 2>&1; exit 0; }
+NODE="$(command -v node 2>/dev/null)"
+if [ -z "$NODE" ]; then
+    for p in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.local/bin/node"; do
+        [ -x "$p" ] && NODE="$p" && break
+    done
+fi
+[ -n "$NODE" ] || { cat >/dev/null 2>&1; exit 0; }
+"$NODE" "$CFG/hooks/subagent-model.js"
+exit 0
+`;
+const SUBAGENT_MODEL_INJECT_SCRIPT = `// AskAway sub-agent model injector. On a runSubagent PreToolUse, overrides tool_input.model
+// with the configured cheap model so the sub-agent runs cheaper. Emits nothing otherwise.
+const fs = require('fs'), path = require('path'), os = require('os');
+try {
+    let raw = '';
+    try { raw = fs.readFileSync(0, 'utf8'); } catch (e) { process.exit(0); }
+    let p; try { p = JSON.parse(raw); } catch (e) { process.exit(0); }
+    const toolName = p.tool_name || p.toolName || '';
+    const input = p.tool_input || p.input;
+    if (toolName !== 'runSubagent' || !input || typeof input !== 'object') { process.exit(0); }
+    const model = (fs.readFileSync(path.join(os.homedir(), '.askaway', 'subagent-model'), 'utf8') || '').trim();
+    if (!model) { process.exit(0); }
+    if (input.model === model) { process.exit(0); }
+    const updated = Object.assign({}, input, { model: model });
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: updated } }));
+} catch (e) {}
+process.exit(0);
+`;
+
+/** Write the sentinel the sub-agent model hook reads (the desired model string; empty = off). */
+async function writeSubagentModelSentinel(): Promise<void> {
+    try {
+        const cfgDir = path.join(os.homedir(), '.askaway');
+        await fs.promises.mkdir(cfgDir, { recursive: true });
+        const model = String(vscode.workspace.getConfiguration('askaway').get('subagentModel', '') || '').trim();
+        await fs.promises.writeFile(path.join(cfgDir, 'subagent-model'), model, 'utf8');
+    } catch (err) {
+        logRuntime('Warning: Could not write sub-agent model sentinel', formatError(err));
+    }
+}
+
+/** Install the sub-agent model PreToolUse hook (Copilot hooks + Claude settings, best-effort). */
+async function ensureSubagentModelHookInstalled(): Promise<void> {
+    const gatePath = path.join(os.homedir(), '.askaway', 'hooks', 'subagent-model-gate.sh');
+    const injectPath = path.join(os.homedir(), '.askaway', 'hooks', 'subagent-model.js');
+    try {
+        await fs.promises.mkdir(path.dirname(gatePath), { recursive: true });
+        if (await fs.promises.readFile(gatePath, 'utf8').catch(() => undefined) !== SUBAGENT_MODEL_GATE_SCRIPT) {
+            await fs.promises.writeFile(gatePath, SUBAGENT_MODEL_GATE_SCRIPT, 'utf8');
+        }
+        await fs.promises.chmod(gatePath, 0o755);
+        if (await fs.promises.readFile(injectPath, 'utf8').catch(() => undefined) !== SUBAGENT_MODEL_INJECT_SCRIPT) {
+            await fs.promises.writeFile(injectPath, SUBAGENT_MODEL_INJECT_SCRIPT, 'utf8');
+        }
+
+        // VS Code Copilot: ~/.copilot/hooks/subagent-model.json (separate file; PreToolUse).
+        const copilotHookPath = path.join(os.homedir(), '.copilot', 'hooks', 'subagent-model.json');
+        await fs.promises.mkdir(path.dirname(copilotHookPath), { recursive: true });
+        const gateAbs = path.join(os.homedir(), '.askaway', 'hooks', 'subagent-model-gate.sh');
+        const cfg = {
+            version: 1,
+            hooks: {
+                PreToolUse: [{ type: 'command', command: gateAbs, cwd: '.', timeout: 5 }],
+                preToolUse: [{ type: 'command', bash: gateAbs, powershell: gateAbs, cwd: '.', timeoutSec: 5 }],
+            },
+        };
+        await fs.promises.writeFile(copilotHookPath, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
+
+        // Claude Code: ~/.claude/settings.json hooks.PreToolUse with a runSubagent matcher.
+        const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+        await fs.promises.mkdir(path.dirname(claudeSettingsPath), { recursive: true });
+        let settings: any = {};
+        try { settings = JSON.parse(await fs.promises.readFile(claudeSettingsPath, 'utf8')); } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') { throw err; }
+        }
+        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) { settings = {}; }
+        if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) { settings.hooks = {}; }
+        if (!Array.isArray(settings.hooks.PreToolUse)) { settings.hooks.PreToolUse = []; }
+        const hasEntry = settings.hooks.PreToolUse.some((e: any) =>
+            Array.isArray(e?.hooks) && e.hooks.some((h: any) => h?.command === SUBAGENT_MODEL_GATE_COMMAND));
+        if (!hasEntry) {
+            settings.hooks.PreToolUse.push({ matcher: 'runSubagent', hooks: [{ type: 'command', command: SUBAGENT_MODEL_GATE_COMMAND }] });
+            await fs.promises.writeFile(claudeSettingsPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+        }
+
+        logRuntime('Installed AskAway sub-agent model hook', { gatePath, injectPath });
+    } catch (err) {
+        logRuntime('Warning: Could not install AskAway sub-agent model hook', formatError(err));
+    }
+}
 
 /** Persist the sentinels the budget hook reads: the soft limit + the workspaceStorage root. */
 async function writeBudgetSentinels(context: vscode.ExtensionContext): Promise<void> {
@@ -309,6 +631,43 @@ async function ensureAskAwayBuildAgentInstalled(context: vscode.ExtensionContext
         }
     } catch (err) {
         logRuntime('Warning: Could not install AskAway Build user agent', formatError(err));
+    }
+}
+
+/**
+ * Install the cowork offload assets at USER level so they work in every workspace:
+ *  - the `/export-to-cowork` prompt command -> VS Code User prompts folder
+ *  - `bundle.mjs` / `apply.mjs` scripts      -> ~/.askaway/cowork/
+ * User edits to any file are preserved (only writes when missing or byte-identical to a prior install).
+ */
+async function ensureCoworkInstalled(context: vscode.ExtensionContext): Promise<void> {
+    const decode = (b64: string) => Buffer.from(b64, 'base64').toString('utf8');
+    const userDir = path.dirname(path.dirname(context.globalStorageUri.fsPath));
+    const promptsDir = path.join(userDir, 'prompts');
+    const coworkDir = path.join(os.homedir(), '.askaway', 'cowork');
+
+    const writeIfSafe = async (filePath: string, content: string, label: string, mode?: number) => {
+        const existing = await fs.promises.readFile(filePath, 'utf8').catch((err: NodeJS.ErrnoException) => {
+            if (err.code === 'ENOENT') { return undefined; }
+            throw err;
+        });
+        if (existing === undefined || existing === content) {
+            await fs.promises.writeFile(filePath, content, 'utf8');
+            if (mode !== undefined) { await fs.promises.chmod(filePath, mode).catch(() => {}); }
+            logRuntime(existing === undefined ? `Installed cowork ${label}` : `cowork ${label} up to date`, { filePath });
+        } else {
+            logRuntime(`cowork ${label} exists; preserving user copy`, { filePath });
+        }
+    };
+
+    try {
+        await fs.promises.mkdir(promptsDir, { recursive: true });
+        await fs.promises.mkdir(coworkDir, { recursive: true });
+        await writeIfSafe(path.join(promptsDir, 'export-to-cowork.prompt.md'), decode(COWORK_PROMPT_B64), 'command');
+        await writeIfSafe(path.join(coworkDir, 'bundle.mjs'), decode(COWORK_BUNDLE_B64), 'bundle.mjs', 0o755);
+        await writeIfSafe(path.join(coworkDir, 'apply.mjs'), decode(COWORK_APPLY_B64), 'apply.mjs', 0o755);
+    } catch (err) {
+        logRuntime('Warning: Could not install cowork assets', formatError(err));
     }
 }
 
@@ -574,10 +933,18 @@ export function activate(context: vscode.ExtensionContext) {
     outputChannel.appendLine(`[${new Date().toISOString()}] AskAway: Extension activating...`);
 
     void ensureAskAwayBuildAgentInstalled(context);
+    void ensureCoworkInstalled(context);
     void ensureRtkGlobalHooksInstalled();
     void ensureCopilotHookInstalled();
     void writeBudgetSentinels(context);
     void ensureBudgetHookInstalled();
+    void ensureCacheTimerHookInstalled();
+    void ensureToolIoHookInstalled();
+    void writeSubagentModelSentinel();
+    void ensureSubagentModelHookInstalled();
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('askaway.subagentModel')) { void writeSubagentModelSentinel(); }
+    }));
 
     // Enable debug logging globally on first activation (needed for token telemetry)
     (async () => {

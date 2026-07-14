@@ -47,36 +47,51 @@ async function computeTurnSpend(context: vscode.ExtensionContext): Promise<{ nan
     catch { return empty; }
 
     // Newest session by main.jsonl mtime = the active chat.
-    let newest: { file: string; mtime: number; sid: string } | null = null;
+    let newest: { dir: string; mtime: number; sid: string } | null = null;
     for (const d of sessionDirs) {
         if (!d.isDirectory()) { continue; }
         const f = path.join(debugRoot, d.name, 'main.jsonl');
         try {
             const st = await fs.promises.stat(f);
-            if (!newest || st.mtimeMs > newest.mtime) { newest = { file: f, mtime: st.mtimeMs, sid: d.name }; }
+            if (!newest || st.mtimeMs > newest.mtime) { newest = { dir: path.join(debugRoot, d.name), mtime: st.mtimeMs, sid: d.name }; }
         } catch { /* skip unreadable */ }
     }
     if (!newest) { return empty; }
 
-    let data: string;
-    try { data = await fs.promises.readFile(newest.file, 'utf8'); } catch { return empty; }
-    const lines = data.split('\n');
+    // The active session dir holds main.jsonl (parent turn) PLUS runSubagent-*.jsonl child
+    // sessions. Sub-agent LLM calls are billed but logged ONLY in the child files, so the budget
+    // must sum ALL of them — otherwise heavy sub-agent turns look far under budget than reality.
+    let childFiles: string[] = [];
+    try {
+        childFiles = (await fs.promises.readdir(newest.dir))
+            .filter(n => n.endsWith('.jsonl') && !n.startsWith('title-') && (n === 'main.jsonl' || n.startsWith('runSubagent')))
+            .map(n => path.join(newest!.dir, n));
+    } catch { childFiles = [path.join(newest.dir, 'main.jsonl')]; }
 
+    // The parent turn boundary is the newest user_message in main.jsonl. Child logs have their
+    // own user_message (the sub-agent prompt) which must NOT move the boundary.
     let lastSubmitTs = 0;
-    for (const line of lines) {
-        if (line.indexOf('"type":"user_message"') === -1) { continue; }
-        try { const p = JSON.parse(line) as { ts?: number }; if (typeof p.ts === 'number' && p.ts > lastSubmitTs) { lastSubmitTs = p.ts; } } catch { /* skip */ }
-    }
+    try {
+        const mainData = await fs.promises.readFile(path.join(newest.dir, 'main.jsonl'), 'utf8');
+        for (const line of mainData.split('\n')) {
+            if (line.indexOf('"type":"user_message"') === -1) { continue; }
+            try { const p = JSON.parse(line) as { ts?: number }; if (typeof p.ts === 'number' && p.ts > lastSubmitTs) { lastSubmitTs = p.ts; } } catch { /* skip */ }
+        }
+    } catch { return empty; }
 
     let nanoAiu = 0, requestCount = 0;
-    for (const line of lines) {
-        if (line.indexOf('llm_request') === -1) { continue; }
-        let p: { ts?: number; attrs?: { copilotUsageNanoAiu?: number } };
-        try { p = JSON.parse(line); } catch { continue; }
-        const ts = typeof p.ts === 'number' ? p.ts : 0;
-        if (ts < lastSubmitTs) { continue; }
-        nanoAiu += typeof p.attrs?.copilotUsageNanoAiu === 'number' ? p.attrs.copilotUsageNanoAiu : 0;
-        requestCount += 1;
+    for (const file of childFiles) {
+        let data: string;
+        try { data = await fs.promises.readFile(file, 'utf8'); } catch { continue; }
+        for (const line of data.split('\n')) {
+            if (line.indexOf('llm_request') === -1) { continue; }
+            let p: { ts?: number; attrs?: { copilotUsageNanoAiu?: number } };
+            try { p = JSON.parse(line); } catch { continue; }
+            const ts = typeof p.ts === 'number' ? p.ts : 0;
+            if (ts < lastSubmitTs) { continue; }
+            nanoAiu += typeof p.attrs?.copilotUsageNanoAiu === 'number' ? p.attrs.copilotUsageNanoAiu : 0;
+            requestCount += 1;
+        }
     }
     return { nanoAiu, requestCount, sessionId: newest.sid };
 }
@@ -604,6 +619,144 @@ async function runRgSearch(input: RgSearchInput): Promise<string> {
     });
 }
 
+// ── read_doc: progressive reader for markdown / logs / long text files ──────────
+// Instead of dumping an entire file into context, this returns a cheap "gist" first
+// (a heading outline for markdown, or a head/tail + error index for logs) with line
+// numbers, so the agent can then request only the specific section / range / matches
+// it needs. Same philosophy as code_nav: find WHERE, then read the narrow slice.
+interface ReadDocInput {
+    filePath: string;
+    mode?: 'outline' | 'section' | 'search';
+    heading?: string;
+    startLine?: number;
+    endLine?: number;
+    query?: string;
+    maxResults?: number;
+    maxLevel?: number;
+}
+
+const READ_DOC_MAX_LINES = 400;      // cap a single section/range read
+const READ_DOC_ERROR_RE = /\b(error|exception|fatal|fail(?:ed|ure)?|traceback|panic|warn(?:ing)?)\b/i;
+
+function resolveDocPath(filePath: string): string {
+    if (!filePath) { return ''; }
+    if (filePath.startsWith('~')) { filePath = path.join(os.homedir(), filePath.slice(1)); }
+    if (path.isAbsolute(filePath)) { return filePath; }
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    return path.join(root, filePath);
+}
+
+function readDocLines(abs: string): string[] {
+    const raw = fs.readFileSync(abs, 'utf8');
+    return raw.split('\n');
+}
+
+function runReadDoc(input: ReadDocInput): string {
+    const abs = resolveDocPath(input.filePath);
+    if (!abs) { return 'Error: filePath is required.'; }
+    let st: fs.Stats;
+    try { st = fs.statSync(abs); } catch { return `Error: file not found: ${input.filePath}`; }
+    if (!st.isFile()) { return `Error: not a file: ${input.filePath}`; }
+    if (st.size > 32 * 1024 * 1024) { return `Error: file too large (${(st.size / 1048576).toFixed(1)}MB > 32MB).`; }
+
+    let lines: string[];
+    try { lines = readDocLines(abs); } catch (e) { return `Error reading file: ${(e as Error).message}`; }
+    const total = lines.length;
+    const rel = vscode.workspace.asRelativePath(abs, false);
+    const mode = input.mode ?? 'outline';
+
+    // ── SECTION: return a specific heading block or an explicit line range ──
+    if (mode === 'section') {
+        let start = 1, end = total;
+        if (input.heading) {
+            const want = input.heading.trim().toLowerCase();
+            let hIdx = -1, hLevel = 6;
+            for (let i = 0; i < total; i++) {
+                const m = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+                if (m && m[2].trim().toLowerCase() === want) { hIdx = i; hLevel = m[1].length; break; }
+            }
+            if (hIdx < 0) {
+                // fall back to first heading that CONTAINS the query
+                for (let i = 0; i < total; i++) {
+                    const m = /^(#{1,6})\s+(.*)$/.exec(lines[i]);
+                    if (m && m[2].trim().toLowerCase().includes(want)) { hIdx = i; hLevel = m[1].length; break; }
+                }
+            }
+            if (hIdx < 0) { return `Heading "${input.heading}" not found in ${rel}. Run mode:"outline" to list headings.`; }
+            start = hIdx + 1;
+            end = total;
+            for (let i = hIdx + 1; i < total; i++) {
+                const m = /^(#{1,6})\s+/.exec(lines[i]);
+                if (m && m[1].length <= hLevel) { end = i; break; }
+            }
+        } else {
+            start = Math.max(1, input.startLine ?? 1);
+            end = Math.min(total, input.endLine ?? Math.min(total, start + READ_DOC_MAX_LINES - 1));
+        }
+        if (end - start + 1 > READ_DOC_MAX_LINES) { end = start + READ_DOC_MAX_LINES - 1; }
+        const body = lines.slice(start - 1, end)
+            .map((l, i) => `${start + i}: ${l}`).join('\n');
+        const more = end < total ? `\n… (${total - end} more lines; request the next range with mode:"section")` : '';
+        return `${rel}  [lines ${start}-${end} of ${total}]\n${body}${more}`;
+    }
+
+    // ── SEARCH: return matching lines with line numbers (great for logs) ──
+    if (mode === 'search') {
+        if (!input.query) { return 'Error: mode "search" requires a query.'; }
+        const max = Math.max(1, Math.min(200, input.maxResults ?? 50));
+        let re: RegExp;
+        try { re = new RegExp(input.query, 'i'); } catch { re = new RegExp(input.query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'); }
+        const hits: string[] = [];
+        for (let i = 0; i < total && hits.length < max; i++) {
+            if (re.test(lines[i])) { hits.push(`${i + 1}: ${lines[i]}`); }
+        }
+        if (!hits.length) { return `No matches for /${input.query}/ in ${rel} (${total} lines).`; }
+        const capped = hits.length >= max ? ` (first ${max}; refine query for more)` : '';
+        return `${rel}  [${hits.length} match(es)${capped} of ${total} lines]\n${hits.join('\n')}\n\nUse mode:"section" with startLine/endLine to read around any hit.`;
+    }
+
+    // ── OUTLINE (default): headings for markdown, or head/tail + error index for logs ──
+    const maxLevel = Math.max(1, Math.min(6, input.maxLevel ?? 3));
+    let inFence = false;
+    const headings: string[] = [];
+    for (let i = 0; i < total; i++) {
+        const line = lines[i];
+        if (/^\s*```/.test(line)) { inFence = !inFence; continue; }
+        if (inFence) { continue; }
+        const m = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+        if (m && m[1].length <= maxLevel) {
+            const level = m[1].length;
+            headings.push(`${'  '.repeat(level - 1)}L${i + 1}  ${'#'.repeat(level)} ${m[2].trim()}`);
+        }
+    }
+
+    if (headings.length >= 2) {
+        return `${rel}  [${total} lines · ${headings.length} headings (≤ H${maxLevel})]\n`
+            + `Outline (read a block with mode:"section" heading:"…" or startLine/endLine):\n\n`
+            + headings.join('\n');
+    }
+
+    // No usable heading structure → treat as a log / plain text: gist = head + tail + error index.
+    const headN = Math.min(15, total);
+    const tailN = Math.min(15, Math.max(0, total - headN));
+    const head = lines.slice(0, headN).map((l, i) => `${i + 1}: ${l}`).join('\n');
+    const tail = tailN > 0
+        ? lines.slice(total - tailN).map((l, i) => `${total - tailN + i + 1}: ${l}`).join('\n')
+        : '';
+    const errIdx: string[] = [];
+    for (let i = 0; i < total && errIdx.length < 40; i++) {
+        if (READ_DOC_ERROR_RE.test(lines[i])) { errIdx.push(`${i + 1}: ${lines[i].trim().slice(0, 160)}`); }
+    }
+    const sizeKb = (st.size / 1024).toFixed(1);
+    return `${rel}  [${total} lines · ${sizeKb} KB · no markdown headings → log/text gist]\n\n`
+        + `── head (1-${headN}) ──\n${head}\n\n`
+        + (tail ? `── tail (${total - tailN + 1}-${total}) ──\n${tail}\n\n` : '')
+        + (errIdx.length
+            ? `── error/warn lines (${errIdx.length}${errIdx.length >= 40 ? '+' : ''}) ──\n${errIdx.join('\n')}\n\n`
+            : `── no error/warn lines matched ──\n\n`)
+        + `Read any span with mode:"section" (startLine/endLine) or filter with mode:"search" query:"…".`;
+}
+
 export function registerTools(context: vscode.ExtensionContext, provider: AskAwayWebviewProvider) {
     let askUserTool: vscode.Disposable | undefined;
     try {
@@ -887,6 +1040,38 @@ export function registerTools(context: vscode.ExtensionContext, provider: AskAwa
         console.warn('[AskAway] rg_search tool already registered, skipping');
     }
     if (rgSearchTool) { context.subscriptions.push(rgSearchTool); }
+
+    // ── Register read_doc tool (progressive markdown / log / long-text reader) ──
+    // Returns a cheap gist first (heading outline or log head/tail + error index)
+    // so the agent reads only the section it needs instead of the whole file.
+    let readDocTool: vscode.Disposable | undefined;
+    try {
+        readDocTool = vscode.lm.registerTool('read_doc', {
+            prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<ReadDocInput>) {
+                const mode = options?.input?.mode ?? 'outline';
+                const fp = options?.input?.filePath ? ` ${path.basename(options.input.filePath)}` : '';
+                return { invocationMessage: `📄 read_doc: ${mode}${fp}` };
+            },
+            async invoke(options: vscode.LanguageModelToolInvocationOptions<ReadDocInput>, _token: vscode.CancellationToken) {
+                try {
+                    const result = runReadDoc(options.input);
+                    logToolCall('read_doc', result, options?.input?.mode ?? 'outline');
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart(result)
+                    ]);
+                } catch (err: unknown) {
+                    if (err instanceof vscode.CancellationError) { throw err; }
+                    const message = err instanceof Error ? err.message : 'Unknown error';
+                    return new vscode.LanguageModelToolResult([
+                        new vscode.LanguageModelTextPart('Error: ' + message)
+                    ]);
+                }
+            }
+        });
+    } catch (e) {
+        console.warn('[AskAway] read_doc tool already registered, skipping');
+    }
+    if (readDocTool) { context.subscriptions.push(readDocTool); }
 
     // ── Register gradle tool (async id-based Gradle build control) ──
     // Uses the SAME shared engine (dispatchGradle) as the MCP `gradle` tool.

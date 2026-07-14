@@ -4,7 +4,7 @@
   "displayName": "AskAway",
   "description": "Never miss an AI agent question again — get Telegram notifications and reply from your phone. Queue prompts, respond remotely, and keep your coding workflow moving.",
   "icon": "media/askaway-logo.png",
-  "version": "1.0.35",
+  "version": "2.1.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -101,7 +101,7 @@
         ],
         "toolReferenceName": "codeNav",
         "displayName": "Code Navigation (LSP)",
-        "modelDescription": "VS Code LSP-powered navigation: go-to-definition, find-references, find-implementations, type-definition, hover, document symbols, workspace symbols, diagnostics. Use instead of grep for precise symbol lookups. Operations: definition, references, implementation, type_definition, hover (require filePath+line+character); document_symbols (requires filePath); workspace_symbols (requires query); diagnostics (optional filePath for file-scoped errors).",
+        "modelDescription": "VS Code LSP-powered code navigation — PREFER over read_file and grep for understanding code. To read a specific function/method without pulling in its Javadoc/doc-comments, imports, and unrelated code, first call document_symbols to get the file's outline (every function/class/method with EXACT line ranges), then do a narrow ranged read_file of only that symbol's lines. This skips large doc-comment blocks and saves tokens on doc-heavy files. Also: go-to-definition (jump straight to a symbol's source location instead of scanning files), find-references, find-implementations, type-definition, hover (signature + doc), workspace-symbols (locate a symbol by name across the repo), diagnostics (errors/warnings). NOTE: returns structure and precise line ranges, not raw source text — use it to find WHERE, then ranged-read that region. Operations: definition, references, implementation, type_definition, hover (require filePath+line+character); document_symbols (requires filePath); workspace_symbols (requires query); diagnostics (optional filePath for file-scoped errors).",
         "canBeReferencedInPrompt": true,
         "icon": "$(go-to-file)",
         "inputSchema": {
@@ -205,6 +205,68 @@
           },
           "required": [
             "pattern"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "read_doc",
+        "tags": [
+          "read",
+          "markdown",
+          "logs",
+          "outline",
+          "progressive",
+          "askaway"
+        ],
+        "toolReferenceName": "readDoc",
+        "displayName": "Read Doc",
+        "modelDescription": "Progressive reader for markdown, log, and long text files — PREFER over read_file when you don't yet know which part you need. Returns a cheap GIST first, then you request only the slice you want (find WHERE, then read the narrow range; same idea as code_nav for prose). mode:\"outline\" (default) → for markdown, a heading table-of-contents (# … ###) with line numbers (control depth via maxLevel); for a log/plain file with no headings, a head+tail excerpt plus an index of error/warn/exception lines with their line numbers. mode:\"section\" → return one block: either heading:\"Exact Heading\" (returns that heading down to the next same/higher-level heading) or startLine+endLine (capped at 400 lines; the result tells you if more remain so you can page). mode:\"search\" → query (regex, case-insensitive) returns matching lines with line numbers (ideal for grepping a big log), then read around any hit with mode:\"section\". filePath is workspace-relative, absolute, or ~-prefixed.",
+        "canBeReferencedInPrompt": true,
+        "icon": "$(book)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "filePath": {
+              "type": "string",
+              "description": "Path to the file. Workspace-relative, absolute, or ~-prefixed."
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "outline",
+                "section",
+                "search"
+              ],
+              "description": "outline (default): gist/TOC. section: return one heading block or startLine..endLine range. search: return lines matching query."
+            },
+            "heading": {
+              "type": "string",
+              "description": "For mode:section — the heading text to return (exact match preferred, else first heading containing this text). Returns that heading down to the next same-or-higher-level heading."
+            },
+            "startLine": {
+              "type": "number",
+              "description": "For mode:section — 1-based first line of the range to return."
+            },
+            "endLine": {
+              "type": "number",
+              "description": "For mode:section — 1-based last line of the range (clamped; max 400 lines per read)."
+            },
+            "query": {
+              "type": "string",
+              "description": "For mode:search — case-insensitive regex (falls back to literal). Returns matching lines with line numbers."
+            },
+            "maxResults": {
+              "type": "number",
+              "description": "For mode:search — max matching lines to return, clamped 1-200. Defaults to 50."
+            },
+            "maxLevel": {
+              "type": "number",
+              "description": "For mode:outline — deepest markdown heading level to include (1-6). Defaults to 3."
+            }
+          },
+          "required": [
+            "filePath"
           ],
           "additionalProperties": false
         }
@@ -473,6 +535,12 @@
           "minimum": 0,
           "scope": "window",
           "description": "Soft per-turn credit budget in AIU. When the agent calls the turn_budget tool and this is exceeded, it is advised to wrap up. 0 = disabled (no soft limit)."
+        },
+        "askaway.subagentModel": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "markdownDescription": "Experimental. When set, a PreToolUse hook rewrites the `model` argument of Copilot's built-in `runSubagent` tool so sub-agents run on this (cheaper) model — e.g. `Claude Haiku 4.5 (copilot)`. Must be an exact model string your plan supports and that can run agentic sub-agents, else sub-agents may fail. Leave empty to disable. Requires a window reload to install the hook."
         },
         "askaway.humanLikeDelay": {
           "type": "boolean",

@@ -41,3 +41,7 @@ tasksync-plugin/dist/
 tasksync-plugin/node_modules/
 
 AGENT_AUDIT.md
+# cowork generated artifacts
+.askaway/cowork-manifest.json
+.askaway/cowork-bundle.md
+.askaway/cowork-inbox/

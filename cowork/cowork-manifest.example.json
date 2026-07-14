@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "createdAt": "2026-07-12T00:00:00.000Z",
+  "topic": "cowork export/import loop",
+  "task": "Validate the cowork bundle+apply scripts self-package correctly.",
+  "context": ["MVP smoke test", "verifies glob expansion + memory read"],
+  "expectedOutput": "reasoning + a unified diff patch under .askaway/cowork-inbox/",
+  "files": [
+    { "path": "cowork/README.md", "reason": "docs" },
+    { "path": ".github/prompts/export-to-cowork.prompt.md", "reason": "the command" }
+  ],
+  "globs": ["cowork/*.mjs"],
+  "memories": ["/Users/machs/Library/Application Support/Code/User/workspaceStorage/61eeb4067a5d442f46f6fa902d44bc39/GitHub.copilot-chat/memory-tool/memories/repo/tasksync-chat.md"]
+}
